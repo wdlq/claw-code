@@ -311,13 +311,30 @@ fn prepare_command(
         return prepared;
     }
 
-    let mut prepared = Command::new("sh");
-    prepared.arg("-lc").arg(command).current_dir(cwd);
-    if sandbox_status.filesystem_active {
-        prepared.env("HOME", cwd.join(".sandbox-home"));
-        prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
+    // On Windows, use cmd.exe instead of sh
+    #[cfg(windows)]
+    {
+        let mut prepared = Command::new("cmd");
+        prepared.arg("/C").arg(command).current_dir(cwd);
+        if sandbox_status.filesystem_active {
+            prepared.env("USERPROFILE", cwd.join(".sandbox-home"));
+            prepared.env("TEMP", cwd.join(".sandbox-tmp"));
+            prepared.env("TMP", cwd.join(".sandbox-tmp"));
+        }
+        prepared
     }
-    prepared
+
+    // On Unix-like systems, use sh
+    #[cfg(not(windows))]
+    {
+        let mut prepared = Command::new("sh");
+        prepared.arg("-lc").arg(command).current_dir(cwd);
+        if sandbox_status.filesystem_active {
+            prepared.env("HOME", cwd.join(".sandbox-home"));
+            prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
+        }
+        prepared
+    }
 }
 
 fn prepare_tokio_command(
@@ -338,13 +355,30 @@ fn prepare_tokio_command(
         return prepared;
     }
 
-    let mut prepared = TokioCommand::new("sh");
-    prepared.arg("-lc").arg(command).current_dir(cwd);
-    if sandbox_status.filesystem_active {
-        prepared.env("HOME", cwd.join(".sandbox-home"));
-        prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
+    // On Windows, use cmd.exe instead of sh
+    #[cfg(windows)]
+    {
+        let mut prepared = TokioCommand::new("cmd");
+        prepared.arg("/C").arg(command).current_dir(cwd);
+        if sandbox_status.filesystem_active {
+            prepared.env("USERPROFILE", cwd.join(".sandbox-home"));
+            prepared.env("TEMP", cwd.join(".sandbox-tmp"));
+            prepared.env("TMP", cwd.join(".sandbox-tmp"));
+        }
+        prepared
     }
-    prepared
+
+    // On Unix-like systems, use sh
+    #[cfg(not(windows))]
+    {
+        let mut prepared = TokioCommand::new("sh");
+        prepared.arg("-lc").arg(command).current_dir(cwd);
+        if sandbox_status.filesystem_active {
+            prepared.env("HOME", cwd.join(".sandbox-home"));
+            prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
+        }
+        prepared
+    }
 }
 
 fn prepare_sandbox_dirs(cwd: &std::path::Path) {

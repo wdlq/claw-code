@@ -1,5 +1,6 @@
 {
   "hooks": {
+    "PreToolUse": ["python .claw/hooks/keyword_restorer.py"],
     "PostToolUse": ["python .claw/hooks/keyword_redactor.py"]
   }
 }
