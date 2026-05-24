@@ -89,6 +89,7 @@ pub struct HookRunResult {
     permission_override: Option<PermissionOverride>,
     permission_reason: Option<String>,
     updated_input: Option<String>,
+    updated_tool_output: Option<String>,
 }
 
 impl HookRunResult {
@@ -102,6 +103,7 @@ impl HookRunResult {
             permission_override: None,
             permission_reason: None,
             updated_input: None,
+            updated_tool_output: None,
         }
     }
 
@@ -148,6 +150,11 @@ impl HookRunResult {
     #[must_use]
     pub fn updated_input_json(&self) -> Option<&str> {
         self.updated_input()
+    }
+
+    #[must_use]
+    pub fn updated_tool_output(&self) -> Option<&str> {
+        self.updated_tool_output.as_deref()
     }
 }
 
@@ -336,6 +343,7 @@ impl HookRunner {
                 permission_override: None,
                 permission_reason: None,
                 updated_input: None,
+                updated_tool_output: None,
             };
         }
 
@@ -507,6 +515,7 @@ struct ParsedHookOutput {
     permission_override: Option<PermissionOverride>,
     permission_reason: Option<String>,
     updated_input: Option<String>,
+    updated_tool_output: Option<String>,
 }
 
 impl ParsedHookOutput {
@@ -532,6 +541,9 @@ fn merge_parsed_hook_output(target: &mut HookRunResult, parsed: ParsedHookOutput
     }
     if parsed.updated_input.is_some() {
         target.updated_input = parsed.updated_input;
+    }
+    if parsed.updated_tool_output.is_some() {
+        target.updated_tool_output = parsed.updated_tool_output;
     }
 }
 
@@ -619,6 +631,9 @@ fn parse_hook_output(
         }
         if let Some(updated_input) = specific.get("updatedInput") {
             parsed.updated_input = serde_json::to_string(updated_input).ok();
+        }
+        if let Some(updated_output) = specific.get("updatedToolOutput") {
+            parsed.updated_tool_output = serde_json::to_string(updated_output).ok();
         }
     }
 
@@ -737,7 +752,7 @@ fn format_hook_failure(command: &str, code: i32, stdout: Option<&str>, stderr: &
 
 fn shell_command(command: &str) -> CommandWithStdin {
     #[cfg(windows)]
-    let mut command_builder = {
+    let command_builder = {
         let mut command_builder = Command::new("cmd");
         command_builder.arg("/C").arg(command);
         CommandWithStdin::new(command_builder)
@@ -1102,6 +1117,49 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn parses_post_hook_updated_tool_output() {
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            Vec::new(),
+            vec![shell_snippet(
+                r#"printf '%s' '{"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":{"stdout":"replaced content","stderr":"","interrupted":false,"isImage":false}}}'"#,
+            )],
+            Vec::new(),
+        ));
+
+        let result = runner.run_post_tool_use(
+            "Read",
+            r#"{"file_path":"test.txt"}"#,
+            "original content",
+            false,
+        );
+
+        assert_eq!(
+            result.updated_tool_output(),
+            Some(r#"{"stdout":"replaced content","stderr":"","interrupted":false,"isImage":false}"#)
+        );
+    }
+
+    #[test]
+    fn post_hook_without_updated_tool_output_returns_none() {
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            Vec::new(),
+            vec![shell_snippet(
+                r#"printf '%s' '{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"info"}}'"#,
+            )],
+            Vec::new(),
+        ));
+
+        let result = runner.run_post_tool_use(
+            "Read",
+            r#"{"file_path":"test.txt"}"#,
+            "original content",
+            false,
+        );
+
+        assert_eq!(result.updated_tool_output(), None);
     }
 
     #[cfg(windows)]

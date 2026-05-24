@@ -472,6 +472,10 @@ where
                                 false,
                             )
                         };
+                        // If hook returns updated_tool_output, replace the tool output
+                        if let Some(updated_output) = post_hook_result.updated_tool_output() {
+                            output = updated_output.to_string();
+                        }
                         if post_hook_result.is_denied()
                             || post_hook_result.is_failed()
                             || post_hook_result.is_cancelled()

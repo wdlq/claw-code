@@ -1,0 +1,5 @@
+{
+  "hooks": {
+    "PostToolUse": ["python .claw/hooks/keyword_redactor.py"]
+  }
+}
