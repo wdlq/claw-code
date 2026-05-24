@@ -60,11 +60,6 @@ def main():
         tool_name = input_data.get("tool_name", "")
         tool_input = input_data.get("tool_input", {})
 
-        # Only process Write and Edit tools (claw uses write_file and edit_file)
-        if tool_name not in ("Write", "Edit", "write_file", "edit_file"):
-            print(json.dumps({}))
-            sys.exit(0)
-
         # Process based on tool type
         if tool_name in ("Write", "write_file"):
             content = tool_input.get("content", "")
@@ -119,6 +114,61 @@ def main():
                         "permissionDecision": "allow"
                     }
                 }))
+
+        elif tool_name in ("Bash", "bash", "PowerShell"):
+            # For Bash/PowerShell, restore keywords in the command
+            command = tool_input.get("command", "")
+            restored_command = restore_keywords(command)
+
+            if restored_command != command:
+                result = {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                        "updatedInput": {
+                            **tool_input,
+                            "command": restored_command
+                        }
+                    }
+                }
+                print(json.dumps(result))
+            else:
+                print(json.dumps({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow"
+                    }
+                }))
+
+        elif tool_name in ("NotebookEdit", "notebook_edit"):
+            # For NotebookEdit, restore keywords in new_source
+            new_source = tool_input.get("new_source", "")
+            restored_source = restore_keywords(new_source)
+
+            if restored_source != new_source:
+                result = {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                        "updatedInput": {
+                            **tool_input,
+                            "new_source": restored_source
+                        }
+                    }
+                }
+                print(json.dumps(result))
+            else:
+                print(json.dumps({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow"
+                    }
+                }))
+
+        else:
+            # For other tools, pass through without modification
+            print(json.dumps({}))
+            sys.exit(0)
 
         sys.exit(0)
 
