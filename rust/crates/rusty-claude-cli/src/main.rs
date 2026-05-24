@@ -387,7 +387,27 @@ fn plugin_load_failure_json(failure: &plugins::PluginLoadFailure) -> Value {
     })
 }
 
+/// Load env vars from settings.json and apply them to the process environment.
+/// Settings.json env vars override system environment variables.
+fn apply_config_env() {
+    let Ok(cwd) = env::current_dir() else {
+        return;
+    };
+    let loader = ConfigLoader::default_for(&cwd);
+    let Ok(config) = loader.load() else {
+        return;
+    };
+    if let Some(env_map) = config.get("env").and_then(|v| v.as_object()) {
+        for (key, value) in env_map {
+            if let Some(val_str) = value.as_str() {
+                env::set_var(key, val_str);
+            }
+        }
+    }
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    apply_config_env();
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args)? {
         CliAction::DumpManifests {

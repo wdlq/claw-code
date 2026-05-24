@@ -1,0 +1,78 @@
+
+● 构建成功！现在可以测试了：
+
+  # 重启 claw
+  & "E:\Claude Code\claw-code\rust\target\debug\claw.exe"
+
+  settings.json 中的 env
+  配置现在会在启动时自动应用到进程环境变量中，并且会覆盖系统环境变量：
+
+  {
+    "env": {
+      "OPENAI_API_KEY": "not-needed",
+      "OPENAI_BASE_URL": "http://localhost:10001/v1"
+    },
+    "model": "local-model",
+    "hooks": {
+      "PreToolUse": ["python .claw/hooks/keyword_restorer.py"],
+      "PostToolUse": ["python .claw/hooks/keyword_redactor.py"]
+    }
+  }
+
+  这样配置后，claw 会使用本地 llama.cpp 的 API 而不是 Anthropic 的 API。
+
+✻ Brewed for 18m 3s
+
+❯ 像你那样写是可以了。为什么我这么写又不行了？                              
+  {                                                                         
+  "env": {                                                                  
+  "ANTHROPIC_DEFAULT_OPUS_MODEL": "mimo-v2.5-pro",                          
+  "ANTHROPIC_AUTH_TOKEN": "XXXXXXX",                                        
+  "ANTHROPIC_BASE_URL":                                                     
+  "https://token-plan-cn.xiaomimimo.com/anthropic"                          
+  },                                                                        
+  "hooks": {                                                                
+  "PreToolUse": ["python .claw/hooks/keyword_restorer.py"],                 
+  "PostToolUse": ["python .claw/hooks/keyword_redactor.py"]                 
+  }                                                                         
+  }                                                                         
+  我现在又用回了MIMO模型                                                    
+
+● 问题是 ANTHROPIC_DEFAULT_OPUS_MODEL 不是 claw-code 支持的环境变量。让我检查
+  claw-code 支持哪些：
+
+● Searched for 1 pattern (ctrl+o to expand)
+
+● ANTHROPIC_DEFAULT_OPUS_MODEL 不是 claw-code 支持的环境变量。claw-code 使用的是
+   ANTHROPIC_MODEL。
+
+  正确的配置：
+
+  {
+    "env": {
+      "ANTHROPIC_MODEL": "mimo-v2.5-pro",
+      "ANTHROPIC_AUTH_TOKEN": "XXXXXXX",
+      "ANTHROPIC_BASE_URL": "https://token-plan-cn.xiaomimimo.com/anthropic"
+    },
+    "hooks": {
+      "PreToolUse": ["python .claw/hooks/keyword_restorer.py"],
+      "PostToolUse": ["python .claw/hooks/keyword_redactor.py"]
+    }
+  }
+
+  claw-code 支持的环境变量：
+  ┌──────────────────────┬──────────────┐
+  │       环境变量       │     用途     │
+  ├──────────────────────┼──────────────┤
+  │ ANTHROPIC_API_KEY    │ API Key      │
+  ├──────────────────────┼──────────────┤
+  │ ANTHROPIC_AUTH_TOKEN │ Bearer Token │
+  ├──────────────────────┼──────────────┤
+  │ ANTHROPIC_BASE_URL   │ API 端点     │
+  ├──────────────────────┼──────────────┤
+  │ ANTHROPIC_MODEL      │ 模型名称     │
+  └──────────────────────┴──────────────┘
+  ANTHROPIC_DEFAULT_OPUS_MODEL、ANTHROPIC_DEFAULT_SONNET_MODEL 等是官方 Claude 
+  Code 特有的，claw-code 不支持。
+
+✻ Cogitated for 54s
