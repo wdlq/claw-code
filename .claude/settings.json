@@ -1,16 +1,4 @@
 {
   "hooks": {
-    "PostToolUse": [
-      {
-        "matcher": "Read|Grep",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python .claude/hooks/keyword_redactor.py",
-            "timeout": 30
-          }
-        ]
-      }
-    ]
   }
 }
