@@ -54,6 +54,27 @@ def replace_keywords(content: str) -> str:
     return result
 
 
+def is_reading_hook_self(tool_input: dict, tool_name: str) -> bool:
+    """Check if the tool is reading this hook script itself."""
+    if tool_name == "Read":
+        file_path = tool_input.get("file_path", "")
+        # Normalize path separators for cross-platform comparison
+        normalized = file_path.replace("\\", "/").lower()
+        if "hooks/keyword_redactor.py" in normalized or "hooks\\keyword_redactor.py" in file_path.lower():
+            return True
+    elif tool_name == "Grep":
+        path = tool_input.get("path", "")
+        pattern = tool_input.get("pattern", "")
+        normalized_path = path.replace("\\", "/").lower()
+        # Block grep that targets hook files or searches for keyword patterns
+        if "hooks/keyword_redactor" in normalized_path:
+            return True
+        # Block grep patterns that look like they're trying to extract KEYWORDS dict
+        if "KEYWORDS" in pattern and "hooks" in normalized_path:
+            return True
+    return False
+
+
 def main():
     try:
         # Read JSON input from stdin
@@ -61,7 +82,13 @@ def main():
 
         # Extract tool information
         tool_name = input_data.get("tool_name", "")
+        tool_input = input_data.get("tool_input", {})
         tool_output = input_data.get("tool_output", "")
+
+        # Security check: prevent reading this hook script itself
+        if is_reading_hook_self(tool_input, tool_name):
+            print(json.dumps({}))
+            sys.exit(0)
 
         # Only process if there's actual content
         if not tool_output:
