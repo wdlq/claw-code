@@ -11,25 +11,44 @@ For Edit tools, it restores BOTH old_string and new_string so that:
 
 Usage:
 - Add to .claude/settings.json as a PreToolUse hook for Write and Edit tools
+- Edit keywords_config.py to define your own keywords and replacement patterns
 """
 
 import sys
 import json
 import hashlib
+import platform
+import os
 
-# ============================================================
-# CONFIGURATION: Must match keyword_redactor.py
-# ============================================================
+# Import shared configuration
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from keywords_config import KEYWORDS, HASH_LENGTH
 
-KEYWORDS = {
-    "AAA": "REDACTED_AAA_{hash}",
-    "BBB": "REDACTED_BBB_{hash}",
-    "SECRET_KEY": "REDACTED_KEY_{hash}",
-    "PASSWORD": "REDACTED_PWD_{hash}",
-    "API_TOKEN": "REDACTED_TOKEN_{hash}",
+# Windows command replacements (Unix -> Windows)
+WINDOWS_CMD_REPLACEMENTS = {
+    # file viewing
+    "cat ": "type ",
+    "cat\t": "type\t",
+    # search
+    "grep -r ": "findstr /S /I ",
+    "grep ": "findstr /I ",
+    "grep\t": "findstr /I\t",
+    # list files
+    "ls ": "dir ",
+    "ls\t": "dir\t",
+    "ls": "dir",
+    # remove
+    "rm ": "del ",
+    "rm\t": "del\t",
+    # move/rename
+    "mv ": "move ",
+    "mv\t": "move\t",
+    # copy
+    "cp ": "copy ",
+    "cp\t": "copy\t",
+    # clear screen
+    "clear": "cls",
 }
-
-HASH_LENGTH = 8
 
 # ============================================================
 # IMPLEMENTATION
@@ -51,6 +70,26 @@ def restore_keywords(content: str) -> str:
     return result
 
 
+def convert_unix_cmd_to_windows(command: str) -> str:
+    """Convert Unix commands to Windows equivalents on Windows platform."""
+    if platform.system() != "Windows":
+        return command
+
+    result = command
+    for unix_cmd, windows_cmd in WINDOWS_CMD_REPLACEMENTS.items():
+        # Only replace at the beginning of command or after pipe/semicolon
+        # Simple approach: replace if command starts with unix_cmd
+        if result.startswith(unix_cmd):
+            result = windows_cmd + result[len(unix_cmd):]
+            break
+        # Also handle commands after pipe
+        if "| " + unix_cmd in result:
+            result = result.replace("| " + unix_cmd, "| " + windows_cmd, 1)
+            break
+
+    return result
+
+
 def main():
     try:
         # Read JSON input from stdin
@@ -66,7 +105,7 @@ def main():
             restored_content = restore_keywords(content)
 
             if restored_content != content:
-                result = {
+                print(json.dumps({
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "allow",
@@ -75,8 +114,7 @@ def main():
                             "content": restored_content
                         }
                     }
-                }
-                print(json.dumps(result))
+                }))
             else:
                 print(json.dumps({
                     "hookSpecificOutput": {
@@ -95,7 +133,7 @@ def main():
 
             # Check if any changes were made
             if restored_old != old_string or restored_new != new_string:
-                result = {
+                print(json.dumps({
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "allow",
@@ -105,8 +143,7 @@ def main():
                             "new_string": restored_new
                         }
                     }
-                }
-                print(json.dumps(result))
+                }))
             else:
                 print(json.dumps({
                     "hookSpecificOutput": {
@@ -116,12 +153,14 @@ def main():
                 }))
 
         elif tool_name in ("Bash", "bash", "PowerShell"):
-            # For Bash/PowerShell, restore keywords in the command
+            # For Bash/PowerShell, restore keywords and convert commands
             command = tool_input.get("command", "")
             restored_command = restore_keywords(command)
+            # Convert Unix commands to Windows equivalents
+            restored_command = convert_unix_cmd_to_windows(restored_command)
 
             if restored_command != command:
-                result = {
+                print(json.dumps({
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "allow",
@@ -130,8 +169,7 @@ def main():
                             "command": restored_command
                         }
                     }
-                }
-                print(json.dumps(result))
+                }))
             else:
                 print(json.dumps({
                     "hookSpecificOutput": {
@@ -146,7 +184,7 @@ def main():
             restored_source = restore_keywords(new_source)
 
             if restored_source != new_source:
-                result = {
+                print(json.dumps({
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "allow",
@@ -155,8 +193,7 @@ def main():
                             "new_source": restored_source
                         }
                     }
-                }
-                print(json.dumps(result))
+                }))
             else:
                 print(json.dumps({
                     "hookSpecificOutput": {
