@@ -7,29 +7,17 @@ The replacement is deterministic - the same keyword always produces the same rep
 
 Usage:
 - Add to .claude/settings.json to activate
-- Customize KEYWORDS dict to define your own keywords and replacement patterns
+- Edit keywords_config.py to define your own keywords and replacement patterns
 """
 
 import sys
 import json
 import hashlib
+import os
 
-# ============================================================
-# CONFIGURATION: Define keywords to replace
-# ============================================================
-# Format: "keyword": "replacement_pattern"
-# Use {hash} in pattern to insert a deterministic hash value
-
-KEYWORDS = {
-    "AAA": "REDACTED_AAA_{hash}",
-    "BBB": "REDACTED_BBB_{hash}",
-    "SECRET_KEY": "REDACTED_KEY_{hash}",
-    "PASSWORD": "REDACTED_PWD_{hash}",
-    "API_TOKEN": "REDACTED_TOKEN_{hash}",
-}
-
-# Hash length to use (shorter = more compact output)
-HASH_LENGTH = 8
+# Import shared configuration
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from keywords_config import KEYWORDS, HASH_LENGTH
 
 # ============================================================
 # IMPLEMENTATION (no need to modify below this line)
@@ -55,19 +43,27 @@ def replace_keywords(content: str) -> str:
 
 
 def is_reading_hook_self(tool_input: dict, tool_name: str) -> bool:
-    """Check if the tool is reading this hook script itself."""
+    """Check if the tool is reading hook scripts or config files."""
+    # Files to protect from reading
+    protected_files = [
+        "hooks/keyword_redactor.py",
+        "hooks/keyword_restorer.py",
+        "hooks/keywords_config.py",
+    ]
+
     if tool_name == "Read":
         file_path = tool_input.get("file_path", "")
         # Normalize path separators for cross-platform comparison
         normalized = file_path.replace("\\", "/").lower()
-        if "hooks/keyword_redactor.py" in normalized or "hooks\\keyword_redactor.py" in file_path.lower():
-            return True
+        for protected in protected_files:
+            if protected in normalized:
+                return True
     elif tool_name == "Grep":
         path = tool_input.get("path", "")
         pattern = tool_input.get("pattern", "")
         normalized_path = path.replace("\\", "/").lower()
         # Block grep that targets hook files or searches for keyword patterns
-        if "hooks/keyword_redactor" in normalized_path:
+        if "hooks/" in normalized_path and ("keyword_redactor" in normalized_path or "keyword_restorer" in normalized_path or "keywords_config" in normalized_path):
             return True
         # Block grep patterns that look like they're trying to extract KEYWORDS dict
         if "KEYWORDS" in pattern and "hooks" in normalized_path:

@@ -279,7 +279,19 @@ pub fn edit_file(
             "old_string and new_string must differ",
         ));
     }
-    if !original_file.contains(old_string) {
+
+    // Normalize line endings: convert old_string to match file's line endings
+    let (normalized_old, normalized_new) = if original_file.contains("\r\n") && !old_string.contains("\r\n") {
+        // File uses \r\n, but old_string uses \n - convert old_string and new_string
+        (old_string.replace("\n", "\r\n"), new_string.replace("\n", "\r\n"))
+    } else if !original_file.contains("\r\n") && old_string.contains("\r\n") {
+        // File uses \n, but old_string uses \r\n - convert old_string and new_string
+        (old_string.replace("\r\n", "\n"), new_string.replace("\r\n", "\n"))
+    } else {
+        (old_string.to_string(), new_string.to_string())
+    };
+
+    if !original_file.contains(normalized_old.as_str()) {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "old_string not found in file",
@@ -287,9 +299,9 @@ pub fn edit_file(
     }
 
     let updated = if replace_all {
-        original_file.replace(old_string, new_string)
+        original_file.replace(normalized_old.as_str(), normalized_new.as_str())
     } else {
-        original_file.replacen(old_string, new_string, 1)
+        original_file.replacen(normalized_old.as_str(), normalized_new.as_str(), 1)
     };
     fs::write(&absolute_path, &updated)?;
 
