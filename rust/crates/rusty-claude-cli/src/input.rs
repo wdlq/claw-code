@@ -13,7 +13,7 @@ use rustyline::{
     Cmd, CompletionType, Config, Context, EditMode, Editor, Helper, KeyCode, KeyEvent, Modifiers,
 };
 
-const PASTE_LINE_THRESHOLD: usize = 6;
+const PASTE_LINE_THRESHOLD: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadOutcome {
@@ -247,32 +247,25 @@ impl LineEditor {
     /// Read a line with paste detection.
     /// After readline returns, check if the result looks like a paste
     /// from the clipboard. If so, register it and return the label.
-    /// On subsequent calls, consume remaining paste lines from stdin.
-    /// After all paste lines are consumed, wait for user to press Enter.
+    /// On subsequent calls, skip lines that are part of the paste injection.
     pub fn read_line_with_paste_detection(&mut self) -> io::Result<ReadOutcome> {
-        // If we have pending paste lines to consume, do that first
+        // If we have lines to skip (from a previous paste detection),
+        // call readline to consume the injected line, but don't submit it
         if self.paste_manager.lines_to_consume > 0 {
             self.paste_manager.lines_to_consume -= 1;
             if let Some(helper) = self.editor.helper_mut() {
                 helper.reset_current_line();
             }
-            // Read and discard the paste injection line
-            match self.editor.readline("") {
+            // Read the injected line (this consumes it from the console buffer)
+            match self.editor.readline(&self.prompt) {
                 Ok(_) => {
-                    // If this was the last line, let user type more before submitting
+                    // If this was the last line to skip, let user type more
                     if self.paste_manager.lines_to_consume == 0 {
                         if let Some(label) = self.paste_manager.pending_label.take() {
-                            // Show prompt and let user type additional text
-                            let mut stdout = io::stdout();
-                            write!(stdout, "{}", self.prompt)?;
-                            stdout.flush()?;
-
-                            // Read user input
-                            if let Some(helper) = self.editor.helper_mut() {
-                                helper.reset_current_line();
-                            }
-                            match self.editor.readline(&self.prompt) {
-                                Ok(additional) => {
+                            // Call read_line_with_paste_detection for additional input
+                            // This allows detecting a second paste
+                            match self.read_line_with_paste_detection() {
+                                Ok(ReadOutcome::Submit(additional)) => {
                                     let additional = additional.trim();
                                     if additional.is_empty() {
                                         return Ok(ReadOutcome::Submit(label));
@@ -281,19 +274,12 @@ impl LineEditor {
                                         return Ok(ReadOutcome::Submit(combined));
                                     }
                                 }
-                                Err(ReadlineError::Interrupted) => {
-                                    self.finish_interrupted_read()?;
-                                    return Ok(ReadOutcome::Submit(label));
-                                }
-                                Err(ReadlineError::Eof) => {
-                                    self.finish_interrupted_read()?;
-                                    return Ok(ReadOutcome::Submit(label));
-                                }
-                                Err(error) => return Err(io::Error::other(error)),
+                                Ok(outcome) => return Ok(outcome),
+                                Err(error) => return Err(error),
                             }
                         }
                     }
-                    // More lines to consume, recurse
+                    // More lines to skip, recurse
                     return self.read_line_with_paste_detection();
                 }
                 Err(ReadlineError::Interrupted) => {
@@ -318,6 +304,9 @@ impl LineEditor {
             }
         }
 
+        // Save clipboard before readline for comparison
+        let clipboard_before = clipboard_win::get_clipboard_string().unwrap_or_default();
+
         if let Some(helper) = self.editor.helper_mut() {
             helper.reset_current_line();
         }
@@ -327,8 +316,10 @@ impl LineEditor {
                 // Read clipboard AFTER readline returns
                 let clipboard_after = clipboard_win::get_clipboard_string().unwrap_or_default();
 
-                // Check if this looks like a paste from clipboard
+                // Check if clipboard changed and looks like a paste
+                let clipboard_changed = clipboard_before != clipboard_after;
                 let clipboard_line_count = clipboard_after.lines().count();
+
                 if clipboard_line_count > PASTE_LINE_THRESHOLD {
                     let first_line = clipboard_after.lines().next().unwrap_or("");
                     // If the returned line ends with the first line of clipboard,
@@ -340,11 +331,12 @@ impl LineEditor {
                             writeln!(stdout, "{}", label)?;
                             stdout.flush()?;
 
-                            // Set up to consume remaining paste lines
+                            // Set up to skip remaining paste lines
+                            // The remaining lines (2..N) are already in the console buffer
                             self.paste_manager.lines_to_consume = clipboard_line_count - 1;
                             self.paste_manager.pending_label = Some(label.clone());
 
-                            // Start consuming remaining lines
+                            // Start skipping remaining lines
                             return self.read_line_with_paste_detection();
                         }
                     }
