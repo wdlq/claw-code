@@ -14,6 +14,7 @@ use rustyline::{
 };
 
 const PASTE_LINE_THRESHOLD: usize = 2;
+const PASTE_DISPLAY_THRESHOLD: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadOutcome {
@@ -28,6 +29,7 @@ pub struct PasteManager {
     pastes: HashMap<String, String>,
     lines_to_consume: usize,
     pending_label: Option<String>,
+    is_large_paste: bool,
 }
 
 impl PasteManager {
@@ -37,6 +39,7 @@ impl PasteManager {
             pastes: HashMap::new(),
             lines_to_consume: 0,
             pending_label: None,
+            is_large_paste: false,
         }
     }
 
@@ -259,9 +262,19 @@ impl LineEditor {
             // Read the injected line (this consumes it from the console buffer)
             match self.editor.readline(&self.prompt) {
                 Ok(_) => {
+                    // For large pastes, clear the consumed line from terminal
+                    if self.paste_manager.is_large_paste {
+                        let mut stdout = io::stdout();
+                        // Move cursor up 1 line and clear it
+                        write!(stdout, "\x1b[1A\x1b[2K")?;
+                        stdout.flush()?;
+                    }
+
                     // If this was the last line to skip, let user type more
                     if self.paste_manager.lines_to_consume == 0 {
                         if let Some(label) = self.paste_manager.pending_label.take() {
+                            self.paste_manager.is_large_paste = false;
+
                             // Call read_line_with_paste_detection for additional input
                             // This allows detecting a second paste
                             match self.read_line_with_paste_detection() {
@@ -326,6 +339,9 @@ impl LineEditor {
                     // it's likely a paste (user may have typed text before pasting)
                     if line.trim().ends_with(first_line.trim()) && !first_line.trim().is_empty() {
                         if let Some(label) = self.paste_manager.register_paste(clipboard_after.trim()) {
+                            // Check if this is a large paste that should suppress display
+                            self.paste_manager.is_large_paste = clipboard_line_count > PASTE_DISPLAY_THRESHOLD;
+
                             let mut stdout = io::stdout();
                             writeln!(stdout)?;
                             writeln!(stdout, "{}", label)?;
