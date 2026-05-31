@@ -4201,7 +4201,8 @@ fn run_resume_command(
         | SlashCommand::Ide { .. }
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
-        | SlashCommand::AddDir { .. } => Err("unsupported resumed slash command".into()),
+        | SlashCommand::AddDir { .. }
+        | SlashCommand::Paste => Err("unsupported resumed slash command".into()),
     }
 }
 
@@ -4334,7 +4335,7 @@ fn run_repl(
 
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
-        match editor.read_line()? {
+        match editor.read_line_with_paste_detection()? {
             input::ReadOutcome::Submit(input) => {
                 let trimmed = input.trim().to_string();
                 if trimmed.is_empty() {
@@ -4357,19 +4358,23 @@ fn run_repl(
                         continue;
                     }
                 }
+
+                // Resolve paste labels to full content
+                let resolved = editor.paste_manager().resolve_all_labels(&trimmed);
+
                 // Bare-word skill dispatch: if the first token of the input
                 // matches a known skill name, invoke it as `/skills <input>`
                 // rather than forwarding raw text to the LLM (ROADMAP #36).
                 let cwd = std::env::current_dir().unwrap_or_default();
-                if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
+                if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &resolved) {
                     editor.push_history(input);
-                    cli.record_prompt_history(&trimmed);
+                    cli.record_prompt_history(&resolved);
                     cli.run_turn(&prompt)?;
                     continue;
                 }
                 editor.push_history(input);
-                cli.record_prompt_history(&trimmed);
-                cli.run_turn(&trimmed)?;
+                cli.record_prompt_history(&resolved);
+                cli.run_turn(&resolved)?;
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -5270,6 +5275,26 @@ impl LiveCli {
             SlashCommand::History { count } => {
                 self.print_prompt_history(count.as_deref());
                 false
+            }
+            SlashCommand::Paste => {
+                // Read clipboard content and run as prompt
+                match clipboard_win::get_clipboard_string() {
+                    Ok(content) => {
+                        let trimmed = content.trim();
+                        if trimmed.is_empty() {
+                            eprintln!("Clipboard is empty.");
+                            false
+                        } else {
+                            // Run the clipboard content as a turn
+                            self.run_turn(trimmed)?;
+                            false
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to read clipboard: {e}");
+                        false
+                    }
+                }
             }
             SlashCommand::Stats => {
                 let usage = UsageTracker::from_session(self.runtime.session()).cumulative_usage();
@@ -9178,7 +9203,6 @@ const STUB_COMMANDS: &[&str] = &[
     "undo",
     "stop",
     "retry",
-    "paste",
     "screenshot",
     "image",
     "search",

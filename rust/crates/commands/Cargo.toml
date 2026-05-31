@@ -12,3 +12,4 @@ workspace = true
 plugins = { path = "../plugins" }
 runtime = { path = "../runtime" }
 serde_json.workspace = true
+clipboard-win = "5"

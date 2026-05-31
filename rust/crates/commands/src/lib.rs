@@ -1179,6 +1179,7 @@ pub enum SlashCommand {
     History {
         count: Option<String>,
     },
+    Paste,
     Unknown(String),
 }
 
@@ -1491,6 +1492,10 @@ pub fn validate_slash_command_input(
         "history" => SlashCommand::History {
             count: optional_single_arg(command, &args, "[count]")?,
         },
+        "paste" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Paste
+        }
         other => SlashCommand::Unknown(other.to_string()),
     }))
 }
@@ -4312,6 +4317,7 @@ pub fn handle_slash_command(
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
         | SlashCommand::History { .. }
+        | SlashCommand::Paste
         | SlashCommand::Unknown(_) => None,
     }
 }

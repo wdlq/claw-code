@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{self, IsTerminal, Write};
 
 use rustyline::completion::{Completer, Pair};
@@ -13,11 +13,59 @@ use rustyline::{
     Cmd, CompletionType, Config, Context, EditMode, Editor, Helper, KeyCode, KeyEvent, Modifiers,
 };
 
+const PASTE_LINE_THRESHOLD: usize = 6;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadOutcome {
     Submit(String),
     Cancel,
     Exit,
+}
+
+/// Manages paste detection, counting, and content storage.
+pub struct PasteManager {
+    paste_count: usize,
+    pastes: HashMap<String, String>,
+    lines_to_consume: usize,
+    pending_label: Option<String>,
+}
+
+impl PasteManager {
+    pub fn new() -> Self {
+        Self {
+            paste_count: 0,
+            pastes: HashMap::new(),
+            lines_to_consume: 0,
+            pending_label: None,
+        }
+    }
+
+    /// Register a paste and return its label if it exceeds the threshold.
+    pub fn register_paste(&mut self, content: &str) -> Option<String> {
+        let line_count = content.lines().count();
+        if line_count <= PASTE_LINE_THRESHOLD {
+            return None;
+        }
+
+        self.paste_count += 1;
+        let label = format!("[Paste text #{} +{} lines]", self.paste_count, line_count);
+        self.pastes.insert(label.clone(), content.to_string());
+        Some(label)
+    }
+
+    /// Resolve all paste labels in the input to their full content.
+    pub fn resolve_all_labels(&self, input: &str) -> String {
+        let mut result = input.to_string();
+        for (label, content) in &self.pastes {
+            result = result.replace(label, content);
+        }
+        result
+    }
+
+    /// Check if input contains any paste labels.
+    pub fn has_labels(&self, input: &str) -> bool {
+        self.pastes.keys().any(|label| input.contains(label))
+    }
 }
 
 struct SlashCommandHelper {
@@ -101,6 +149,7 @@ impl Helper for SlashCommandHelper {}
 pub struct LineEditor {
     prompt: String,
     editor: Editor<SlashCommandHelper, DefaultHistory>,
+    paste_manager: PasteManager,
 }
 
 impl LineEditor {
@@ -109,17 +158,30 @@ impl LineEditor {
         let config = Config::builder()
             .completion_type(CompletionType::List)
             .edit_mode(EditMode::Emacs)
+            .bracketed_paste(true)
             .build();
         let mut editor = Editor::<SlashCommandHelper, DefaultHistory>::with_config(config)
             .expect("rustyline editor should initialize");
         editor.set_helper(Some(SlashCommandHelper::new(completions)));
         editor.bind_sequence(KeyEvent(KeyCode::Char('J'), Modifiers::CTRL), Cmd::Newline);
+        editor.bind_sequence(KeyEvent(KeyCode::Char('M'), Modifiers::CTRL), Cmd::Newline);
         editor.bind_sequence(KeyEvent(KeyCode::Enter, Modifiers::SHIFT), Cmd::Newline);
 
         Self {
             prompt: prompt.into(),
             editor,
+            paste_manager: PasteManager::new(),
         }
+    }
+
+    /// Get a reference to the paste manager.
+    pub fn paste_manager(&self) -> &PasteManager {
+        &self.paste_manager
+    }
+
+    /// Get a mutable reference to the paste manager.
+    pub fn paste_manager_mut(&mut self) -> &mut PasteManager {
+        &mut self.paste_manager
     }
 
     pub fn push_history(&mut self, entry: impl Into<String>) {
@@ -147,7 +209,133 @@ impl LineEditor {
         }
 
         match self.editor.readline(&self.prompt) {
-            Ok(line) => Ok(ReadOutcome::Submit(line)),
+            Ok(line) => {
+                // Check if this is a multi-line paste that exceeds threshold
+                let line_count = line.lines().count();
+                if line_count > PASTE_LINE_THRESHOLD {
+                    // Register the paste and get label
+                    if let Some(label) = self.paste_manager.register_paste(&line) {
+                        // Print the label on a new line
+                        let mut stdout = io::stdout();
+                        writeln!(stdout)?;
+                        writeln!(stdout, "{}", label)?;
+                        write!(stdout, "{}", self.prompt)?;
+                        stdout.flush()?;
+
+                        // Return the label as the input (will be resolved later)
+                        return Ok(ReadOutcome::Submit(label));
+                    }
+                }
+                Ok(ReadOutcome::Submit(line))
+            }
+            Err(ReadlineError::Interrupted) => {
+                let has_input = !self.current_line().is_empty();
+                self.finish_interrupted_read()?;
+                if has_input {
+                    Ok(ReadOutcome::Cancel)
+                } else {
+                    Ok(ReadOutcome::Exit)
+                }
+            }
+            Err(ReadlineError::Eof) => {
+                self.finish_interrupted_read()?;
+                Ok(ReadOutcome::Exit)
+            }
+            Err(error) => Err(io::Error::other(error)),
+        }
+    }
+
+    /// Read a line with paste detection.
+    /// After readline returns, check if the result looks like a paste
+    /// from the clipboard. If so, register it and return the label.
+    /// On subsequent calls, consume remaining paste lines from stdin.
+    pub fn read_line_with_paste_detection(&mut self) -> io::Result<ReadOutcome> {
+        // If we have pending paste lines to consume, do that first
+        if self.paste_manager.lines_to_consume > 0 {
+            self.paste_manager.lines_to_consume -= 1;
+            if let Some(helper) = self.editor.helper_mut() {
+                helper.reset_current_line();
+            }
+            // Read and discard the paste injection line
+            match self.editor.readline("") {
+                Ok(_) => {
+                    // If this was the last line, return the pending label
+                    if self.paste_manager.lines_to_consume == 0 {
+                        if let Some(label) = self.paste_manager.pending_label.take() {
+                            return Ok(ReadOutcome::Submit(label));
+                        }
+                    }
+                    // More lines to consume, recurse
+                    return self.read_line_with_paste_detection();
+                }
+                Err(ReadlineError::Interrupted) => {
+                    self.finish_interrupted_read()?;
+                    self.paste_manager.lines_to_consume = 0;
+                    if let Some(label) = self.paste_manager.pending_label.take() {
+                        return Ok(ReadOutcome::Submit(label));
+                    }
+                    return Ok(ReadOutcome::Cancel);
+                }
+                Err(ReadlineError::Eof) => {
+                    self.finish_interrupted_read()?;
+                    self.paste_manager.lines_to_consume = 0;
+                    self.paste_manager.pending_label = None;
+                    return Ok(ReadOutcome::Exit);
+                }
+                Err(error) => {
+                    self.paste_manager.lines_to_consume = 0;
+                    self.paste_manager.pending_label = None;
+                    return Err(io::Error::other(error));
+                }
+            }
+        }
+
+        if let Some(helper) = self.editor.helper_mut() {
+            helper.reset_current_line();
+        }
+
+        match self.editor.readline(&self.prompt) {
+            Ok(line) => {
+                // Read clipboard AFTER readline returns
+                let clipboard_after = clipboard_win::get_clipboard_string().unwrap_or_default();
+
+                // Check if this looks like a paste from clipboard
+                let clipboard_line_count = clipboard_after.lines().count();
+                if clipboard_line_count > PASTE_LINE_THRESHOLD {
+                    let first_line = clipboard_after.lines().next().unwrap_or("");
+                    // If the returned line matches the first line of clipboard,
+                    // it's likely a paste that got cut off at the first newline
+                    if line.trim() == first_line.trim() && !line.trim().is_empty() {
+                        if let Some(label) = self.paste_manager.register_paste(clipboard_after.trim()) {
+                            let mut stdout = io::stdout();
+                            writeln!(stdout)?;
+                            writeln!(stdout, "{}", label)?;
+                            stdout.flush()?;
+
+                            // Set up to consume remaining paste lines
+                            self.paste_manager.lines_to_consume = clipboard_line_count - 1;
+                            self.paste_manager.pending_label = Some(label.clone());
+
+                            // Start consuming remaining lines
+                            return self.read_line_with_paste_detection();
+                        }
+                    }
+                }
+
+                // Also check the returned line itself for multi-line content
+                let line_count = line.lines().count();
+                if line_count > PASTE_LINE_THRESHOLD {
+                    if let Some(label) = self.paste_manager.register_paste(&line) {
+                        let mut stdout = io::stdout();
+                        writeln!(stdout)?;
+                        writeln!(stdout, "{}", label)?;
+                        stdout.flush()?;
+                        return Ok(ReadOutcome::Submit(label));
+                    }
+                }
+
+                Ok(ReadOutcome::Submit(line))
+            }
             Err(ReadlineError::Interrupted) => {
                 let has_input = !self.current_line().is_empty();
                 self.finish_interrupted_read()?;
