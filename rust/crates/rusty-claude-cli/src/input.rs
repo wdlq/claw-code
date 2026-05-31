@@ -164,7 +164,6 @@ impl LineEditor {
             .expect("rustyline editor should initialize");
         editor.set_helper(Some(SlashCommandHelper::new(completions)));
         editor.bind_sequence(KeyEvent(KeyCode::Char('J'), Modifiers::CTRL), Cmd::Newline);
-        editor.bind_sequence(KeyEvent(KeyCode::Char('M'), Modifiers::CTRL), Cmd::Newline);
         editor.bind_sequence(KeyEvent(KeyCode::Enter, Modifiers::SHIFT), Cmd::Newline);
 
         Self {
@@ -249,6 +248,7 @@ impl LineEditor {
     /// After readline returns, check if the result looks like a paste
     /// from the clipboard. If so, register it and return the label.
     /// On subsequent calls, consume remaining paste lines from stdin.
+    /// After all paste lines are consumed, wait for user to press Enter.
     pub fn read_line_with_paste_detection(&mut self) -> io::Result<ReadOutcome> {
         // If we have pending paste lines to consume, do that first
         if self.paste_manager.lines_to_consume > 0 {
@@ -259,10 +259,38 @@ impl LineEditor {
             // Read and discard the paste injection line
             match self.editor.readline("") {
                 Ok(_) => {
-                    // If this was the last line, return the pending label
+                    // If this was the last line, let user type more before submitting
                     if self.paste_manager.lines_to_consume == 0 {
                         if let Some(label) = self.paste_manager.pending_label.take() {
-                            return Ok(ReadOutcome::Submit(label));
+                            // Show prompt and let user type additional text
+                            let mut stdout = io::stdout();
+                            write!(stdout, "{}", self.prompt)?;
+                            stdout.flush()?;
+
+                            // Read user input
+                            if let Some(helper) = self.editor.helper_mut() {
+                                helper.reset_current_line();
+                            }
+                            match self.editor.readline(&self.prompt) {
+                                Ok(additional) => {
+                                    let additional = additional.trim();
+                                    if additional.is_empty() {
+                                        return Ok(ReadOutcome::Submit(label));
+                                    } else {
+                                        let combined = format!("{}\n{}", label, additional);
+                                        return Ok(ReadOutcome::Submit(combined));
+                                    }
+                                }
+                                Err(ReadlineError::Interrupted) => {
+                                    self.finish_interrupted_read()?;
+                                    return Ok(ReadOutcome::Submit(label));
+                                }
+                                Err(ReadlineError::Eof) => {
+                                    self.finish_interrupted_read()?;
+                                    return Ok(ReadOutcome::Submit(label));
+                                }
+                                Err(error) => return Err(io::Error::other(error)),
+                            }
                         }
                     }
                     // More lines to consume, recurse
@@ -303,9 +331,9 @@ impl LineEditor {
                 let clipboard_line_count = clipboard_after.lines().count();
                 if clipboard_line_count > PASTE_LINE_THRESHOLD {
                     let first_line = clipboard_after.lines().next().unwrap_or("");
-                    // If the returned line matches the first line of clipboard,
-                    // it's likely a paste that got cut off at the first newline
-                    if line.trim() == first_line.trim() && !line.trim().is_empty() {
+                    // If the returned line ends with the first line of clipboard,
+                    // it's likely a paste (user may have typed text before pasting)
+                    if line.trim().ends_with(first_line.trim()) && !first_line.trim().is_empty() {
                         if let Some(label) = self.paste_manager.register_paste(clipboard_after.trim()) {
                             let mut stdout = io::stdout();
                             writeln!(stdout)?;
