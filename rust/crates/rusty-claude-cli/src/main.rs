@@ -5043,7 +5043,8 @@ impl LiveCli {
                 )?;
                 let final_text = final_assistant_text(&summary);
                 if !final_text.is_empty() {
-                    println!("{final_text}");
+                    let rendered = TerminalRenderer::new().markdown_to_ansi(&final_text);
+                    println!("{rendered}");
                 }
                 println!();
                 if let Some(event) = summary.auto_compaction {
@@ -9786,11 +9787,16 @@ fn push_output_block(
 ) -> Result<(), RuntimeError> {
     match block {
         OutputContentBlock::Text { text } => {
-            if !text.is_empty() {
+            // During streaming, text is rendered via MarkdownStreamState in the
+            // ContentBlockDelta handler. Only render here for non-streaming
+            // responses (streaming_tool_input == false means non-streaming).
+            if !text.is_empty() && !streaming_tool_input {
                 let rendered = TerminalRenderer::new().markdown_to_ansi(&text);
                 write!(out, "{rendered}")
                     .and_then(|()| out.flush())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
+                events.push(AssistantEvent::TextDelta(text));
+            } else if !text.is_empty() {
                 events.push(AssistantEvent::TextDelta(text));
             }
         }

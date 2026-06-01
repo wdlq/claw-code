@@ -10,6 +10,7 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ColorTheme {
@@ -249,7 +250,8 @@ impl TerminalRenderer {
 
     #[must_use]
     pub fn render_markdown(&self, markdown: &str) -> String {
-        let normalized = normalize_nested_fences(markdown);
+        let normalized = normalize_markdown(markdown);
+        let normalized = normalize_nested_fences(&normalized);
         let mut output = String::new();
         let mut state = RenderState::default();
         let mut code_language = String::new();
@@ -813,6 +815,140 @@ fn normalize_nested_fences(markdown: &str) -> String {
     out
 }
 
+/// Pre-process markdown to fix common formatting issues from LLM output.
+///
+/// - Ensures table rows have a separator row (`| --- |`) after the header
+/// - Ensures headings (`#`) and list items (`- `, `* `, `1. `) are preceded by a blank line
+fn normalize_markdown(markdown: &str) -> String {
+    let lines: Vec<&str> = markdown.split_inclusive('\n').collect();
+    let mut out = String::with_capacity(markdown.len() + 64);
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+
+        // --- Table fix: insert separator row if missing ---
+        // Only check on the FIRST row of a table (not preceded by another table row or separator).
+        let prev_is_table = i > 0 && {
+            let prev_trimmed = lines[i - 1]
+                .trim_end_matches('\n')
+                .trim_end_matches('\r');
+            is_table_row(prev_trimmed)
+        };
+        if is_table_row(trimmed) && !is_table_separator(trimmed) && !prev_is_table {
+            // This looks like a header row. Check if the next line is a separator.
+            let next_is_separator = lines
+                .get(i + 1)
+                .map(|l| {
+                    let t = l.trim_end_matches('\n').trim_end_matches('\r');
+                    is_table_separator(t)
+                })
+                .unwrap_or(false);
+
+            if !next_is_separator {
+                // Count columns from this row.
+                let col_count = trimmed.split('|').filter(|c| !c.trim().is_empty()).count().max(1);
+                // Ensure previous line is blank (CommonMark requires it).
+                if i > 0 {
+                    let prev = lines[i - 1]
+                        .trim_end_matches('\n')
+                        .trim_end_matches('\r')
+                        .trim();
+                    if !prev.is_empty() {
+                        out.push('\n');
+                    }
+                }
+                out.push_str(line);
+                if !line.ends_with('\n') {
+                    out.push('\n');
+                }
+                // Insert separator.
+                let separator: String = std::iter::once("|")
+                    .chain(std::iter::repeat(" --- |").take(col_count))
+                    .collect();
+                out.push_str(&separator);
+                out.push('\n');
+                i += 1;
+                continue;
+            }
+        }
+
+        // --- Blank line before headings ---
+        if is_atx_heading(trimmed) {
+            if i > 0 && !out.is_empty() {
+                let prev_out = out.trim_end_matches('\n');
+                if !prev_out.is_empty() {
+                    let last_line = prev_out.lines().last().unwrap_or("");
+                    if !last_line.trim().is_empty() {
+                        out.push('\n');
+                    }
+                }
+            }
+        }
+
+        // --- Blank line before list items ---
+        if (trimmed.starts_with("- ") || trimmed.starts_with("* ") || starts_with_ordered_list(trimmed))
+            && i > 0
+        {
+            let prev = lines[i - 1]
+                .trim_end_matches('\n')
+                .trim_end_matches('\r')
+                .trim();
+            if !prev.is_empty()
+                && !prev.starts_with("- ")
+                && !prev.starts_with("* ")
+                && !starts_with_ordered_list(prev)
+                && !prev.starts_with('|')
+            {
+                out.push('\n');
+            }
+        }
+
+        out.push_str(line);
+        i += 1;
+    }
+
+    out
+}
+
+fn is_table_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.len() > 2
+}
+
+fn is_table_separator(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('|')
+        && trimmed.ends_with('|')
+        && trimmed
+            .chars()
+            .all(|c| c == '|' || c == '-' || c == ':' || c == ' ')
+}
+
+fn starts_with_ordered_list(line: &str) -> bool {
+    let trimmed = line.trim();
+    if let Some(pos) = trimmed.find(". ") {
+        pos > 0 && pos <= 3 && trimmed[..pos].bytes().all(|b| b.is_ascii_digit())
+    } else {
+        false
+    }
+}
+
+fn is_atx_heading(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('#') {
+        return false;
+    }
+    let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+    if hashes > 6 {
+        return false;
+    }
+    // Must have a space after the hashes (or be exactly hashes only).
+    trimmed.len() == hashes
+        || trimmed.as_bytes().get(hashes).map_or(false, |&b| b == b' ')
+}
+
 fn find_stream_safe_boundary(markdown: &str) -> Option<usize> {
     let mut open_fence: Option<FenceMarker> = None;
     let mut last_boundary = None;
@@ -885,7 +1021,7 @@ fn line_closes_fence(line: &str, opener: FenceMarker) -> bool {
 }
 
 fn visible_width(input: &str) -> usize {
-    strip_ansi(input).chars().count()
+    strip_ansi(input).width()
 }
 
 fn strip_ansi(input: &str) -> String {
@@ -976,6 +1112,54 @@ mod tests {
         assert_eq!(lines[2], "│ alpha │ 1     │");
         assert_eq!(lines[3], "│ beta  │ 22    │");
         assert!(markdown_output.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn normalizes_table_without_separator() {
+        let renderer = TerminalRenderer::new();
+        // LLM often omits the separator row.
+        let output = renderer.render_markdown("| Name | Value |\n| alpha | 1 |\n| beta | 22 |");
+        let plain = strip_ansi(&output);
+        let lines = plain.lines().collect::<Vec<_>>();
+
+        // Should have 4 lines: header, separator, 2 data rows.
+        assert_eq!(lines.len(), 4, "got lines: {:?}", lines);
+        assert!(lines[0].contains("Name"));
+        // Separator uses ─ (box-drawing), not - (ASCII).
+        assert!(lines[1].contains('─'), "separator line: {}", lines[1]);
+        assert!(lines[2].contains("alpha"));
+        assert!(lines[3].contains("beta"));
+    }
+
+    #[test]
+    fn normalizes_table_without_separator_and_blank_line() {
+        let renderer = TerminalRenderer::new();
+        // LLM output: table without separator, preceded by text without blank line.
+        let output = renderer.render_markdown("some text\n| Name | Value |\n| alpha | 1 |\n| beta | 22 |");
+        let plain = strip_ansi(&output);
+        let lines = plain.lines().collect::<Vec<_>>();
+
+        // Should render as a table (not raw text with | pipes).
+        // Header row should have properly aligned cells.
+        let header = lines.iter().find(|l| l.contains("Name") && l.contains("Value")).expect("header row");
+        let header_borders: Vec<usize> = header.match_indices('│').map(|(i, _)| i).collect();
+        assert!(header_borders.len() >= 3, "header should have at least 3 borders, got {:?}", header_borders);
+        // Data rows should have matching border positions.
+        let data_row = lines.iter().find(|l| l.contains("alpha") && l.contains("1")).expect("alpha row");
+        let data_borders: Vec<usize> = data_row.match_indices('│').map(|(i, _)| i).collect();
+        assert_eq!(header_borders, data_borders, "data row borders don't match header");
+    }
+
+    #[test]
+    fn normalizes_heading_without_blank_line() {
+        let renderer = TerminalRenderer::new();
+        // Heading immediately after paragraph text (no blank line).
+        let output = renderer.render_markdown("some text\n## Heading\n\nparagraph");
+        let plain = strip_ansi(&output);
+
+        assert!(plain.contains("Heading"));
+        // The heading should be rendered as a heading (with styling), not as literal "## Heading".
+        assert!(output.contains('\u{1b}'), "heading should be styled with ANSI");
     }
 
     #[test]
