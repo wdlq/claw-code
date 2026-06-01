@@ -40,7 +40,11 @@ fn is_binary_file(path: &Path) -> io::Result<bool> {
 /// the workspace boundary (e.g. via `../` traversal or symlink).
 #[allow(dead_code)]
 fn validate_workspace_boundary(resolved: &Path, workspace_root: &Path) -> io::Result<()> {
-    if !resolved.starts_with(workspace_root) {
+    // Normalize both paths to handle Windows \\?\ prefix inconsistencies
+    let normalized_resolved = normalize_for_comparison(resolved);
+    let normalized_root = normalize_for_comparison(workspace_root);
+
+    if !normalized_resolved.starts_with(&normalized_root) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
@@ -51,6 +55,22 @@ fn validate_workspace_boundary(resolved: &Path, workspace_root: &Path) -> io::Re
         ));
     }
     Ok(())
+}
+
+/// Normalize a path for comparison by removing Windows \\?\ prefix if present.
+#[cfg(target_os = "windows")]
+fn normalize_for_comparison(path: &Path) -> PathBuf {
+    let path_str = path.to_string_lossy();
+    if path_str.starts_with("\\\\?\\") {
+        PathBuf::from(&path_str[4..])
+    } else {
+        path.to_path_buf()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn normalize_for_comparison(path: &Path) -> PathBuf {
+    path.to_path_buf()
 }
 
 /// Text payload returned by file-reading operations.
@@ -250,6 +270,19 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
     }
     fs::write(&absolute_path, content)?;
 
+    // For large files, include first 10 lines + modified parts + last 10 lines
+    let is_large_file = original_file.as_ref().map_or(false, |f| f.len() > 100000) || content.len() > 100000;
+
+    let original_file_output = original_file.as_ref().map(|f| {
+        if is_large_file {
+            format!("[File content omitted - {} bytes]", f.len())
+        } else {
+            f.clone()
+        }
+    });
+
+    let structured_patch = make_patch(original_file.as_deref().unwrap_or(""), content);
+
     Ok(WriteFileOutput {
         kind: if original_file.is_some() {
             String::from("update")
@@ -258,8 +291,8 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
         },
         file_path: absolute_path.to_string_lossy().into_owned(),
         content: content.to_owned(),
-        structured_patch: make_patch(original_file.as_deref().unwrap_or(""), content),
-        original_file,
+        structured_patch,
+        original_file: original_file_output,
         git_diff: None,
     })
 }
@@ -305,12 +338,26 @@ pub fn edit_file(
     };
     fs::write(&absolute_path, &updated)?;
 
+    // For large files, don't include the full original_file and patch in the output
+    // This reduces the output size and avoids API limits
+    // For large files, include first 10 lines + modified parts + last 10 lines
+    let is_large_file = original_file.len() > 100000;
+
+    let original_file_output = if is_large_file {
+        // For large files, only include a placeholder
+        format!("[File content omitted - {} bytes]", original_file.len())
+    } else {
+        original_file.clone()
+    };
+
+    let structured_patch = make_patch(&original_file, &updated);
+
     Ok(EditFileOutput {
         file_path: absolute_path.to_string_lossy().into_owned(),
         old_string: old_string.to_owned(),
         new_string: new_string.to_owned(),
-        original_file: original_file.clone(),
-        structured_patch: make_patch(&original_file, &updated),
+        original_file: original_file_output,
+        structured_patch,
         user_modified: false,
         replace_all,
         git_diff: None,
@@ -636,21 +683,131 @@ fn apply_limit<T>(
 }
 
 fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
-    let mut lines = Vec::new();
-    for line in original.lines() {
-        lines.push(format!("-{line}"));
-    }
-    for line in updated.lines() {
-        lines.push(format!("+{line}"));
+    let original_lines: Vec<&str> = original.lines().collect();
+    let updated_lines: Vec<&str> = updated.lines().collect();
+
+    // For small files, include all lines
+    if original_lines.len() <= 100 {
+        let mut lines = Vec::new();
+        for line in &original_lines {
+            lines.push(format!("-{line}"));
+        }
+        for line in &updated_lines {
+            lines.push(format!("+{line}"));
+        }
+        return vec![StructuredPatchHunk {
+            old_start: 1,
+            old_lines: original_lines.len(),
+            new_start: 1,
+            new_lines: updated_lines.len(),
+            lines,
+        }];
     }
 
-    vec![StructuredPatchHunk {
+    // For large files, include first 10 lines + changed sections + last 10 lines
+    let header_lines = 10;
+    let footer_lines = 10;
+    let mut hunks = Vec::new();
+
+    // First hunk: first 10 lines
+    let first_chunk_orig: Vec<String> = original_lines.iter().take(header_lines)
+        .map(|l| format!("-{l}"))
+        .collect();
+    let first_chunk_upd: Vec<String> = updated_lines.iter().take(header_lines)
+        .map(|l| format!("+{l}"))
+        .collect();
+
+    let mut first_lines = Vec::new();
+    first_lines.extend(first_chunk_orig);
+    first_lines.extend(first_chunk_upd);
+
+    hunks.push(StructuredPatchHunk {
         old_start: 1,
-        old_lines: original.lines().count(),
+        old_lines: header_lines.min(original_lines.len()),
         new_start: 1,
-        new_lines: updated.lines().count(),
-        lines,
-    }]
+        new_lines: header_lines.min(updated_lines.len()),
+        lines: first_lines,
+    });
+
+    // Middle hunks: changed sections
+    let mut i = 0;
+    let mut j = 0;
+
+    while i < original_lines.len() || j < updated_lines.len() {
+        // Skip matching lines
+        while i < original_lines.len() && j < updated_lines.len() && original_lines[i] == updated_lines[j] {
+            i += 1;
+            j += 1;
+        }
+
+        if i >= original_lines.len() && j >= updated_lines.len() {
+            break;
+        }
+
+        // Found a difference - collect the changed region
+        let change_start_orig = i;
+        let change_start_upd = j;
+
+        // Find end of changed region
+        while i < original_lines.len() && j < updated_lines.len() && original_lines[i] != updated_lines[j] {
+            i += 1;
+            j += 1;
+        }
+
+        // Also handle additions or deletions
+        while i < original_lines.len() && (j >= updated_lines.len() || original_lines[i] != updated_lines[j]) {
+            i += 1;
+        }
+        while j < updated_lines.len() && (i >= original_lines.len() || original_lines[i] != updated_lines[j]) {
+            j += 1;
+        }
+
+        let change_end_orig = i;
+        let change_end_upd = j;
+
+        // Build hunk lines for changed section
+        let mut hunk_lines = Vec::new();
+
+        // Removed lines
+        for idx in change_start_orig..change_end_orig {
+            hunk_lines.push(format!("-{}", original_lines[idx]));
+        }
+
+        // Added lines
+        for idx in change_start_upd..change_end_upd {
+            hunk_lines.push(format!("+{}", updated_lines[idx]));
+        }
+
+        hunks.push(StructuredPatchHunk {
+            old_start: change_start_orig + 1,
+            old_lines: change_end_orig - change_start_orig,
+            new_start: change_start_upd + 1,
+            new_lines: change_end_upd - change_start_upd,
+            lines: hunk_lines,
+        });
+    }
+
+    // Last hunk: last 10 lines
+    let last_chunk_orig: Vec<String> = original_lines.iter().rev().take(footer_lines).rev()
+        .map(|l| format!("-{l}"))
+        .collect();
+    let last_chunk_upd: Vec<String> = updated_lines.iter().rev().take(footer_lines).rev()
+        .map(|l| format!("+{l}"))
+        .collect();
+
+    let mut last_lines = Vec::new();
+    last_lines.extend(last_chunk_orig);
+    last_lines.extend(last_chunk_upd);
+
+    hunks.push(StructuredPatchHunk {
+        old_start: original_lines.len().saturating_sub(footer_lines) + 1,
+        old_lines: footer_lines.min(original_lines.len()),
+        new_start: updated_lines.len().saturating_sub(footer_lines) + 1,
+        new_lines: footer_lines.min(updated_lines.len()),
+        lines: last_lines,
+    });
+
+    hunks
 }
 
 fn normalize_path(path: &str) -> io::Result<PathBuf> {

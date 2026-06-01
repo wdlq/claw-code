@@ -811,15 +811,51 @@ impl CommandWithStdin {
             child_stdin.write_all(stdin)?;
         }
 
+        // Take ownership of stdout and stderr to read them in separate threads
+        // This prevents deadlock when the child writes more data than the pipe buffer
+        let stdout_handle = child.stdout.take().map(|stdout| {
+            thread::spawn(move || {
+                use std::io::Read;
+                let mut buf = Vec::new();
+                let mut reader = stdout;
+                let _ = reader.read_to_end(&mut buf);
+                buf
+            })
+        });
+
+        let stderr_handle = child.stderr.take().map(|stderr| {
+            thread::spawn(move || {
+                use std::io::Read;
+                let mut buf = Vec::new();
+                let mut reader = stderr;
+                let _ = reader.read_to_end(&mut buf);
+                buf
+            })
+        });
+
         loop {
             if abort_signal.is_some_and(HookAbortSignal::is_aborted) {
                 let _ = child.kill();
-                let _ = child.wait_with_output();
+                let _ = child.wait();
                 return Ok(CommandExecution::Cancelled);
             }
 
             match child.try_wait()? {
-                Some(_) => return child.wait_with_output().map(CommandExecution::Finished),
+                Some(status) => {
+                    // Wait for stdout and stderr threads to complete
+                    let stdout = stdout_handle
+                        .map(|h| h.join().unwrap_or_default())
+                        .unwrap_or_default();
+                    let stderr = stderr_handle
+                        .map(|h| h.join().unwrap_or_default())
+                        .unwrap_or_default();
+
+                    return Ok(CommandExecution::Finished(std::process::Output {
+                        status,
+                        stdout,
+                        stderr,
+                    }));
+                }
                 None => thread::sleep(Duration::from_millis(20)),
             }
         }

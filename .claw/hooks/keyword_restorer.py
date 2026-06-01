@@ -19,10 +19,21 @@ import json
 import hashlib
 import platform
 import os
+import time
+import signal
+import threading
 
 # Import shared configuration
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from keywords_config import KEYWORDS, HASH_LENGTH
+
+# Debug logging
+DEBUG_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hook_debug.log')
+
+def log_debug(msg):
+    """Write debug message to log file."""
+    with open(DEBUG_LOG, 'a', encoding='utf-8') as f:
+        f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
 
 # Windows command replacements (Unix -> Windows)
 WINDOWS_CMD_REPLACEMENTS = {
@@ -90,22 +101,123 @@ def convert_unix_cmd_to_windows(command: str) -> str:
     return result
 
 
+def timeout_handler(signum, frame):
+    """Handle timeout - exit gracefully."""
+    log_debug("Timeout occurred")
+    sys.stdout.write('{}\n')
+    sys.stdout.flush()
+    sys.exit(0)
+
+
+def write_output_with_timeout(output_json, timeout_seconds=60):
+    """Write output to stdout with a timeout to prevent hanging."""
+    log_debug(f"Writing output ({len(output_json)} chars)")
+
+    # Use a thread to write with timeout
+    success = [False]
+    error_msg = [None]
+
+    def write_thread():
+        try:
+            # Write in very small chunks with delays for large outputs
+            if len(output_json) > 50000:
+                chunk_size = 4096  # 4KB chunks for large outputs
+                for i in range(0, len(output_json), chunk_size):
+                    chunk = output_json[i:i+chunk_size]
+                    sys.stdout.write(chunk)
+                    sys.stdout.flush()
+                    time.sleep(0.01)  # 10ms delay between chunks
+            else:
+                sys.stdout.write(output_json)
+
+            sys.stdout.write('\n')
+            sys.stdout.flush()
+            success[0] = True
+            log_debug("Write completed")
+        except Exception as e:
+            error_msg[0] = str(e)
+            log_debug(f"Write thread error: {e}")
+
+    thread = threading.Thread(target=write_thread)
+    thread.daemon = True
+    thread.start()
+    thread.join(timeout_seconds)
+
+    if not success[0]:
+        log_debug(f"Write timeout or failure: {error_msg[0]}")
+        # Return empty JSON as fallback
+        try:
+            sys.stdout.write('{}\n')
+            sys.stdout.flush()
+        except:
+            pass
+
+
+def is_accessing_hook_files(tool_input: dict, tool_name: str) -> bool:
+    """Check if the tool is trying to access hook scripts or config files."""
+    protected_files = [
+        "keyword_redactor.py",
+        "keyword_restorer.py",
+        "keywords_config.py",
+        "hook_debug.log",
+    ]
+
+    if tool_name in ("Read", "read_file"):
+        file_path = tool_input.get("file_path", "")
+        normalized = file_path.replace("\\", "/").lower()
+        for protected in protected_files:
+            if protected in normalized and "hooks/" in normalized:
+                return True
+    elif tool_name in ("bash", "Bash", "PowerShell"):
+        command = tool_input.get("command", "")
+        command_lower = command.lower()
+        for protected in protected_files:
+            if protected in command_lower:
+                return True
+        if "hooks/" in command_lower and ("cat" in command_lower or "type" in command_lower or "open(" in command_lower):
+            return True
+    elif tool_name in ("Write", "write_file"):
+        content = tool_input.get("content", "")
+        content_lower = content.lower()
+        for protected in protected_files:
+            if protected in content_lower:
+                return True
+    return False
+
+
 def main():
     try:
+        # Set timeout to 30 seconds for large files
+        if hasattr(signal, 'SIGALRM'):
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(30)
+
+        log_debug("Restorer hook started")
+
         # Read JSON input from stdin
+        log_debug("Waiting for stdin...")
         input_data = json.load(sys.stdin)
+        log_debug(f"Received input, tool: {input_data.get('tool_name', 'unknown')}")
 
         # Extract tool information
         tool_name = input_data.get("tool_name", "")
         tool_input = input_data.get("tool_input", {})
+        log_debug(f"Processing tool: {tool_name}")
+
+        # Security check: prevent accessing hook files
+        if is_accessing_hook_files(tool_input, tool_name):
+            log_debug("Blocked: accessing hook files")
+            write_output_with_timeout('{}', timeout_seconds=5)
+            sys.exit(0)
 
         # Process based on tool type
         if tool_name in ("Write", "write_file"):
+            log_debug("Processing Write tool")
             content = tool_input.get("content", "")
             restored_content = restore_keywords(content)
 
             if restored_content != content:
-                print(json.dumps({
+                write_output_with_timeout(json.dumps({
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "allow",
@@ -114,16 +226,17 @@ def main():
                             "content": restored_content
                         }
                     }
-                }))
+                }), timeout_seconds=10)
             else:
-                print(json.dumps({
+                write_output_with_timeout(json.dumps({
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "allow"
                     }
-                }))
+                }), timeout_seconds=5)
 
         elif tool_name in ("Edit", "edit_file"):
+            log_debug("Processing Edit tool")
             # For Edit tool, we need to restore BOTH old_string and new_string
             old_string = tool_input.get("old_string", "")
             new_string = tool_input.get("new_string", "")
@@ -133,7 +246,7 @@ def main():
 
             # Check if any changes were made
             if restored_old != old_string or restored_new != new_string:
-                print(json.dumps({
+                write_output_with_timeout(json.dumps({
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "allow",
@@ -143,16 +256,17 @@ def main():
                             "new_string": restored_new
                         }
                     }
-                }))
+                }), timeout_seconds=10)
             else:
-                print(json.dumps({
+                write_output_with_timeout(json.dumps({
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "allow"
                     }
-                }))
+                }), timeout_seconds=5)
 
         elif tool_name in ("Bash", "bash", "PowerShell"):
+            log_debug("Processing Bash tool")
             # For Bash/PowerShell, restore keywords and convert commands
             command = tool_input.get("command", "")
             restored_command = restore_keywords(command)
@@ -160,7 +274,7 @@ def main():
             restored_command = convert_unix_cmd_to_windows(restored_command)
 
             if restored_command != command:
-                print(json.dumps({
+                write_output_with_timeout(json.dumps({
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "allow",
@@ -169,22 +283,23 @@ def main():
                             "command": restored_command
                         }
                     }
-                }))
+                }), timeout_seconds=10)
             else:
-                print(json.dumps({
+                write_output_with_timeout(json.dumps({
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "allow"
                     }
-                }))
+                }), timeout_seconds=5)
 
         elif tool_name in ("NotebookEdit", "notebook_edit"):
+            log_debug("Processing NotebookEdit tool")
             # For NotebookEdit, restore keywords in new_source
             new_source = tool_input.get("new_source", "")
             restored_source = restore_keywords(new_source)
 
             if restored_source != new_source:
-                print(json.dumps({
+                write_output_with_timeout(json.dumps({
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "allow",
@@ -193,27 +308,33 @@ def main():
                             "new_source": restored_source
                         }
                     }
-                }))
+                }), timeout_seconds=10)
             else:
-                print(json.dumps({
+                write_output_with_timeout(json.dumps({
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "allow"
                     }
-                }))
+                }), timeout_seconds=5)
 
         else:
+            log_debug(f"Pass through for tool: {tool_name}")
             # For other tools, pass through without modification
-            print(json.dumps({}))
+            write_output_with_timeout('{}', timeout_seconds=5)
             sys.exit(0)
 
+        # Cancel the alarm
+        if hasattr(signal, 'SIGALRM'):
+            signal.alarm(0)
         sys.exit(0)
 
     except json.JSONDecodeError as e:
-        print(json.dumps({"error": f"Invalid JSON input: {e}"}), file=sys.stderr)
+        log_debug(f"JSON error: {e}")
+        write_output_with_timeout(json.dumps({"error": f"Invalid JSON input: {e}"}), timeout_seconds=5)
         sys.exit(1)
     except Exception as e:
-        print(json.dumps({"error": str(e)}), file=sys.stderr)
+        log_debug(f"Error: {e}")
+        write_output_with_timeout(json.dumps({"error": str(e)}), timeout_seconds=5)
         sys.exit(1)
 
 
