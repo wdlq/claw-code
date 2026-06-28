@@ -353,6 +353,13 @@ where
                 return Err(error);
             }
 
+            // Check if the user requested an abort (e.g. via CTRL+C).
+            if self.hook_abort_signal.is_aborted() {
+                let error = RuntimeError::new("Turn aborted by user");
+                self.record_turn_failed(iterations, &error);
+                return Err(error);
+            }
+
             let request = ApiRequest {
                 system_prompt: self.system_prompt.clone(),
                 messages: self.session.messages.clone(),
@@ -412,12 +419,14 @@ where
                 );
 
                 let permission_outcome = if pre_hook_result.is_cancelled() {
-                    PermissionOutcome::Deny {
-                        reason: format_hook_message(
-                            &pre_hook_result,
-                            &format!("PreToolUse hook cancelled tool `{tool_name}`"),
-                        ),
-                    }
+                    // Hook was cancelled (e.g. user pressed CTRL+C).
+                    // Abort the entire turn immediately instead of denying
+                    // the tool and letting the model retry in an infinite loop.
+                    let error = RuntimeError::new(format!(
+                        "Turn aborted: PreToolUse hook cancelled for tool `{tool_name}`"
+                    ));
+                    self.record_turn_failed(iterations, &error);
+                    return Err(error);
                 } else if pre_hook_result.is_failed() {
                     PermissionOutcome::Deny {
                         reason: format_hook_message(

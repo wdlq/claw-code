@@ -669,8 +669,8 @@ fn http_response(status: &str, content_type: &str, body: &str, headers: &[(&str,
 fn text_message_response(id: &str, text: &str) -> MessageResponse {
     MessageResponse {
         id: id.to_string(),
-        kind: "message".to_string(),
-        role: "assistant".to_string(),
+        kind: Some("message".to_string()),
+        role: Some("assistant".to_string()),
         content: vec![OutputContentBlock::Text {
             text: text.to_string(),
         }],
@@ -695,8 +695,8 @@ fn text_message_response_with_usage(
 ) -> MessageResponse {
     MessageResponse {
         id: id.to_string(),
-        kind: "message".to_string(),
-        role: "assistant".to_string(),
+        kind: Some("message".to_string()),
+        role: Some("assistant".to_string()),
         content: vec![OutputContentBlock::Text {
             text: text.to_string(),
         }],
@@ -738,8 +738,8 @@ struct ToolUseMessage<'a> {
 fn tool_message_response_many(id: &str, tool_uses: &[ToolUseMessage<'_>]) -> MessageResponse {
     MessageResponse {
         id: id.to_string(),
-        kind: "message".to_string(),
-        role: "assistant".to_string(),
+        kind: Some("message".to_string()),
+        role: Some("assistant".to_string()),
         content: tool_uses
             .iter()
             .map(|tool_use| OutputContentBlock::ToolUse {

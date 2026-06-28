@@ -483,8 +483,8 @@ impl StreamState {
             events.push(StreamEvent::MessageStart(MessageStartEvent {
                 message: MessageResponse {
                     id: chunk.id.clone(),
-                    kind: "message".to_string(),
-                    role: "assistant".to_string(),
+                    kind: Some("message".to_string()),
+                    role: Some("assistant".to_string()),
                     content: Vec::new(),
                     model: chunk.model.clone().unwrap_or_else(|| self.model.clone()),
                     stop_reason: None,
@@ -1397,8 +1397,8 @@ fn normalize_response(
 
     Ok(MessageResponse {
         id: response.id,
-        kind: "message".to_string(),
-        role: choice.message.role,
+        kind: Some("message".to_string()),
+        role: Some(choice.message.role),
         content,
         model: response.model.if_empty_then(model.to_string()),
         stop_reason: choice
@@ -1628,7 +1628,7 @@ mod tests {
                 model: "grok-3".to_string(),
                 max_tokens: 64,
                 messages: vec![InputMessage {
-                    role: "user".to_string(),
+                    role: Some("user".to_string()),
                     content: vec![
                         InputContentBlock::Text {
                             text: "hello".to_string(),
@@ -1737,7 +1737,7 @@ mod tests {
             model: "deepseek-v4-pro".to_string(),
             choices: vec![super::ChatChoice {
                 message: super::ChatMessage {
-                    role: "assistant".to_string(),
+                    role: Some("assistant".to_string()),
                     content: Some("final answer".to_string()),
                     reasoning_content: Some("hidden thought".to_string()),
                     tool_calls: Vec::new(),
@@ -2008,7 +2008,7 @@ mod tests {
             model: model.to_string(),
             max_tokens: 100,
             messages: vec![InputMessage {
-                role: "assistant".to_string(),
+                role: Some("assistant".to_string()),
                 content: vec![
                     InputContentBlock::Thinking {
                         thinking: "prior reasoning".to_string(),
@@ -2238,7 +2238,7 @@ mod tests {
             model: "gpt-4o".to_string(),
             max_tokens: 100,
             messages: vec![InputMessage {
-                role: "assistant".to_string(),
+                role: Some("assistant".to_string()),
                 content: vec![InputContentBlock::Text {
                     text: "Hello".to_string(),
                 }],
@@ -2268,7 +2268,7 @@ mod tests {
             model: "gpt-4o".to_string(),
             max_tokens: 100,
             messages: vec![InputMessage {
-                role: "assistant".to_string(),
+                role: Some("assistant".to_string()),
                 content: vec![InputContentBlock::ToolUse {
                     id: "call_1".to_string(),
                     name: "read_file".to_string(),
@@ -2385,7 +2385,7 @@ mod tests {
 
         // Test with gpt-4o (should include is_error)
         let message = InputMessage {
-            role: "user".to_string(),
+            role: Some("user".to_string()),
             content: vec![InputContentBlock::ToolResult {
                 tool_use_id: "call_1".to_string(),
                 content: vec![ToolResultContentBlock::Text {
@@ -2409,7 +2409,7 @@ mod tests {
 
         // Test with grok-3 (should include is_error)
         let message2 = InputMessage {
-            role: "user".to_string(),
+            role: Some("user".to_string()),
             content: vec![InputContentBlock::ToolResult {
                 tool_use_id: "call_2".to_string(),
                 content: vec![ToolResultContentBlock::Text {
@@ -2440,7 +2440,7 @@ mod tests {
 
         // Test with kimi-k2.5 (should EXCLUDE is_error)
         let message = InputMessage {
-            role: "user".to_string(),
+            role: Some("user".to_string()),
             content: vec![InputContentBlock::ToolResult {
                 tool_use_id: "call_1".to_string(),
                 content: vec![ToolResultContentBlock::Text {
@@ -2486,7 +2486,7 @@ mod tests {
             max_tokens: 100,
             messages: vec![
                 InputMessage {
-                    role: "assistant".to_string(),
+                    role: Some("assistant".to_string()),
                     content: vec![InputContentBlock::ToolUse {
                         id: "call_1".to_string(),
                         name: "read_file".to_string(),
@@ -2494,7 +2494,7 @@ mod tests {
                     }],
                 },
                 InputMessage {
-                    role: "user".to_string(),
+                    role: Some("user".to_string()),
                     content: vec![InputContentBlock::ToolResult {
                         tool_use_id: "call_1".to_string(),
                         content: vec![ToolResultContentBlock::Text {

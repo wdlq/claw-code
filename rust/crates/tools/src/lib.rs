@@ -12,17 +12,22 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    check_freshness, dedupe_superseded_commit_events, edit_file_in_workspace, execute_bash,
-    glob_search_in_workspace, grep_search_in_workspace, load_system_prompt,
+    check_freshness, dedupe_superseded_commit_events,
+    edit_file_in_workspace_with_allowed,
+    execute_bash,
+    glob_search_in_workspace_with_allowed,
+    grep_search_in_workspace_with_allowed,
+    load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
-    read_file_in_workspace,
+    read_file_in_workspace_with_allowed,
     summary_compression::compress_summary_text,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
-    write_file_in_workspace, ApiClient, ApiRequest, AssistantEvent, BashCommandInput,
+    write_file_in_workspace_with_allowed,
+    ApiClient, ApiRequest, AssistantEvent, BashCommandInput,
     BashCommandOutput, BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage,
     ConversationRuntime, GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
     LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole,
@@ -1216,31 +1221,36 @@ fn execute_tool_with_enforcer(
             let file_input: ReadFileInput = from_value(input)?;
             let required_mode = classify_read_path_permission(&file_input.path, false);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_read_file(file_input)
+            let allowed = allowed_external_paths(enforcer, name);
+            run_read_file_with_allowed(file_input, &allowed)
         }
         "write_file" => {
             let file_input: WriteFileInput = from_value(input)?;
             let required_mode = classify_file_path_permission(&file_input.path, true);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_write_file(file_input)
+            let allowed = allowed_external_paths(enforcer, name);
+            run_write_file_with_allowed(file_input, &allowed)
         }
         "edit_file" => {
             let file_input: EditFileInput = from_value(input)?;
             let required_mode = classify_file_path_permission(&file_input.path, false);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_edit_file(file_input)
+            let allowed = allowed_external_paths(enforcer, name);
+            run_edit_file_with_allowed(file_input, &allowed)
         }
         "glob_search" => {
             let glob_input: GlobSearchInputValue = from_value(input)?;
             let required_mode = classify_glob_permission(&glob_input);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_glob_search(glob_input)
+            let allowed = allowed_external_paths(enforcer, name);
+            run_glob_search_with_allowed(glob_input, &allowed)
         }
         "grep_search" => {
             let grep_input: GrepSearchInput = from_value(input)?;
             let required_mode = classify_grep_permission(&grep_input);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_grep_search(grep_input)
+            let allowed = allowed_external_paths(enforcer, name);
+            run_grep_search_with_allowed(grep_input, &allowed)
         }
         "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
         "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
@@ -1307,6 +1317,18 @@ fn execute_tool_with_enforcer(
         }
         _ => Err(format!("unsupported tool: {name}")),
     }
+}
+
+/// Extract allowed external path prefixes from the permission enforcer
+/// for a given tool name.  Returns an empty vector when no enforcer is
+/// present or no allow rules match.
+fn allowed_external_paths(
+    enforcer: Option<&PermissionEnforcer>,
+    tool_name: &str,
+) -> Vec<String> {
+    enforcer
+        .map(|e| e.allowed_path_prefixes(tool_name))
+        .unwrap_or_default()
 }
 
 /// Enforce permission check with a dynamically classified permission mode.
@@ -2107,50 +2129,51 @@ fn branch_divergence_output(
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_read_file(input: ReadFileInput) -> Result<String, String> {
+fn run_read_file_with_allowed(input: ReadFileInput, allowed: &[String]) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     to_pretty_json(
-        read_file_in_workspace(&input.path, input.offset, input.limit, &workspace)
+        read_file_in_workspace_with_allowed(&input.path, input.offset, input.limit, &workspace, allowed)
             .map_err(io_to_string)?,
     )
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_write_file(input: WriteFileInput) -> Result<String, String> {
+fn run_write_file_with_allowed(input: WriteFileInput, allowed: &[String]) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     to_pretty_json(
-        write_file_in_workspace(&input.path, &input.content, &workspace).map_err(io_to_string)?,
+        write_file_in_workspace_with_allowed(&input.path, &input.content, &workspace, allowed).map_err(io_to_string)?,
     )
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_edit_file(input: EditFileInput) -> Result<String, String> {
+fn run_edit_file_with_allowed(input: EditFileInput, allowed: &[String]) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     to_pretty_json(
-        edit_file_in_workspace(
+        edit_file_in_workspace_with_allowed(
             &input.path,
             &input.old_string,
             &input.new_string,
             input.replace_all.unwrap_or(false),
             &workspace,
+            allowed,
         )
         .map_err(io_to_string)?,
     )
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_glob_search(input: GlobSearchInputValue) -> Result<String, String> {
+fn run_glob_search_with_allowed(input: GlobSearchInputValue, allowed: &[String]) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     to_pretty_json(
-        glob_search_in_workspace(&input.pattern, input.path.as_deref(), &workspace)
+        glob_search_in_workspace_with_allowed(&input.pattern, input.path.as_deref(), &workspace, allowed)
             .map_err(io_to_string)?,
     )
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_grep_search(input: GrepSearchInput) -> Result<String, String> {
+fn run_grep_search_with_allowed(input: GrepSearchInput, allowed: &[String]) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
-    to_pretty_json(grep_search_in_workspace(&input, &workspace).map_err(io_to_string)?)
+    to_pretty_json(grep_search_in_workspace_with_allowed(&input, &workspace, allowed).map_err(io_to_string)?)
 }
 
 #[allow(clippy::needless_pass_by_value)]

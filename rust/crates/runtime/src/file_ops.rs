@@ -40,21 +40,71 @@ fn is_binary_file(path: &Path) -> io::Result<bool> {
 /// the workspace boundary (e.g. via `../` traversal or symlink).
 #[allow(dead_code)]
 fn validate_workspace_boundary(resolved: &Path, workspace_root: &Path) -> io::Result<()> {
+    validate_workspace_boundary_impl(resolved, workspace_root, &[])
+}
+
+/// Like [`validate_workspace_boundary`] but also accepts a list of
+/// additional path prefixes that are considered safe.  When the resolved
+/// path starts with any of the `allowed` prefixes the check passes
+/// immediately, even if the path is outside the workspace root.
+///
+/// This is used to honour user-configured `permissions.allow` rules that
+/// explicitly grant access to directories outside the workspace.
+#[allow(dead_code)]
+fn validate_workspace_boundary_with_allowed(
+    resolved: &Path,
+    workspace_root: &Path,
+    allowed: &[String],
+) -> io::Result<()> {
+    validate_workspace_boundary_impl(resolved, workspace_root, allowed)
+}
+
+fn validate_workspace_boundary_impl(
+    resolved: &Path,
+    workspace_root: &Path,
+    allowed: &[String],
+) -> io::Result<()> {
     // Normalize both paths to handle Windows \\?\ prefix inconsistencies
     let normalized_resolved = normalize_for_comparison(resolved);
     let normalized_root = normalize_for_comparison(workspace_root);
 
-    if !normalized_resolved.starts_with(&normalized_root) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "path {} escapes workspace boundary {}",
-                resolved.display(),
-                workspace_root.display()
-            ),
-        ));
+    if normalized_resolved.starts_with(&normalized_root) {
+        return Ok(());
     }
-    Ok(())
+
+    // Check whether the path matches any explicitly allowed external prefix.
+    // Normalize path separators for cross-platform comparison.
+    let resolved_str = normalize_separators(&normalized_resolved.to_string_lossy());
+    for prefix in allowed {
+        let normalized_prefix = normalize_for_comparison(&PathBuf::from(prefix));
+        let prefix_str = normalize_separators(&normalized_prefix.to_string_lossy());
+        // Ensure prefix ends with "/" for consistent matching - handles the case
+        // where the allowed path is the directory itself (e.g., "path" matches "path/file")
+        // Trim any existing trailing slash first to avoid "path//"
+        let prefix_trimmed = prefix_str.trim_end_matches('/');
+        if prefix_trimmed.is_empty() {
+            // Edge case: prefix was just "/" - skip to avoid matching everything
+            continue;
+        }
+        let prefix_with_slash = format!("{}/", prefix_trimmed);
+        if resolved_str.starts_with(&prefix_with_slash) || resolved_str == prefix_trimmed {
+            return Ok(());
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "path {} escapes workspace boundary {}",
+            resolved.display(),
+            workspace_root.display()
+        ),
+    ))
+}
+
+/// Normalize path separators to forward slashes for cross-platform comparison.
+fn normalize_separators(path: &str) -> String {
+    path.replace('\\', "/")
 }
 
 /// Normalize a path for comparison by removing Windows \\?\ prefix if present.
@@ -374,6 +424,15 @@ fn glob_search_impl(
     path: Option<&str>,
     workspace_root: Option<&Path>,
 ) -> io::Result<GlobSearchOutput> {
+    glob_search_impl_with_allowed(pattern, path, workspace_root, &[])
+}
+
+fn glob_search_impl_with_allowed(
+    pattern: &str,
+    path: Option<&str>,
+    workspace_root: Option<&Path>,
+    allowed: &[String],
+) -> io::Result<GlobSearchOutput> {
     let started = Instant::now();
     let base_dir = path
         .map(normalize_path)
@@ -381,7 +440,7 @@ fn glob_search_impl(
         .unwrap_or(std::env::current_dir()?);
     let canonical_root = workspace_root.map(canonicalize_workspace_root);
     if let Some(root) = canonical_root.as_deref() {
-        validate_workspace_boundary(&base_dir, root)?;
+        validate_workspace_boundary_with_allowed(&base_dir, root, allowed)?;
     }
     let search_pattern = if Path::new(pattern).is_absolute() {
         pattern.to_owned()
@@ -404,7 +463,7 @@ fn glob_search_impl(
             let canonical_walk_root = walk_root
                 .canonicalize()
                 .unwrap_or_else(|_| walk_root.clone());
-            validate_workspace_boundary(&canonical_walk_root, root)?;
+            validate_workspace_boundary_with_allowed(&canonical_walk_root, root, allowed)?;
         }
         let entries = WalkDir::new(&walk_root)
             .into_iter()
@@ -417,7 +476,7 @@ fn glob_search_impl(
             {
                 if let Some(root) = canonical_root.as_deref() {
                     let canonical_candidate = candidate.canonicalize()?;
-                    validate_workspace_boundary(&canonical_candidate, root)?;
+                    validate_workspace_boundary_with_allowed(&canonical_candidate, root, allowed)?;
                 }
                 matches.push(candidate.to_path_buf());
             }
@@ -455,6 +514,14 @@ fn grep_search_impl(
     input: &GrepSearchInput,
     workspace_root: Option<&Path>,
 ) -> io::Result<GrepSearchOutput> {
+    grep_search_impl_with_allowed(input, workspace_root, &[])
+}
+
+fn grep_search_impl_with_allowed(
+    input: &GrepSearchInput,
+    workspace_root: Option<&Path>,
+    allowed: &[String],
+) -> io::Result<GrepSearchOutput> {
     let base_path = input
         .path
         .as_deref()
@@ -463,7 +530,7 @@ fn grep_search_impl(
         .unwrap_or(std::env::current_dir()?);
     let canonical_root = workspace_root.map(canonicalize_workspace_root);
     if let Some(root) = canonical_root.as_deref() {
-        validate_workspace_boundary(&base_path, root)?;
+        validate_workspace_boundary_with_allowed(&base_path, root, allowed)?;
     }
 
     let regex = RegexBuilder::new(&input.pattern)
@@ -492,7 +559,7 @@ fn grep_search_impl(
     for file_path in collect_search_files(&base_path)? {
         if let Some(root) = canonical_root.as_deref() {
             let canonical_file = file_path.canonicalize()?;
-            validate_workspace_boundary(&canonical_file, root)?;
+            validate_workspace_boundary_with_allowed(&canonical_file, root, allowed)?;
         }
         if !matches_optional_filters(&file_path, glob_filter.as_ref(), file_type) {
             continue;
@@ -850,9 +917,21 @@ pub fn read_file_in_workspace(
     limit: Option<usize>,
     workspace_root: &Path,
 ) -> io::Result<ReadFileOutput> {
+    read_file_in_workspace_with_allowed(path, offset, limit, workspace_root, &[])
+}
+
+/// Read a file with workspace boundary enforcement, honouring allowed
+/// external path prefixes from the permission system.
+pub fn read_file_in_workspace_with_allowed(
+    path: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    workspace_root: &Path,
+    allowed: &[String],
+) -> io::Result<ReadFileOutput> {
     let absolute_path = normalize_path(path)?;
     let canonical_root = canonicalize_workspace_root(workspace_root);
-    validate_workspace_boundary(&absolute_path, &canonical_root)?;
+    validate_workspace_boundary_with_allowed(&absolute_path, &canonical_root, allowed)?;
     read_file(path, offset, limit)
 }
 
@@ -863,9 +942,20 @@ pub fn write_file_in_workspace(
     content: &str,
     workspace_root: &Path,
 ) -> io::Result<WriteFileOutput> {
+    write_file_in_workspace_with_allowed(path, content, workspace_root, &[])
+}
+
+/// Write a file with workspace boundary enforcement, honouring allowed
+/// external path prefixes from the permission system.
+pub fn write_file_in_workspace_with_allowed(
+    path: &str,
+    content: &str,
+    workspace_root: &Path,
+    allowed: &[String],
+) -> io::Result<WriteFileOutput> {
     let absolute_path = normalize_path_allow_missing(path)?;
     let canonical_root = canonicalize_workspace_root(workspace_root);
-    validate_workspace_boundary(&absolute_path, &canonical_root)?;
+    validate_workspace_boundary_with_allowed(&absolute_path, &canonical_root, allowed)?;
     write_file(path, content)
 }
 
@@ -878,9 +968,22 @@ pub fn edit_file_in_workspace(
     replace_all: bool,
     workspace_root: &Path,
 ) -> io::Result<EditFileOutput> {
+    edit_file_in_workspace_with_allowed(path, old_string, new_string, replace_all, workspace_root, &[])
+}
+
+/// Edit a file with workspace boundary enforcement, honouring allowed
+/// external path prefixes from the permission system.
+pub fn edit_file_in_workspace_with_allowed(
+    path: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+    workspace_root: &Path,
+    allowed: &[String],
+) -> io::Result<EditFileOutput> {
     let absolute_path = normalize_path(path)?;
     let canonical_root = canonicalize_workspace_root(workspace_root);
-    validate_workspace_boundary(&absolute_path, &canonical_root)?;
+    validate_workspace_boundary_with_allowed(&absolute_path, &canonical_root, allowed)?;
     edit_file(path, old_string, new_string, replace_all)
 }
 
@@ -891,7 +994,18 @@ pub fn glob_search_in_workspace(
     path: Option<&str>,
     workspace_root: &Path,
 ) -> io::Result<GlobSearchOutput> {
-    glob_search_impl(pattern, path, Some(workspace_root))
+    glob_search_in_workspace_with_allowed(pattern, path, workspace_root, &[])
+}
+
+/// Expand a glob pattern with workspace boundary enforcement, honouring
+/// allowed external path prefixes from the permission system.
+pub fn glob_search_in_workspace_with_allowed(
+    pattern: &str,
+    path: Option<&str>,
+    workspace_root: &Path,
+    allowed: &[String],
+) -> io::Result<GlobSearchOutput> {
+    glob_search_impl_with_allowed(pattern, path, Some(workspace_root), allowed)
 }
 
 /// Search file contents with workspace boundary enforcement.
@@ -900,7 +1014,17 @@ pub fn grep_search_in_workspace(
     input: &GrepSearchInput,
     workspace_root: &Path,
 ) -> io::Result<GrepSearchOutput> {
-    grep_search_impl(input, Some(workspace_root))
+    grep_search_in_workspace_with_allowed(input, workspace_root, &[])
+}
+
+/// Search file contents with workspace boundary enforcement, honouring
+/// allowed external path prefixes from the permission system.
+pub fn grep_search_in_workspace_with_allowed(
+    input: &GrepSearchInput,
+    workspace_root: &Path,
+    allowed: &[String],
+) -> io::Result<GrepSearchOutput> {
+    grep_search_impl_with_allowed(input, Some(workspace_root), allowed)
 }
 
 /// Check whether a path is a symlink that resolves outside the workspace.

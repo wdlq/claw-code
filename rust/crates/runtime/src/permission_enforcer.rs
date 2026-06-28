@@ -65,8 +65,20 @@ impl PermissionEnforcer {
         matches!(self.check(tool_name, input), EnforcementResult::Allowed)
     }
 
+    /// Return the path prefixes from allow rules that apply to the given
+    /// tool.  These are used to relax workspace-boundary enforcement for
+    /// explicitly allowed external directories.
+    #[must_use]
+    pub fn allowed_path_prefixes(&self, tool_name: &str) -> Vec<String> {
+        self.policy.allowed_path_prefixes(tool_name)
+    }
+
     /// Check permission with an explicitly provided required mode.
     /// Used when the required mode is determined dynamically (e.g., bash command classification).
+    ///
+    /// Evaluates deny → allow → mode comparison, so that user-configured
+    /// `allow` rules can grant access to specific paths without requiring
+    /// `danger-full-access` mode.
     pub fn check_with_required_mode(
         &self,
         tool_name: &str,
@@ -77,6 +89,22 @@ impl PermissionEnforcer {
         // prompt flow rather than hard-denying.
         if self.policy.active_mode() == PermissionMode::Prompt {
             return EnforcementResult::Allowed;
+        }
+
+        // Check deny → allow rules first.
+        match self.policy.check_rules_only(tool_name, input) {
+            Some(PermissionOutcome::Deny { reason }) => {
+                return EnforcementResult::Denied {
+                    tool: tool_name.to_owned(),
+                    active_mode: self.policy.active_mode().as_str().to_owned(),
+                    required_mode: required_mode.as_str().to_owned(),
+                    reason,
+                };
+            }
+            Some(PermissionOutcome::Allow) => {
+                return EnforcementResult::Allowed;
+            }
+            None => {}
         }
 
         let active_mode = self.policy.active_mode();
@@ -581,5 +609,85 @@ mod tests {
             }
             other => panic!("expected denied result, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn check_with_required_mode_respects_allow_rules() {
+        // given: workspace-write mode with an allow rule for an external path
+        use crate::config::RuntimePermissionRuleConfig;
+        let config = RuntimePermissionRuleConfig::new(
+            vec!["read_file(/other/project/:*)".to_owned()],
+            vec![],
+            vec![],
+        );
+        let policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite)
+            .with_permission_rules(&config);
+        let enforcer = PermissionEnforcer::new(policy);
+
+        // when: read_file on the allowed external path requires DangerFullAccess
+        let result = enforcer.check_with_required_mode(
+            "read_file",
+            r#"{"path":"/other/project/src/main.rs"}"#,
+            PermissionMode::DangerFullAccess,
+        );
+
+        // then: should be allowed via the allow rule
+        assert_eq!(result, EnforcementResult::Allowed);
+    }
+
+    #[test]
+    fn check_with_required_mode_deny_rules_override_allow_rules() {
+        // given: deny rule takes precedence over allow rule
+        use crate::config::RuntimePermissionRuleConfig;
+        let config = RuntimePermissionRuleConfig::new(
+            vec!["read_file(/other/project/:*)".to_owned()],
+            vec!["read_file(/other/project/secret/:*)".to_owned()],
+            vec![],
+        );
+        let policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite)
+            .with_permission_rules(&config);
+        let enforcer = PermissionEnforcer::new(policy);
+
+        // when: reading a file under the denied sub-path
+        let result = enforcer.check_with_required_mode(
+            "read_file",
+            r#"{"path":"/other/project/secret/key.txt"}"#,
+            PermissionMode::DangerFullAccess,
+        );
+
+        // then: should be denied
+        assert!(matches!(result, EnforcementResult::Denied { .. }));
+    }
+
+    #[test]
+    fn check_with_required_mode_cwd_paths_still_work_without_rules() {
+        // given: workspace-write mode with no allow rules
+        let enforcer = make_enforcer(PermissionMode::WorkspaceWrite);
+
+        // when: a CWD-internal operation requires only WorkspaceWrite
+        let result = enforcer.check_with_required_mode(
+            "read_file",
+            r#"{"path":"src/main.rs"}"#,
+            PermissionMode::ReadOnly,
+        );
+
+        // then: should be allowed via mode comparison (WorkspaceWrite >= ReadOnly)
+        assert_eq!(result, EnforcementResult::Allowed);
+    }
+
+    #[test]
+    fn check_with_required_mode_external_path_denied_without_rules() {
+        // given: workspace-write mode with no allow rules
+        let enforcer = make_enforcer(PermissionMode::WorkspaceWrite);
+
+        // when: an external path requires DangerFullAccess
+        let result = enforcer.check_with_required_mode(
+            "read_file",
+            r#"{"path":"/other/project/file.txt"}"#,
+            PermissionMode::DangerFullAccess,
+        );
+
+        // then: should be denied (no allow rule, mode insufficient)
+        assert!(matches!(result, EnforcementResult::Denied { .. }));
     }
 }

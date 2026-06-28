@@ -10,6 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use tokio::sync::Notify;
 
 use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
 use crate::permissions::PermissionOverride;
@@ -59,9 +60,27 @@ pub trait HookProgressReporter {
     fn on_event(&mut self, event: &HookProgressEvent);
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 pub struct HookAbortSignal {
     aborted: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl Default for HookAbortSignal {
+    fn default() -> Self {
+        Self {
+            aborted: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+}
+
+impl std::fmt::Debug for HookAbortSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HookAbortSignal")
+            .field("aborted", &self.aborted)
+            .finish()
+    }
 }
 
 impl HookAbortSignal {
@@ -72,11 +91,20 @@ impl HookAbortSignal {
 
     pub fn abort(&self) {
         self.aborted.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
     }
 
     #[must_use]
     pub fn is_aborted(&self) -> bool {
         self.aborted.load(Ordering::SeqCst)
+    }
+
+    /// Returns a future that resolves immediately when the abort signal is set.
+    pub async fn wait(&self) {
+        if self.is_aborted() {
+            return;
+        }
+        self.notify.notified().await;
     }
 }
 

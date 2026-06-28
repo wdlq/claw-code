@@ -330,6 +330,54 @@ impl PermissionPolicy {
     ) -> Option<&'a PermissionRule> {
         rules.iter().find(|rule| rule.matches(tool_name, input))
     }
+
+    /// Check only the configured deny/allow rules against a tool invocation.
+    ///
+    /// Returns `Some(Allow)` if an allow rule matches (and no deny rule does),
+    /// `Some(Deny)` if a deny rule matches, or `None` when no rule applies.
+    pub fn check_rules_only(
+        &self,
+        tool_name: &str,
+        input: &str,
+    ) -> Option<PermissionOutcome> {
+        if let Some(rule) = Self::find_matching_rule(&self.deny_rules, tool_name, input) {
+            return Some(PermissionOutcome::Deny {
+                reason: format!(
+                    "Permission to use {tool_name} has been denied by rule '{}'",
+                    rule.raw
+                ),
+            });
+        }
+        if Self::find_matching_rule(&self.allow_rules, tool_name, input).is_some() {
+            return Some(PermissionOutcome::Allow);
+        }
+        None
+    }
+
+    /// Collect the path prefixes from all allow rules that apply to the
+    /// given tool name.  These are used to relax workspace-boundary
+    /// enforcement for explicitly allowed external directories.
+    pub fn allowed_path_prefixes(&self, tool_name: &str) -> Vec<String> {
+        self.allow_rules
+            .iter()
+            .filter(|rule| rule.tool_name == tool_name)
+            .filter_map(|rule| match &rule.matcher {
+                PermissionRuleMatcher::Prefix(prefix) => {
+                    // Ensure prefix ends with a path separator for consistent matching.
+                    // This handles the case where user configures "path/:*)" and the
+                    // resulting prefix "path/" needs to match paths like "path/file.rs"
+                    // as well as "path" (the directory itself).
+                    let normalized = prefix.replace('\\', "/");
+                    if normalized.ends_with('/') {
+                        Some(normalized)
+                    } else {
+                        Some(format!("{}/", normalized))
+                    }
+                }
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -381,11 +429,16 @@ impl PermissionRule {
 
         match &self.matcher {
             PermissionRuleMatcher::Any => true,
-            PermissionRuleMatcher::Exact(expected) => {
-                extract_permission_subject(input).is_some_and(|candidate| candidate == *expected)
-            }
+            PermissionRuleMatcher::Exact(expected) => extract_permission_subject(input)
+                .is_some_and(|candidate| normalize_path_separators(&candidate) == *normalize_path_separators(expected)),
             PermissionRuleMatcher::Prefix(prefix) => extract_permission_subject(input)
-                .is_some_and(|candidate| candidate.starts_with(prefix)),
+                .is_some_and(|candidate| {
+                    let normalized_candidate = normalize_path_separators(&candidate);
+                    let normalized_prefix = normalize_path_separators(prefix);
+                    // Handle trailing slash: "path/" should match both "path/file" and "path"
+                    normalized_candidate.starts_with(&normalized_prefix)
+                        || normalized_candidate.starts_with(&format!("{}/", normalized_prefix.trim_end_matches('/')))
+                }),
         }
     }
 }
@@ -442,6 +495,11 @@ fn find_last_unescaped(value: &str, needle: char) -> Option<usize> {
         }
     }
     None
+}
+
+/// Normalize path separators to forward slashes for cross-platform comparison.
+fn normalize_path_separators(path: &str) -> String {
+    path.replace('\\', "/")
 }
 
 fn extract_permission_subject(input: &str) -> Option<String> {

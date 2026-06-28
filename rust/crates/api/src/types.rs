@@ -135,9 +135,10 @@ pub enum ToolChoice {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MessageResponse {
     pub id: String,
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub role: String,
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
     pub content: Vec<OutputContentBlock>,
     pub model: String,
     #[serde(default)]
@@ -304,7 +305,7 @@ mod tests {
     fn message_response_estimates_cost_from_model_usage() {
         let response = MessageResponse {
             id: "msg_cost".to_string(),
-            kind: "message".to_string(),
+            kind: Some("message".to_string()),
             role: "assistant".to_string(),
             content: Vec::new(),
             model: "claude-sonnet-4-20250514".to_string(),

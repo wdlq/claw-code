@@ -4369,12 +4369,28 @@ fn run_repl(
                 if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &resolved) {
                     editor.push_history(input);
                     cli.record_prompt_history(&resolved);
-                    cli.run_turn(&prompt)?;
+                    if let Err(error) = cli.run_turn(&prompt) {
+                        let msg = error.to_string();
+                        if msg.contains("Turn aborted") {
+                            eprintln!("Cancelled.");
+                        } else {
+                            return Err(error);
+                        }
+                    }
                     continue;
                 }
                 editor.push_history(input);
                 cli.record_prompt_history(&resolved);
-                cli.run_turn(&resolved)?;
+                if let Err(error) = cli.run_turn(&resolved) {
+                    let msg = error.to_string();
+                    if msg.contains("Turn aborted") {
+                        // User cancelled (e.g. CTRL+C) — return to the REPL
+                        // prompt instead of crashing.
+                        eprintln!("Cancelled.");
+                    } else {
+                        return Err(error);
+                    }
+                }
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -4465,6 +4481,14 @@ impl BuiltRuntime {
             .expect("runtime should exist before installing hook abort signal");
         self.runtime = Some(runtime.with_hook_abort_signal(hook_abort_signal));
         self
+    }
+
+    fn set_api_abort_signal(&mut self, signal: runtime::HookAbortSignal) {
+        self.runtime
+            .as_mut()
+            .expect("runtime should exist")
+            .api_client_mut()
+            .set_abort_signal(signal);
     }
 
     fn shutdown_plugins(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -4851,27 +4875,19 @@ struct HookAbortMonitor {
 impl HookAbortMonitor {
     fn spawn(abort_signal: runtime::HookAbortSignal) -> Self {
         Self::spawn_with_waiter(abort_signal, move |stop_rx, abort_signal| {
-            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
+            // Use ctrlc crate for reliable cross-platform signal handling.
+            // This uses SetConsoleCtrlHandler on Windows, which works
+            // regardless of tokio runtime state or rustyline terminal mode.
+            if ctrlc::set_handler(move || {
+                abort_signal.abort();
+            })
+            .is_err()
+            {
                 return;
-            };
+            }
 
-            runtime.block_on(async move {
-                let wait_for_stop = tokio::task::spawn_blocking(move || {
-                    let _ = stop_rx.recv();
-                });
-
-                tokio::select! {
-                    result = tokio::signal::ctrl_c() => {
-                        if result.is_ok() {
-                            abort_signal.abort();
-                        }
-                    }
-                    _ = wait_for_stop => {}
-                }
-            });
+            // Block until stop signal is received.
+            let _ = stop_rx.recv();
         })
     }
 
@@ -4998,7 +5014,7 @@ impl LiveCli {
         emit_output: bool,
     ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
         let hook_abort_signal = runtime::HookAbortSignal::new();
-        let runtime = build_runtime(
+        let mut runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
             self.model.clone(),
@@ -5010,6 +5026,7 @@ impl LiveCli {
             None,
         )?
         .with_hook_abort_signal(hook_abort_signal.clone());
+        runtime.set_api_abort_signal(hook_abort_signal.clone());
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
 
         Ok((runtime, hook_abort_monitor))
@@ -5058,11 +5075,20 @@ impl LiveCli {
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
-                spinner.fail(
-                    "❌ Request failed",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
+                let msg = error.to_string();
+                if msg.contains("Turn aborted") {
+                    spinner.finish(
+                        "Cancelled",
+                        TerminalRenderer::new().color_theme(),
+                        &mut stdout,
+                    )?;
+                } else {
+                    spinner.fail(
+                        "❌ Request failed",
+                        TerminalRenderer::new().color_theme(),
+                        &mut stdout,
+                    )?;
+                }
                 Err(Box::new(error))
             }
         }
@@ -5262,7 +5288,16 @@ impl LiveCli {
             }
             SlashCommand::Skills { args } => {
                 match classify_skills_slash_command(args.as_deref()) {
-                    SkillSlashDispatch::Invoke(prompt) => self.run_turn(&prompt)?,
+                    SkillSlashDispatch::Invoke(prompt) => {
+                        if let Err(error) = self.run_turn(&prompt) {
+                            let msg = error.to_string();
+                            if msg.contains("Turn aborted") {
+                                eprintln!("Cancelled.");
+                            } else {
+                                return Err(error);
+                            }
+                        }
+                    }
                     SkillSlashDispatch::Local => {
                         Self::print_skills(args.as_deref(), CliOutputFormat::Text)?;
                     }
@@ -5287,7 +5322,14 @@ impl LiveCli {
                             false
                         } else {
                             // Run the clipboard content as a turn
-                            self.run_turn(trimmed)?;
+                            if let Err(error) = self.run_turn(trimmed) {
+                                let msg = error.to_string();
+                                if msg.contains("Turn aborted") {
+                                    eprintln!("Cancelled.");
+                                } else {
+                                    return Err(error);
+                                }
+                            }
                             false
                         }
                     }
@@ -8528,6 +8570,8 @@ fn build_runtime_with_plugin_state(
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
+    let tool_registry =
+        tool_registry.with_enforcer(runtime::permission_enforcer::PermissionEnforcer::new(policy.clone()));
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -8654,6 +8698,7 @@ struct AnthropicRuntimeClient {
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
     reasoning_effort: Option<String>,
+    abort_signal: Option<runtime::HookAbortSignal>,
 }
 
 impl AnthropicRuntimeClient {
@@ -8719,11 +8764,16 @@ impl AnthropicRuntimeClient {
             tool_registry,
             progress_reporter,
             reasoning_effort: None,
+            abort_signal: None,
         })
     }
 
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
         self.reasoning_effort = effort;
+    }
+
+    fn set_abort_signal(&mut self, signal: runtime::HookAbortSignal) {
+        self.abort_signal = Some(signal);
     }
 }
 
@@ -8818,15 +8868,53 @@ impl AnthropicRuntimeClient {
         let mut received_any_event = false;
 
         loop {
+            // Check abort signal before blocking on the stream.
+            if self
+                .abort_signal
+                .as_ref()
+                .is_some_and(runtime::HookAbortSignal::is_aborted)
+            {
+                return Err(RuntimeError::new("Turn aborted by user"));
+            }
+
             let next = if apply_stall_timeout && !received_any_event {
-                match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
-                    Ok(inner) => inner.map_err(|error| {
-                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                    })?,
-                    Err(_elapsed) => {
-                        return Err(RuntimeError::new(
-                            "post-tool stall: model did not respond within timeout",
-                        ));
+                if let Some(ref abort) = self.abort_signal {
+                    tokio::select! {
+                        biased;
+                        _ = abort.wait() => return Err(RuntimeError::new("Turn aborted by user")),
+                        result = tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()) => {
+                            match result {
+                                Ok(inner) => inner.map_err(|error| {
+                                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                                })?,
+                                Err(_elapsed) => {
+                                    return Err(RuntimeError::new(
+                                        "post-tool stall: model did not respond within timeout",
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
+                        Ok(inner) => inner.map_err(|error| {
+                            RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                        })?,
+                        Err(_elapsed) => {
+                            return Err(RuntimeError::new(
+                                "post-tool stall: model did not respond within timeout",
+                            ));
+                        }
+                    }
+                }
+            } else if let Some(ref abort) = self.abort_signal {
+                tokio::select! {
+                    biased;
+                    _ = abort.wait() => return Err(RuntimeError::new("Turn aborted by user")),
+                    result = stream.next_event() => {
+                        result.map_err(|error| {
+                            RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                        })?
                     }
                 }
             } else {
@@ -14429,7 +14517,7 @@ UU conflicted.rs",
         let events = response_to_events(
             MessageResponse {
                 id: "msg-1".to_string(),
-                kind: "message".to_string(),
+                kind: Some("message".to_string()),
                 model: "claude-opus-4-6".to_string(),
                 role: "assistant".to_string(),
                 content: vec![OutputContentBlock::ToolUse {
@@ -14464,7 +14552,7 @@ UU conflicted.rs",
         let events = response_to_events(
             MessageResponse {
                 id: "msg-2".to_string(),
-                kind: "message".to_string(),
+                kind: Some("message".to_string()),
                 model: "claude-opus-4-6".to_string(),
                 role: "assistant".to_string(),
                 content: vec![OutputContentBlock::ToolUse {
@@ -14499,7 +14587,7 @@ UU conflicted.rs",
         let events = response_to_events(
             MessageResponse {
                 id: "msg-3".to_string(),
-                kind: "message".to_string(),
+                kind: Some("message".to_string()),
                 model: "claude-opus-4-6".to_string(),
                 role: "assistant".to_string(),
                 content: vec![

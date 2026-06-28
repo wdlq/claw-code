@@ -114,6 +114,14 @@ pub(crate) fn parse_frame_with_provider(
     }
 
     if data_lines.is_empty() {
+        // Handle GLM's non-SSE JSON response format:
+        // GLM returns {"type": "message_start", "message": {...}}
+        // instead of standard SSE format with event:/data: prefixes
+        if trimmed.starts_with('{') {
+            return serde_json::from_str::<StreamEvent>(trimmed)
+                .map(Some)
+                .map_err(|error| ApiError::json_deserialize(provider, model, trimmed, error));
+        }
         return Ok(None);
     }
 

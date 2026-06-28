@@ -715,7 +715,7 @@ mod tests {
     ) -> MessageResponse {
         MessageResponse {
             id: "msg_test".to_string(),
-            kind: "message".to_string(),
+            kind: Some("message".to_string()),
             role: "assistant".to_string(),
             content: vec![OutputContentBlock::Text {
                 text: text.to_string(),
