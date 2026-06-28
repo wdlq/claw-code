@@ -363,10 +363,6 @@ impl PermissionPolicy {
             .filter(|rule| rule.tool_name == tool_name)
             .filter_map(|rule| match &rule.matcher {
                 PermissionRuleMatcher::Prefix(prefix) => {
-                    // Ensure prefix ends with a path separator for consistent matching.
-                    // This handles the case where user configures "path/:*)" and the
-                    // resulting prefix "path/" needs to match paths like "path/file.rs"
-                    // as well as "path" (the directory itself).
                     let normalized = prefix.replace('\\', "/");
                     if normalized.ends_with('/') {
                         Some(normalized)

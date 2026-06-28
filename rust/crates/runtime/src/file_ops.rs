@@ -442,10 +442,24 @@ fn glob_search_impl_with_allowed(
     if let Some(root) = canonical_root.as_deref() {
         validate_workspace_boundary_with_allowed(&base_dir, root, allowed)?;
     }
+
+    // Build the search pattern, handling Windows extended-length path prefix
     let search_pattern = if Path::new(pattern).is_absolute() {
-        pattern.to_owned()
+        // Strip Windows \\?\ prefix if present before using with glob
+        if pattern.starts_with("\\\\?\\") {
+            pattern[4..].to_owned()
+        } else {
+            pattern.to_owned()
+        }
     } else {
         base_dir.join(pattern).to_string_lossy().into_owned()
+    };
+
+    // Also strip \\?\ prefix from search_pattern if it came from base_dir
+    let search_pattern = if search_pattern.starts_with("\\\\?\\") {
+        search_pattern[4..].to_owned()
+    } else {
+        search_pattern
     };
 
     // The `glob` crate does not support brace expansion ({a,b,c}).
@@ -459,6 +473,7 @@ fn glob_search_impl_with_allowed(
         let compiled = Pattern::new(pat)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
         let walk_root = derive_glob_walk_root(pat);
+
         if let Some(root) = canonical_root.as_deref() {
             let canonical_walk_root = walk_root
                 .canonicalize()
@@ -667,7 +682,14 @@ fn should_skip_glob_dir(entry: &DirEntry) -> bool {
 }
 
 fn derive_glob_walk_root(pattern: &str) -> PathBuf {
-    let path = Path::new(pattern);
+    // Strip Windows extended-length path prefix if present
+    let pattern_stripped = if pattern.starts_with("\\\\?\\") {
+        &pattern[4..]
+    } else {
+        pattern
+    };
+
+    let path = Path::new(pattern_stripped);
     let mut prefix = PathBuf::new();
     let mut saw_component = false;
 
