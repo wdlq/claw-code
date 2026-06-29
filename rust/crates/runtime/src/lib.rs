@@ -10,6 +10,7 @@ pub mod bash_validation;
 mod bootstrap;
 pub mod branch_lock;
 mod compact;
+mod micro_compact;
 mod config;
 pub mod config_validate;
 mod conversation;

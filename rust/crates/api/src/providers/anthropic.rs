@@ -406,6 +406,16 @@ impl AnthropicClient {
         let mut attempts = 0;
         let mut last_error: Option<ApiError>;
 
+        // Diagnostic snapshot of the request body for GLM debugging.
+        let diag_request_body = self
+            .request_profile
+            .render_json_body(request)
+            .ok()
+            .map(|mut v| {
+                strip_unsupported_beta_body_fields(&mut v);
+                v
+            });
+
         loop {
             attempts += 1;
             if let Some(session_tracer) = &self.session_tracer {
@@ -419,6 +429,7 @@ impl AnthropicClient {
             match self.send_raw_request(request).await {
                 Ok(response) => match expect_success(response).await {
                     Ok(response) => {
+                        write_glm_diag(attempts, response.status().as_u16(), None, &diag_request_body);
                         if let Some(session_tracer) = &self.session_tracer {
                             session_tracer.record_http_request_succeeded(
                                 attempts,
@@ -432,11 +443,13 @@ impl AnthropicClient {
                         return Ok(response);
                     }
                     Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => {
+                        write_glm_diag(attempts, error_status(&error), Some(&error), &diag_request_body);
                         self.record_request_failure(attempts, &error);
                         last_error = Some(error);
                     }
                     Err(error) => {
                         let error = enrich_bearer_auth_error(error, &self.auth);
+                        write_glm_diag(attempts, error_status(&error), Some(&error), &diag_request_body);
                         self.record_request_failure(attempts, &error);
                         return Err(error);
                     }
@@ -471,6 +484,7 @@ impl AnthropicClient {
         let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let mut request_body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut request_body);
+
         let request_builder = self.build_request(&request_url).json(&request_body);
         request_builder.send().await.map_err(ApiError::from)
     }
@@ -994,6 +1008,64 @@ fn strip_unsupported_beta_body_fields(body: &mut Value) {
                 object.insert("stop_sequences".to_string(), stop_val);
             }
         }
+    }
+}
+
+/// Diagnostic helper: extract HTTP status from an ApiError if present.
+fn error_status(error: &ApiError) -> u16 {
+    match error {
+        ApiError::Api { status, .. } => status.as_u16(),
+        _ => 0,
+    }
+}
+
+/// Diagnostic helper: append a per-request record to the GLM debug log so we
+/// can inspect the exact request body and error response that accompany a
+/// multi-turn 400/403 failure. The log path is fixed; claw is launched from
+/// the user's project directory so the file lands in that cwd.
+fn write_glm_diag(
+    attempt: u32,
+    status: u16,
+    error: Option<&ApiError>,
+    request_body: &Option<Value>,
+) {
+    use std::io::Write;
+    let path = "claw_glm_diag.log";
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let body_str = request_body
+        .as_ref()
+        .map(|v| serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()))
+        .unwrap_or_else(|| "<render failed>".to_string());
+    let (err_type, err_msg, err_body) = match error {
+        Some(ApiError::Api {
+            error_type,
+            message,
+            body,
+            ..
+        }) => (
+            error_type.clone().unwrap_or_default(),
+            message.clone().unwrap_or_default(),
+            body.clone(),
+        ),
+        Some(other) => (other.to_string(), String::new(), String::new()),
+        None => (String::new(), String::new(), String::new()),
+    };
+    let record = format!(
+        "\n==== claw_glm_diag t={timestamp} attempt={attempt} status={status} ====\n\
+         [error_type] {err_type}\n\
+         [error_message] {err_msg}\n\
+         [error_body] {err_body}\n\
+         [request_body]\n{body_str}\n"
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = f.write_all(record.as_bytes());
     }
 }
 

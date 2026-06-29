@@ -640,6 +640,12 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 16_384,
             context_window_tokens: 256_000,
         }),
+        // GLM-5 family (Zhipu AI) — 200K context, 128K max output
+        // Source: https://aigw-gzgy2.cucloud.cn API docs
+        "glm-5" | "glm-5.1" => Some(ModelTokenLimit {
+            max_output_tokens: 128_000,
+            context_window_tokens: 200_000,
+        }),
         _ => None,
     }
 }

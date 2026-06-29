@@ -15,7 +15,7 @@ use crate::permissions::{
 use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::usage::{TokenUsage, UsageTracker};
 
-const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
+const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 55_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
 
 /// Fully assembled request payload sent to the upstream model client.
@@ -360,6 +360,31 @@ where
                 return Err(error);
             }
 
+            // Micro-compact: clear old tool-result content before building the
+            // API request.  This is the primary defense against oversized
+            // request bodies — tool results (file reads, grep output, …)
+            // are replaced with a placeholder once they're old enough that
+            // the model no longer needs the verbatim content.
+            let mc_result = crate::micro_compact::microcompact_session(&mut self.session);
+            if mc_result.cleared_count > 0 {
+                eprintln!(
+                    "[micro-compact: cleared {} old tool result(s), freed {} chars]",
+                    mc_result.cleared_count, mc_result.chars_freed
+                );
+            }
+
+            // Pre-flight auto-compact: if the session is still large after
+            // micro-compact, do a full auto-compact. This prevents 400 errors
+            // from providers (e.g. GLM) that reject oversized requests.
+            if self.session_needs_pre_flight_compact() {
+                if let Some(event) = self.maybe_auto_compact() {
+                    eprintln!(
+                        "[auto-compacted: removed {} messages]",
+                        event.removed_message_count
+                    );
+                }
+            }
+
             let request = ApiRequest {
                 system_prompt: self.system_prompt.clone(),
                 messages: self.session.messages.clone(),
@@ -570,9 +595,25 @@ where
     }
 
     fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
-        if self.usage_tracker.cumulative_usage().input_tokens
-            < self.auto_compaction_input_tokens_threshold
-        {
+        // Some providers (e.g. GLM) don't return input_tokens in usage.
+        // Fall back to a rough estimate from the session messages so
+        // auto-compact still triggers when the context grows large.
+        let input_tokens = self.usage_tracker.cumulative_usage().input_tokens;
+        let estimated_tokens = if input_tokens == 0 {
+            // Rough estimate: ~4 chars per token across all message content
+            let char_count: usize = self.session.messages.iter().map(|m| {
+                m.blocks.iter().map(|b| match b {
+                    ContentBlock::Text { text } => text.len(),
+                    ContentBlock::ToolUse { input, .. } => input.to_string().len(),
+                    ContentBlock::ToolResult { output, .. } => output.len(),
+                    _ => 0,
+                }).sum::<usize>()
+            }).sum::<usize>();
+            (char_count / 4) as u32
+        } else {
+            input_tokens
+        };
+        if estimated_tokens < self.auto_compaction_input_tokens_threshold {
             return None;
         }
 
@@ -592,6 +633,23 @@ where
         Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
         })
+    }
+
+    /// Returns true if the current session is large enough to risk a
+    /// provider-side rejection (e.g. GLM's 400 Bad Request) and should
+    /// be compacted BEFORE the next API call.
+    fn session_needs_pre_flight_compact(&self) -> bool {
+        // Estimate token count from message content (~4 chars/token).
+        let char_count: usize = self.session.messages.iter().map(|m| {
+            m.blocks.iter().map(|b| match b {
+                ContentBlock::Text { text } => text.len(),
+                ContentBlock::ToolUse { input, .. } => input.to_string().len(),
+                ContentBlock::ToolResult { output, .. } => output.len(),
+                _ => 0,
+            }).sum::<usize>()
+        }).sum::<usize>();
+        let estimated_tokens = (char_count / 4) as u32;
+        estimated_tokens >= self.auto_compaction_input_tokens_threshold
     }
 
     fn record_turn_started(&self, user_input: &str) {

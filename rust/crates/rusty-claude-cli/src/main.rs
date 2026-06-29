@@ -152,6 +152,10 @@ impl ModelProvenance {
 fn max_tokens_for_model(model: &str) -> u32 {
     api::max_tokens_for_model(model)
 }
+
+fn max_tokens_for_model_with_override(model: &str, plugin_override: Option<u32>) -> u32 {
+    api::max_tokens_for_model_with_override(model, plugin_override)
+}
 // Build-time constants injected by build.rs (fall back to static values when
 // build.rs hasn't run, e.g. in doc-test or unusual toolchain environments).
 const DEFAULT_DATE: &str = match option_env!("BUILD_DATE") {
@@ -4442,6 +4446,7 @@ struct RuntimePluginState {
     tool_registry: GlobalToolRegistry,
     plugin_registry: PluginRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    plugin_max_output_tokens: Option<u32>,
 }
 
 struct RuntimeMcpState {
@@ -8140,6 +8145,7 @@ fn build_runtime_plugin_state_with_loader(
         tool_registry,
         plugin_registry,
         mcp_state,
+        plugin_max_output_tokens: runtime_config.plugins().max_output_tokens(),
     })
 }
 
@@ -8566,6 +8572,7 @@ fn build_runtime_with_plugin_state(
         tool_registry,
         plugin_registry,
         mcp_state,
+        plugin_max_output_tokens,
     } = runtime_plugin_state;
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
@@ -8574,15 +8581,19 @@ fn build_runtime_with_plugin_state(
         tool_registry.with_enforcer(runtime::permission_enforcer::PermissionEnforcer::new(policy.clone()));
     let mut runtime = ConversationRuntime::new_with_features(
         session,
-        AnthropicRuntimeClient::new(
-            session_id,
-            model,
-            enable_tools,
-            emit_output,
-            allowed_tools.clone(),
-            tool_registry.clone(),
-            progress_reporter,
-        )?,
+        {
+            let mut client = AnthropicRuntimeClient::new(
+                session_id,
+                model,
+                enable_tools,
+                emit_output,
+                allowed_tools.clone(),
+                tool_registry.clone(),
+                progress_reporter,
+            )?;
+            client.plugin_max_output_tokens = plugin_max_output_tokens;
+            client
+        },
         CliToolExecutor::new(
             allowed_tools.clone(),
             emit_output,
@@ -8699,6 +8710,7 @@ struct AnthropicRuntimeClient {
     progress_reporter: Option<InternalPromptProgressReporter>,
     reasoning_effort: Option<String>,
     abort_signal: Option<runtime::HookAbortSignal>,
+    plugin_max_output_tokens: Option<u32>,
 }
 
 impl AnthropicRuntimeClient {
@@ -8765,6 +8777,7 @@ impl AnthropicRuntimeClient {
             progress_reporter,
             reasoning_effort: None,
             abort_signal: None,
+            plugin_max_output_tokens: None,
         })
     }
 
@@ -8795,7 +8808,7 @@ impl ApiClient for AnthropicRuntimeClient {
         let is_post_tool = request_ends_with_tool_result(&request);
         let message_request = MessageRequest {
             model: self.model.clone(),
-            max_tokens: max_tokens_for_model(&self.model),
+            max_tokens: max_tokens_for_model_with_override(&self.model, self.plugin_max_output_tokens),
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: self
