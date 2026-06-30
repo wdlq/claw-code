@@ -17,3 +17,9 @@ Cargo.lock
 /_*.ps1
 /_*.cmd
 /atomcode*.exe
+show_mc.ps1
+count_log.ps1
+grep_diag.ps1
+analyze_log.ps1
+analyze_log2.ps1
+read_log_tail.ps1

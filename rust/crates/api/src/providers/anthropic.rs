@@ -416,6 +416,18 @@ impl AnthropicClient {
                 v
             });
 
+        // Log the request body size to claw_glm_diag.log for diagnosis of
+        // oversized-request failures (e.g. GLM 400/500).  Written to a file
+        // rather than stderr because the body can be large and we only need
+        // the byte count, not the contents.  This runs on EVERY request so
+        // we can correlate size with failures even when micro-compact clears
+        // nothing (cleared_count == 0 writes no micro-compact log entry).
+        // Reuses diag_request_body so we don't render the body twice.
+        if let Some(body) = &diag_request_body {
+            let body_bytes = serde_json::to_vec(body).map_or(0, |v| v.len());
+            log_request_size(body_bytes, &self.base_url);
+        }
+
         loop {
             attempts += 1;
             if let Some(session_tracer) = &self.session_tracer {
@@ -1008,6 +1020,31 @@ fn strip_unsupported_beta_body_fields(body: &mut Value) {
                 object.insert("stop_sequences".to_string(), stop_val);
             }
         }
+    }
+}
+
+/// Append a request-size record to `claw_glm_diag.log` so we can correlate
+/// request body size with upstream failures (400/500) without printing large
+/// payloads to the console.  Format matches `write_glm_diag` so all diagnostic
+/// events share one chronological log.  Writes every request — independent of
+/// whether micro-compact cleared anything — so we always have a size baseline.
+fn log_request_size(body_bytes: usize, base_url: &str) {
+    use std::io::Write;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Rough token estimate (~4 chars/token) for quick eyeballing.
+    let est_tokens = body_bytes / 4;
+    let record = format!(
+        "\n==== claw_request_size t={timestamp} bytes={body_bytes} est_tokens={est_tokens} url={base_url} ====\n"
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("claw_glm_diag.log")
+    {
+        let _ = f.write_all(record.as_bytes());
     }
 }
 

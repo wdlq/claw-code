@@ -23,6 +23,19 @@ const GLOB_SEARCH_IGNORED_DIRS: &[&str] = &[
     "target",
     "dist",
     "coverage",
+    // Python virtual-envs and caches (can contain tens of thousands of files)
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".cache",
+    // Rust build artefacts
+    "cargo-target",
+    // Java / Gradle
+    ".gradle",
+    ".mvn",
 ];
 
 /// Check whether a file appears to contain binary content by examining
@@ -632,6 +645,7 @@ fn grep_search_impl_with_allowed(
             content_lines,
             input.head_limit,
             input.offset,
+            total_matches,
         ));
     }
 
@@ -641,7 +655,11 @@ fn grep_search_impl_with_allowed(
         filenames,
         content: None,
         num_lines: None,
-        num_matches: (output_mode == "count").then_some(total_matches),
+        // Report total matches in every mode so the CLI summary line
+        // ("N matches across M files") is correct even for the default
+        // `files_with_matches` mode, which previously left this as None
+        // and rendered as "0 matches".
+        num_matches: Some(total_matches),
         applied_limit,
         applied_offset,
     })
@@ -653,6 +671,7 @@ fn build_grep_content_output(
     content_lines: Vec<String>,
     head_limit: Option<usize>,
     offset: Option<usize>,
+    total_matches: usize,
 ) -> GrepSearchOutput {
     let (lines, limit, offset) = apply_limit(content_lines, head_limit, offset);
     GrepSearchOutput {
@@ -661,7 +680,7 @@ fn build_grep_content_output(
         filenames,
         num_lines: Some(lines.len()),
         content: Some(lines.join("\n")),
-        num_matches: None,
+        num_matches: Some(total_matches),
         applied_limit: limit,
         applied_offset: offset,
     }
@@ -719,7 +738,10 @@ fn collect_search_files(base_path: &Path) -> io::Result<Vec<PathBuf>> {
     }
 
     let mut files = Vec::new();
-    for entry in WalkDir::new(base_path) {
+    for entry in WalkDir::new(base_path)
+        .into_iter()
+        .filter_entry(|entry| !should_skip_glob_dir(entry))
+    {
         let entry = entry.map_err(|error| io::Error::other(error.to_string()))?;
         if entry.file_type().is_file() {
             files.push(entry.path().to_path_buf());
@@ -905,7 +927,25 @@ fn normalize_path(path: &str) -> io::Result<PathBuf> {
     } else {
         std::env::current_dir()?.join(path)
     };
-    candidate.canonicalize()
+    // canonicalize resolves symlinks and normalises the path, but it requires
+    // the path to exist *and* to be resolvable by the OS.  On Windows, paths
+    // with forward slashes and CJK characters can fail canonicalize even when
+    // the directory exists (os error 2).  Fall back to the un-canonicalized
+    // candidate so the operation can still proceed — the path is valid, just
+    // not in its canonical form.
+    candidate
+        .canonicalize()
+        .or_else(|_| {
+            // If the parent exists, at least normalise that part.
+            if let Some(parent) = candidate.parent() {
+                if let Ok(canonical_parent) = parent.canonicalize() {
+                    if let Some(name) = candidate.file_name() {
+                        return Ok(canonical_parent.join(name));
+                    }
+                }
+            }
+            Ok(candidate)
+        })
 }
 
 fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
