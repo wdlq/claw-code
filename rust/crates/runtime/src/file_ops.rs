@@ -23,6 +23,9 @@ const GLOB_SEARCH_IGNORED_DIRS: &[&str] = &[
     "target",
     "dist",
     "coverage",
+    // Claw session/cache dirs (contain huge JSONL files with embedded file contents;
+    // searching them bloats the context window to millions of tokens)
+    ".claw",
     // Python virtual-envs and caches (can contain tens of thousands of files)
     ".venv",
     "venv",
