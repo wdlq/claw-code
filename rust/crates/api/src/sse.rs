@@ -118,9 +118,7 @@ pub(crate) fn parse_frame_with_provider(
         // GLM returns {"type": "message_start", "message": {...}}
         // instead of standard SSE format with event:/data: prefixes
         if trimmed.starts_with('{') {
-            return serde_json::from_str::<StreamEvent>(trimmed)
-                .map(Some)
-                .map_err(|error| ApiError::json_deserialize(provider, model, trimmed, error));
+            return parse_stream_event(provider, model, trimmed);
         }
         return Ok(None);
     }
@@ -130,9 +128,53 @@ pub(crate) fn parse_frame_with_provider(
         return Ok(None);
     }
 
-    serde_json::from_str::<StreamEvent>(&payload)
+    parse_stream_event(provider, model, &payload)
+}
+
+/// Deserialize a streamed JSON payload into a [`StreamEvent`], with special
+/// handling for upstream `{"type": "error", "message": "..."}` frames.
+///
+/// Some providers (notably the GLM gateway) inject an Anthropic-protocol-shaped
+/// `error` event into the SSE stream when the upstream returns a non-2xx status
+/// (e.g. 500 Internal Server Error).  The `StreamEvent` enum has no `error`
+/// variant, so a naive `serde_json::from_str` would fail with a misleading
+/// `unknown variant` message that hides the real upstream cause.
+///
+/// This function first probes the payload as a generic JSON value; if the
+/// `type` field is `error`, it converts the frame into an `ApiError::Api`
+/// carrying the upstream message (so the caller surfaces the real error).
+/// Otherwise it falls back to the normal typed deserialization.
+fn parse_stream_event(
+    provider: &str,
+    model: &str,
+    payload: &str,
+) -> Result<Option<StreamEvent>, ApiError> {
+    // Probe for an upstream error frame before typed deserialization.
+    // We parse to a generic Value first; if it's not an error frame the
+    // cost is one extra small parse, which is negligible next to a network
+    // round-trip.
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+        if value.get("type").and_then(|t| t.as_str()) == Some("error") {
+            let message = value
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("(upstream returned an error event with no message)")
+                .to_string();
+            return Err(ApiError::Api {
+                status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                error_type: Some("upstream_stream_error".to_string()),
+                message: Some(message),
+                request_id: None,
+                body: payload.to_string(),
+                retryable: false,
+                suggested_action: None,
+            });
+        }
+    }
+
+    serde_json::from_str::<StreamEvent>(payload)
         .map(Some)
-        .map_err(|error| ApiError::json_deserialize(provider, model, &payload, error))
+        .map_err(|error| ApiError::json_deserialize(provider, model, payload, error))
 }
 
 #[cfg(test)]

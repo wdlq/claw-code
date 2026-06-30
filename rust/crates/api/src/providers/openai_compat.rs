@@ -276,6 +276,16 @@ impl OpenAiCompatClient {
         // Pre-flight check: verify request body size against provider limits
         check_request_body_size_for_base_url(request, self.config(), &self.base_url)?;
 
+        // Log the request body size to claw_glm_diag.log for diagnosis of
+        // oversized-request failures (e.g. GLM 400/500).  Written to a file
+        // rather than stderr because the body can be large and we only need
+        // the byte count, not the contents.  This runs on EVERY request so
+        // we can correlate size with failures even when micro-compact clears
+        // nothing (cleared_count == 0 writes no micro-compact log entry).
+        let body_bytes =
+            estimate_request_body_size_for_base_url(request, self.config(), &self.base_url);
+        log_request_size(body_bytes, &self.base_url);
+
         let request_url = chat_completions_endpoint(&self.base_url);
         self.http
             .post(&request_url)
@@ -961,6 +971,32 @@ fn estimate_request_body_size_for_base_url(
     let payload = build_chat_completion_request_for_base_url(request, config, base_url);
     // serde_json::to_vec gives us the exact byte size of the serialized JSON
     serde_json::to_vec(&payload).map_or(0, |v| v.len())
+}
+
+/// Append a request-size record to `claw_glm_diag.log` so we can correlate
+/// request body size with upstream failures (400/500) without printing large
+/// payloads to the console.  Format matches `write_microcompact_diag` so all
+/// diagnostic events share one chronological log.
+fn log_request_size(body_bytes: usize, base_url: &str) {
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Rough token estimate (~4 chars/token) for quick eyeballing.
+    let est_tokens = body_bytes / 4;
+    let record = format!(
+        "\n==== claw_request_size t={timestamp} bytes={body_bytes} est_tokens={est_tokens} url={base_url} ====\n"
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("claw_glm_diag.log")
+    {
+        let _ = f.write_all(record.as_bytes());
+    }
 }
 
 /// Pre-flight check for request body size against provider limits.
