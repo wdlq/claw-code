@@ -17,6 +17,10 @@ use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 55_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+/// Percentage of context window to trigger auto-compact (e.g. 75 means 75%).
+const AUTO_COMPACT_PCT_OVERRIDE_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_PCT_OVERRIDE";
+/// Context window size in tokens, used together with PCT_OVERRIDE.
+const AUTO_COMPACT_WINDOW_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -761,21 +765,38 @@ where
 }
 
 /// Reads the automatic compaction threshold from the environment.
+/// Supports three formats:
+/// 1. CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS (direct token count)
+/// 2. CLAUDE_CODE_AUTO_COMPACT_PCT_OVERRIDE + CLAUDE_CODE_AUTO_COMPACT_WINDOW (percentage of context window)
+/// 3. Default: 55,000 tokens
 #[must_use]
 pub fn auto_compaction_threshold_from_env() -> u32 {
-    parse_auto_compaction_threshold(
-        std::env::var(AUTO_COMPACTION_THRESHOLD_ENV_VAR)
-            .ok()
-            .as_deref(),
-    )
-}
+    // First check for direct token threshold
+    if let Ok(threshold) = std::env::var(AUTO_COMPACTION_THRESHOLD_ENV_VAR) {
+        if let Ok(tokens) = threshold.trim().parse::<u32>() {
+            if tokens > 0 {
+                return tokens;
+            }
+        }
+    }
 
-#[must_use]
-fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
-    value
-        .and_then(|raw| raw.trim().parse::<u32>().ok())
-        .filter(|threshold| *threshold > 0)
-        .unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
+    // Check for PCT_OVERRIDE + WINDOW combination
+    if let (Ok(pct_str), Ok(window_str)) = (
+        std::env::var(AUTO_COMPACT_PCT_OVERRIDE_ENV_VAR),
+        std::env::var(AUTO_COMPACT_WINDOW_ENV_VAR),
+    ) {
+        if let (Ok(pct), Ok(window)) = (
+            pct_str.trim().parse::<u32>(),
+            window_str.trim().parse::<u32>(),
+        ) {
+            if pct > 0 && pct <= 100 && window > 0 {
+                // Calculate threshold as percentage of context window
+                return (window as u64 * pct as u64 / 100) as u32;
+            }
+        }
+    }
+
+    DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
 }
 
 fn build_assistant_message(

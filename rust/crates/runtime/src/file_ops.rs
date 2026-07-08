@@ -16,6 +16,13 @@ const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
 /// Maximum file size that can be written (10 MB).
 const MAX_WRITE_SIZE: usize = 10 * 1024 * 1024;
 
+/// Maximum characters a grep content result may have before being
+/// persisted to disk.  When the output exceeds this threshold the
+/// content is written to `.claw/persisted/grep_results/` and the
+/// `content` field is replaced with a file-reference string so the
+/// LLM can read it on demand.
+const DEFAULT_MAX_RESULT_SIZE_CHARS: usize = 50_000;
+
 const GLOB_SEARCH_IGNORED_DIRS: &[&str] = &[
     ".git",
     "node_modules",
@@ -265,6 +272,10 @@ pub struct GrepSearchOutput {
     pub applied_limit: Option<usize>,
     #[serde(rename = "appliedOffset")]
     pub applied_offset: Option<usize>,
+    #[serde(rename = "outputPersisted")]
+    pub output_persisted: Option<bool>,
+    #[serde(rename = "persistedPath")]
+    pub persisted_path: Option<String>,
 }
 
 /// Reads a text file and returns a line-windowed payload.
@@ -665,7 +676,43 @@ fn grep_search_impl_with_allowed(
         num_matches: Some(total_matches),
         applied_limit,
         applied_offset,
+        output_persisted: None,
+        persisted_path: None,
     })
+}
+
+/// Persist large tool output to disk and return the file path.
+///
+/// The file is written under `<workspace_root>/.claw/persisted/grep_results/`
+/// with a unique name derived from the current timestamp and a hash of the
+/// content.  If the directory cannot be created or the file cannot be written,
+/// the function returns `None` (the caller should fall back to inline output).
+fn persist_large_output(content: &str) -> Option<String> {
+    let workspace_root = std::env::current_dir().ok()?;
+    let persisted_dir = workspace_root.join(".claw").join("persisted").join("grep_results");
+    fs::create_dir_all(&persisted_dir).ok()?;
+
+    // Generate a unique filename using timestamp and a short hash of the content.
+    // Use only alphanumeric characters to avoid issues with special characters
+    // (e.g., "-" in the hash might get mangled by hooks or other processing).
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    let content_hash = hasher.finish();
+    // Use hex encoding but remove non-alphanumeric characters
+    let hash_hex = format!("{:016x}", content_hash);
+    let hash_clean: String = hash_hex.chars().filter(|c| c.is_alphanumeric()).collect();
+    let filename = format!("grep_{timestamp}_{}.txt", &hash_clean[..hash_clean.len().min(16)]);
+    let file_path = persisted_dir.join(&filename);
+
+    fs::write(&file_path, content).ok()?;
+
+    // Return a relative-style path that the LLM can use with read_file.
+    Some(format!(".claw/persisted/grep_results/{filename}"))
 }
 
 fn build_grep_content_output(
@@ -677,15 +724,43 @@ fn build_grep_content_output(
     total_matches: usize,
 ) -> GrepSearchOutput {
     let (lines, limit, offset) = apply_limit(content_lines, head_limit, offset);
+    let content = lines.join("\n");
+
+    // If the content exceeds the size threshold, persist it to disk
+    // and replace the inline content with a file reference so the LLM
+    // can read it on demand instead of blowing up the context window.
+    let char_count = content.chars().count();
+    if char_count > DEFAULT_MAX_RESULT_SIZE_CHARS {
+        if let Some(persisted_path) = persist_large_output(&content) {
+            return GrepSearchOutput {
+                mode: Some(output_mode),
+                num_files: filenames.len(),
+                filenames,
+                num_lines: Some(lines.len()),
+                content: Some(format!(
+                    "[Large output persisted to file: {persisted_path}]"
+                )),
+                num_matches: Some(total_matches),
+                applied_limit: limit,
+                applied_offset: offset,
+                output_persisted: Some(true),
+                persisted_path: Some(persisted_path),
+            };
+        }
+        // If persistence failed, fall through to return the full content inline.
+    }
+
     GrepSearchOutput {
         mode: Some(output_mode),
         num_files: filenames.len(),
         filenames,
         num_lines: Some(lines.len()),
-        content: Some(lines.join("\n")),
+        content: Some(content),
         num_matches: Some(total_matches),
         applied_limit: limit,
         applied_offset: offset,
+        output_persisted: None,
+        persisted_path: None,
     }
 }
 

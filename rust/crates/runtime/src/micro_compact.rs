@@ -44,6 +44,12 @@ const COMPACTABLE_TOOLS: &[&str] = &[
 /// grep/bash output) get cleared.
 const MIN_OUTPUT_LENGTH_FOR_CLEAR: usize = 5_000;
 
+/// Emergency threshold: tool results larger than this are ALWAYS cleared,
+/// regardless of whether they're in the protected recent window.
+/// This prevents context window explosion from huge outputs (e.g., a 2MB
+/// grep result would exceed the context window by itself).
+const EMERGENCY_CLEAR_THRESHOLD: usize = 500_000;
+
 /// How many **recent** tool results to protect from micro-compact, regardless
 /// of which assistant turn they belong to.  Mirrors claude-code's
 /// `keepRecent` semantics (default 5 in timeBasedMCConfig.ts) but raised to
@@ -125,9 +131,19 @@ pub fn microcompact_session(session: &mut Session) -> MicroCompactResult {
                 continue;
             }
 
-            // Skip results in the protected recent window.
+            // Skip results in the protected recent window UNLESS they're
+            // dangerously large (emergency threshold). This prevents a single
+            // huge output (e.g. 2MB grep) from exceeding the context window.
             if protect_set.contains(tool_use_id.as_str()) {
-                continue;
+                if output.len() < EMERGENCY_CLEAR_THRESHOLD {
+                    continue;
+                }
+                // Emergency clear: even protected results are cleared if too large
+                eprintln!(
+                    "[micro-compact: emergency clear of protected {} output ({} chars)]",
+                    tool_name,
+                    output.len()
+                );
             }
 
             cleared_count += 1;
