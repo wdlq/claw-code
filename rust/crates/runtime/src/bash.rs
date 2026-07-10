@@ -293,6 +293,115 @@ fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> 
     resolve_sandbox_status_for_request(&request, cwd)
 }
 
+/// Rewrite POSIX drive-letter paths (`/e/...`, `/E/...`) into the Windows
+/// form (`E:/...`) that `cmd.exe` understands.  claw's `bash` tool on Windows
+/// routes commands through `cmd /C` (see `prepare_command`), but the model
+/// frequently emits Git Bash style paths like `cd /e/NW工程/... && php -l ...`
+/// because the system prompt or conversation history contains bash examples.
+/// cmd.exe rejects `/e/` with "The system cannot find the path specified"
+/// before the actual tool command (e.g. `php`) is ever invoked — the operator
+/// sees an apparent "php not in PATH" misdagnosis.
+///
+/// Scope is deliberately narrow: only `/X/` and `/X` (where X is a single
+/// ASCII letter) **at a command-token boundary** are rewritten — i.e. the
+/// `/X` must be immediately preceded by whitespace, `;`, `&`, `|`, the string
+/// start, or after a `cd &&`/`cd ||` separator.  This prevents rewriting
+/// `/X` inside home-relative paths like `~/y` (the `~` prefixes a relative
+/// segment) or relative paths like `./e/x`.  Other POSIX paths (`/tmp/`,
+/// `~/`, `/var/`) are left untouched — those have no clean Windows equivalent
+/// and the model should emit Windows paths for them.
+fn rewrite_posix_drive_paths_for_windows(command: &str) -> String {
+    let chars: Vec<char> = command.chars().collect();
+    let mut out = String::with_capacity(command.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '/' && i + 1 < chars.len() {
+            let letter = chars[i + 1];
+            let is_letter = letter.is_ascii_alphabetic();
+            let next_is_slash_or_end = i + 2 >= chars.len() || chars[i + 2] == '/';
+            let at_token_boundary = i == 0
+                || matches!(
+                    chars[i - 1],
+                    ' ' | '\t' | ';' | '&' | '|'
+                );
+            if is_letter && next_is_slash_or_end && at_token_boundary {
+                out.push(letter);
+                out.push(':');
+                i += 2;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+#[cfg(test)]
+mod drive_path_tests {
+    use super::rewrite_posix_drive_paths_for_windows;
+
+    #[test]
+    fn rewrites_drive_prefix_slash_e() {
+        assert_eq!(
+            rewrite_posix_drive_paths_for_windows("cd /e/NW工程/资料库/html && php -l x.php"),
+            "cd e:/NW工程/资料库/html && php -l x.php"
+        );
+    }
+
+    #[test]
+    fn rewrites_uppercase_drive_letter() {
+        assert_eq!(
+            rewrite_posix_drive_paths_for_windows("ls /C/Windows"),
+            "ls C:/Windows"
+        );
+    }
+
+    #[test]
+    fn rewrites_bare_drive_prefix_without_trailing_slash() {
+        // `/e` alone → `e:` — borderline, but keep behavior consistent
+        assert_eq!(
+            rewrite_posix_drive_paths_for_windows("cd /e"),
+            "cd e:"
+        );
+    }
+
+    #[test]
+    fn leaves_relative_posix_paths_untouched() {
+        // No leading `/` before the letter → `/e/` inside `./e/` is not a drive path
+        assert_eq!(
+            rewrite_posix_drive_paths_for_windows("cat ./e/x.txt"),
+            "cat ./e/x.txt"
+        );
+    }
+
+    #[test]
+    fn leaves_tmp_and_home_untouched() {
+        // `/tmp/`, `~/`, `/var/` are not drive-letter paths — leave alone
+        assert_eq!(
+            rewrite_posix_drive_paths_for_windows("cat /tmp/x.txt && ls ~/y"),
+            "cat /tmp/x.txt && ls ~/y"
+        );
+    }
+
+    #[test]
+    fn leaves_already_windows_paths_untouched() {
+        // `E:/...` has no leading `/` → pattern doesn't match, no rewrite
+        assert_eq!(
+            rewrite_posix_drive_paths_for_windows("cd E:/NW工程/x && php -l y.php"),
+            "cd E:/NW工程/x && php -l y.php"
+        );
+    }
+
+    #[test]
+    fn handles_multiple_drive_paths_in_one_command() {
+        assert_eq!(
+            rewrite_posix_drive_paths_for_windows("cp /e/src/x /e/dst/y"),
+            "cp e:/src/x e:/dst/y"
+        );
+    }
+}
+
 fn prepare_command(
     command: &str,
     cwd: &std::path::Path,
@@ -311,11 +420,14 @@ fn prepare_command(
         return prepared;
     }
 
-    // On Windows, use cmd.exe instead of sh
+    // On Windows, use cmd.exe instead of sh.  Rewrite POSIX drive-letter
+    // paths (/e/...) to Windows form (E:/...) first — the model frequently
+    // emits Git Bash style paths that cmd.exe rejects.
     #[cfg(windows)]
     {
+        let rewritten = rewrite_posix_drive_paths_for_windows(command);
         let mut prepared = Command::new("cmd");
-        prepared.arg("/C").arg(command).current_dir(cwd);
+        prepared.arg("/C").arg(&rewritten).current_dir(cwd);
         if sandbox_status.filesystem_active {
             prepared.env("USERPROFILE", cwd.join(".sandbox-home"));
             prepared.env("TEMP", cwd.join(".sandbox-tmp"));
@@ -355,11 +467,13 @@ fn prepare_tokio_command(
         return prepared;
     }
 
-    // On Windows, use cmd.exe instead of sh
+    // On Windows, use cmd.exe instead of sh.  Rewrite POSIX drive-letter
+    // paths (/e/...) to Windows form (E:/...) first — see prepare_command.
     #[cfg(windows)]
     {
+        let rewritten = rewrite_posix_drive_paths_for_windows(command);
         let mut prepared = TokioCommand::new("cmd");
-        prepared.arg("/C").arg(command).current_dir(cwd);
+        prepared.arg("/C").arg(&rewritten).current_dir(cwd);
         if sandbox_status.filesystem_active {
             prepared.env("USERPROFILE", cwd.join(".sandbox-home"));
             prepared.env("TEMP", cwd.join(".sandbox-tmp"));

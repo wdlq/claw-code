@@ -94,6 +94,15 @@ impl HookAbortSignal {
         self.notify.notify_waiters();
     }
 
+    /// Resets the abort flag to `false` so the signal can be reused for a new
+    /// turn.  The `Notify` is **not** re-armed — any `wait()` future already
+    /// resolved by a previous `abort()` stays resolved; only new `wait()`
+    /// calls observe the reset flag via the early-return in `wait()`.
+    /// Call this at the **start** of each turn before re-entrant use.
+    pub fn reset(&self) {
+        self.aborted.store(false, Ordering::SeqCst);
+    }
+
     #[must_use]
     pub fn is_aborted(&self) -> bool {
         self.aborted.load(Ordering::SeqCst)

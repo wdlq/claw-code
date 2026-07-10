@@ -4433,6 +4433,13 @@ struct LiveCli {
     runtime: BuiltRuntime,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
+    /// #186: process-shared abort signal, cloned by every turn so the
+    /// ctrlc handler installed on turn 1 references the same underlying
+    /// `Arc<AtomicBool>`/`Arc<Notify>` that later turns' runtimes listen
+    /// on.  Without this, Ctrl+C on turn 2+ would abort a stale turn-1
+    /// instance and leave the current turn uninterruptible.  Reset at the
+    /// start of each turn via `reset()` in `prepare_turn_runtime`.
+    shared_abort_signal: runtime::HookAbortSignal,
 }
 
 #[derive(Debug, Clone)]
@@ -4877,18 +4884,75 @@ struct HookAbortMonitor {
     join_handle: Option<JoinHandle<()>>,
 }
 
+// #186: ctrlc::set_handler succeeds exactly once per process (see ctrlc-3.5.2
+// `init_and_set_handler`, gated on a static `INIT` AtomicBool that is never
+// cleared).  This static records whether we have already attempted the install
+// on an earlier turn so later turns can skip the redundant failing call and
+// avoid mistaking its `Err(MultipleHandlers)` for a real Ctrl+C outage.
+static CTRL_C_HANDLER_ATTEMPTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn ctrlc_handler_installed() -> bool {
+    CTRL_C_HANDLER_ATTEMPTED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn mark_ctrlc_handler_installed() {
+    CTRL_C_HANDLER_ATTEMPTED.store(true, std::sync::atomic::Ordering::Release);
+}
+
 impl HookAbortMonitor {
     fn spawn(abort_signal: runtime::HookAbortSignal) -> Self {
         Self::spawn_with_waiter(abort_signal, move |stop_rx, abort_signal| {
             // Use ctrlc crate for reliable cross-platform signal handling.
             // This uses SetConsoleCtrlHandler on Windows, which works
             // regardless of tokio runtime state or rustyline terminal mode.
-            if ctrlc::set_handler(move || {
-                abort_signal.abort();
-            })
-            .is_err()
-            {
-                return;
+            //
+            // #186: ctrlc::set_handler is **process-global** — it succeeds
+            // exactly once per process; every subsequent call returns
+            // `Err(MultipleHandlers)` regardless of whether the previous
+            // handler is still active (verified against ctrlc-3.5.2's
+            // `init_and_set_handler`, which gates on a static `INIT`
+            // AtomicBool and never clears it).  So:
+            //
+            //   * the **first** turn installs the real handler, whose closure
+            //     captures a clone of the process-shared `abort_signal`;
+            //   * every later turn sees `Err(MultipleHandlers)` — this is
+            //     *normal* and means "the handler from turn 1 is still
+            //     driving", NOT "Ctrl+C is dead".  We must not warn on it.
+            //
+            // The reason this is safe across turns is that `LiveCli` now
+            // holds a **process-shared** `HookAbortSignal` (see
+            // `shared_abort_signal`), and every turn clones **the same**
+            // underlying `Arc<AtomicBool>`/`Arc<Notify>`.  So the handler
+            // installed on turn 1 references the same signal the current
+            // turn's runtime is listening on — Ctrl+C on turn 3 aborts
+            // turn 3, not a stale turn-1 instance.
+            //
+            // We only surface a stderr warning on the **first** attempt
+            // when it genuinely fails to install — that indicates the host
+            // terminal (mintty/ConPTY/re-directed stdin) won't deliver
+            // CTRL_C_EVENT at all, and the operator should fall back to
+            // `/stop` (B phase).
+            let first_attempt = !ctrlc_handler_installed();
+            if first_attempt {
+                if ctrlc::set_handler(move || {
+                    let _ = writeln!(
+                        io::stderr(),
+                        "[claw] Ctrl+C received — aborting current turn."
+                    );
+                    abort_signal.abort();
+                })
+                .is_err()
+                {
+                    let _ = writeln!(
+                        io::stderr(),
+                        "[claw] warning: failed to install Ctrl+C handler — Ctrl+C will NOT interrupt turns. Use /stop instead."
+                    );
+                    mark_ctrlc_handler_installed();
+                    let _ = stop_rx.recv();
+                    return;
+                }
+                mark_ctrlc_handler_installed();
             }
 
             // Block until stop signal is received.
@@ -4948,6 +5012,7 @@ impl LiveCli {
             runtime,
             session,
             prompt_history: Vec::new(),
+            shared_abort_signal: runtime::HookAbortSignal::new(),
         };
         cli.persist_session()?;
         Ok(cli)
@@ -5018,7 +5083,13 @@ impl LiveCli {
         &self,
         emit_output: bool,
     ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
-        let hook_abort_signal = runtime::HookAbortSignal::new();
+        // #186: clone the process-shared signal so the ctrlc handler
+        // installed on turn 1 (which captured the same underlying
+        // `Arc<AtomicBool>`/`Arc<Notify>`) drives the current turn's
+        // abort too.  Reset the flag first so an earlier turn's Ctrl+C
+        // doesn't bleed into this turn as an immediate abort.
+        let hook_abort_signal = self.shared_abort_signal.clone();
+        hook_abort_signal.reset();
         let mut runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
@@ -8858,13 +8929,31 @@ impl AnthropicRuntimeClient {
         message_request: &MessageRequest,
         apply_stall_timeout: bool,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let mut stream = self
-            .client
-            .stream_message(message_request)
-            .await
-            .map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-            })?;
+        // Stream establishment (HTTP POST + waiting for response headers) can
+        // take a long time on providers that "think" before emitting the first
+        // SSE event (e.g. GLM). During that window the outer `tokio::select!`
+        // over `stream.next_event()` has not been entered yet, so without this
+        // guard a CTRL+C would set the abort flag but nothing would observe it
+        // until the response finally arrives — the user could not cancel the
+        // "Thinking (0 chars hidden)" phase. Wrap the establishment future so
+        // the abort signal wins immediately.
+        let mut stream = if let Some(ref abort) = self.abort_signal {
+            tokio::select! {
+                biased;
+                _ = abort.wait() => return Err(RuntimeError::new("Turn aborted by user")),
+                result = self.client.stream_message(message_request) => result
+                    .map_err(|error| {
+                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                    })?,
+            }
+        } else {
+            self.client
+                .stream_message(message_request)
+                .await
+                .map_err(|error| {
+                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                })?
+        };
         let mut stdout = io::stdout();
         let mut sink = io::sink();
         let out: &mut dyn Write = if self.emit_output {
@@ -14532,7 +14621,7 @@ UU conflicted.rs",
                 id: "msg-1".to_string(),
                 kind: Some("message".to_string()),
                 model: "claude-opus-4-6".to_string(),
-                role: "assistant".to_string(),
+                role: Some("assistant".to_string()),
                 content: vec![OutputContentBlock::ToolUse {
                     id: "tool-1".to_string(),
                     name: "read_file".to_string(),
@@ -14567,7 +14656,7 @@ UU conflicted.rs",
                 id: "msg-2".to_string(),
                 kind: Some("message".to_string()),
                 model: "claude-opus-4-6".to_string(),
-                role: "assistant".to_string(),
+                role: Some("assistant".to_string()),
                 content: vec![OutputContentBlock::ToolUse {
                     id: "tool-2".to_string(),
                     name: "read_file".to_string(),
@@ -14602,7 +14691,7 @@ UU conflicted.rs",
                 id: "msg-3".to_string(),
                 kind: Some("message".to_string()),
                 model: "claude-opus-4-6".to_string(),
-                role: "assistant".to_string(),
+                role: Some("assistant".to_string()),
                 content: vec![
                     OutputContentBlock::Thinking {
                         thinking: "step 1".to_string(),

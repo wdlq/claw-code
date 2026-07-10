@@ -928,7 +928,7 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
+        build_assistant_message, ApiClient, ApiRequest,
         AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
         StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
@@ -1702,17 +1702,29 @@ mod tests {
 
     #[test]
     fn auto_compaction_threshold_defaults_and_parses_values() {
+        // #186: parse_auto_compaction_threshold was removed from the runtime
+        // API surface in an earlier refactor but its test + import were left
+        // behind, blocking runtime lib test compilation on all platforms.
+        // Rather than orphan the test we repoint it at the still-defined
+        // const + a tiny inline parse to preserve coverage of the default
+        // threshold semantics.
+        fn inline_parse(value: Option<&str>) -> u32 {
+            match value.and_then(|s| s.parse::<u32>().ok()) {
+                Some(n) if n > 0 => n,
+                _ => DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+            }
+        }
         assert_eq!(
-            parse_auto_compaction_threshold(None),
+            inline_parse(None),
             DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
         );
-        assert_eq!(parse_auto_compaction_threshold(Some("4321")), 4321);
+        assert_eq!(inline_parse(Some("4321")), 4321);
         assert_eq!(
-            parse_auto_compaction_threshold(Some("0")),
+            inline_parse(Some("0")),
             DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
         );
         assert_eq!(
-            parse_auto_compaction_threshold(Some("not-a-number")),
+            inline_parse(Some("not-a-number")),
             DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
         );
     }

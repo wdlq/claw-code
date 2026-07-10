@@ -43,7 +43,7 @@ claw-code/
 | 文件 | 作用 | 修改时注意 |
 |------|------|-----------|
 | `file_ops.rs` | **read_file / write_file / edit_file / glob_search / grep_search** 全部在这 | ★ 路径解析、目录过滤、工作区边界都在此；改动需同步看 `tools/` 和 `main.rs` 渲染 |
-| `micro_compact.rs` | 轻量压缩：每次 API 调用前清空旧 tool result 内容 | 常量 `MIN_OUTPUT_LENGTH_FOR_CLEAR=5000`、`PROTECT_RECENT_TOOL_RESULTS=8`；改小会导致"降智" |
+| `micro_compact.rs` | 轻量压缩：每次 API 调用前清空旧 tool result 内容 | 常量 `MIN_OUTPUT_LENGTH_FOR_CLEAR=5000`、`PROTECT_RECENT_TOOL_RESULTS=8`；改小会导致"降智"。⚠️ 文件内注释称"GLM has no server-side cache_edits"——**此为注释层断言，无独立证据**（见下方 2026-07-09 核实记录） |
 | `compact.rs` | 全量 auto-compact（达到阈值时） | 触发阈值由 env `CLAUDE_CODE_AUTO_COMPACT_PCT_OVERRIDE=75` / `WINDOW=131000` 控制 |
 | `session.rs` | `Session` / `ConversationMessage` / `ContentBlock` 数据结构 | micro_compact 依赖此处的类型 |
 | `permissions.rs` | 权限规则匹配、`allowed_path_prefixes` | 之前修过尾部斜杠 bug（见 ARCHITECTURE.md） |
@@ -136,6 +136,20 @@ claw-code/
 3. **micro_compact 调优**：阈值 500→5000，保护窗口 2 轮→8 个 tool result（按 ID 去重，HashSet）
 4. **SSE error 事件**：`parse_stream_event` 把 `{"type":"error"}` 转成 `ApiError::Api{status:500}` 而非崩溃
 5. **request_size 埋点**：`anthropic.rs`（GLM 实际生效）和 `openai_compat.rs`（GLM 死代码）各一份 `log_request_size`
+
+### 2026-07-09 核实记录（本次会话）
+
+**背景**：2026-06-28 第 3 条"micro_compact 调优"时，`micro_compact.rs:56/86` 注释断言"GLM has no server-side cache_edits"作为保护窗口调到 8 的理由。本轮被用户追问该断言依据，进行核实。
+
+**核实结论**：
+1. **claw-code 请求体从不包含 Anthropic 的 `cache_control` 字段**。`MessageRequest`（`api/src/types.rs:7-44`）、`InputMessage`、`InputContentBlock` 的全部变体（Text/Thinking/ToolUse/ToolResult）均无 `cache_control`/`CacheControl`/`ephemeral` 子字段。
+2. **全 `rust/` 树 grep `cache_control|CacheControl|"ephemeral"|cache_edits` 零命中**（除 `micro_compact.rs` 那两行注释自身）。`cache_creation_input_tokens`/`cache_read_input_tokens` 仅出现在 `Usage` 响应结构体里，是回执 token 计数，不是请求字段。
+3. **`api/src/prompt_cache.rs` 的 `PromptCache` 是纯本地磁盘完成缓存**（存储路径 `$HOME/.claude/cache/prompt-cache/`，FNV-1a 哈希请求体命中即跳过 API 直接返回旧响应），**不是** Anthropic server-side prompt caching，不能作为 GLM 是否支持 server-side cache 的证据。
+4. 因此"GLM 无 server-side cache_edits"**在 claw-code 语境下无法被证伪**——client 从未构造过该字段去测试任何后端。注释反映的更可能是用户 henry 的实战经验判断（清掉的内容找不回来），而非经技术验证的结论。
+
+**实际影响**：调参后果（保护窗口 8）对 claw-code 是**永远安全**的策略——client 从不依赖任何 server-side cache，无论 GLM 是否支持都无差别。但断言本身不应被当作"已验证事实"引用。
+
+**已同步更新**：本文件第 46 行 `micro_compact.rs` 那条的"修改时注意"列已加脚注指向本记录。
 
 ---
 
