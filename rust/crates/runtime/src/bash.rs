@@ -302,29 +302,32 @@ fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> 
 /// before the actual tool command (e.g. `php`) is ever invoked — the operator
 /// sees an apparent "php not in PATH" misdagnosis.
 ///
-/// Scope is deliberately narrow: only `/X/` and `/X` (where X is a single
-/// ASCII letter) **at a command-token boundary** are rewritten — i.e. the
-/// `/X` must be immediately preceded by whitespace, `;`, `&`, `|`, the string
-/// start, or after a `cd &&`/`cd ||` separator.  This prevents rewriting
-/// `/X` inside home-relative paths like `~/y` (the `~` prefixes a relative
-/// segment) or relative paths like `./e/x`.  Other POSIX paths (`/tmp/`,
-/// `~/`, `/var/`) are left untouched — those have no clean Windows equivalent
-/// and the model should emit Windows paths for them.
+/// Scope is deliberately narrow: only `/X/` (where X is a single ASCII
+/// letter) **at a command-token boundary** is rewritten — i.e. the `/X`
+/// must be immediately preceded by whitespace, `;`, `&`, `|`, or string
+/// start, AND followed by `/`.  The "followed by `/`" guard is essential:
+/// without it, cmd.exe flags like `/b` (`dir /b`), `/s`, `/h` would be
+/// misdetected as POSIX drive-letter paths and rewritten to `b:` — breaking
+/// every dir/findstr/etc flag.  Other POSIX paths (`/tmp/`, `~/`, `/var/`)
+/// are left untouched — those have no clean Windows equivalent and the
+/// model should emit Windows paths for them.
 fn rewrite_posix_drive_paths_for_windows(command: &str) -> String {
     let chars: Vec<char> = command.chars().collect();
     let mut out = String::with_capacity(command.len());
     let mut i = 0;
     while i < chars.len() {
-        if chars[i] == '/' && i + 1 < chars.len() {
+        if chars[i] == '/' && i + 2 < chars.len() {
             let letter = chars[i + 1];
             let is_letter = letter.is_ascii_alphabetic();
-            let next_is_slash_or_end = i + 2 >= chars.len() || chars[i + 2] == '/';
+            // MUST be followed by `/` — not space, not end.  This prevents
+            // misdetecting cmd.exe flags (`/b`, `/s`, `/h`) as drive paths.
+            let next_is_slash = chars[i + 2] == '/';
             let at_token_boundary = i == 0
                 || matches!(
                     chars[i - 1],
                     ' ' | '\t' | ';' | '&' | '|'
                 );
-            if is_letter && next_is_slash_or_end && at_token_boundary {
+            if is_letter && next_is_slash && at_token_boundary {
                 out.push(letter);
                 out.push(':');
                 i += 2;
@@ -358,11 +361,26 @@ mod drive_path_tests {
     }
 
     #[test]
-    fn rewrites_bare_drive_prefix_without_trailing_slash() {
-        // `/e` alone → `e:` — borderline, but keep behavior consistent
+    fn leaves_bare_drive_prefix_without_trailing_slash_untouched() {
+        // `/e` alone (no trailing `/`) is ambiguous — could be a cmd.exe
+        // flag.  We no longer rewrite this; only `/e/` is rewritten.
         assert_eq!(
             rewrite_posix_drive_paths_for_windows("cd /e"),
-            "cd e:"
+            "cd /e"
+        );
+    }
+
+    #[test]
+    fn leaves_cmd_exe_flags_untouched() {
+        // cmd.exe flags like `/b`, `/s`, `/h` must NOT be rewritten to `b:`
+        // — this was the original failure mode that broke `dir /b`.
+        assert_eq!(
+            rewrite_posix_drive_paths_for_windows(r#"dir "E:\stuff" /b"#),
+            r#"dir "E:\stuff" /b"#
+        );
+        assert_eq!(
+            rewrite_posix_drive_paths_for_windows(r#"findstr /I /S "pattern" /b"#),
+            r#"findstr /I /S "pattern" /b"#
         );
     }
 
@@ -423,11 +441,23 @@ fn prepare_command(
     // On Windows, use cmd.exe instead of sh.  Rewrite POSIX drive-letter
     // paths (/e/...) to Windows form (E:/...) first — the model frequently
     // emits Git Bash style paths that cmd.exe rejects.
+    //
+    // #186: feed `/C <command>` via `raw_arg` rather than two separate
+    // `.arg()` calls.  Rust's `Command::arg` wraps each argv element in
+    // quotes when it contains whitespace, which turns `cmd /C "dir \"E:\...\" /b"`
+    // into a doubly-quoted string that cmd.exe's `/C` parsing interprets
+    // as having escaped inner quotes — and the path comes out garbled,
+    // reporting "The filename, directory name, or volume label syntax is
+    // incorrect." even when the path is valid.  `raw_arg` skips Rust's
+    // argv escaping and passes the bare command line to cmd.exe, which
+    // then sees the command verbatim with inner quotes intact.
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
         let rewritten = rewrite_posix_drive_paths_for_windows(command);
+
         let mut prepared = Command::new("cmd");
-        prepared.arg("/C").arg(&rewritten).current_dir(cwd);
+        prepared.raw_arg(format!("/C {rewritten}")).current_dir(cwd);
         if sandbox_status.filesystem_active {
             prepared.env("USERPROFILE", cwd.join(".sandbox-home"));
             prepared.env("TEMP", cwd.join(".sandbox-tmp"));
@@ -468,12 +498,16 @@ fn prepare_tokio_command(
     }
 
     // On Windows, use cmd.exe instead of sh.  Rewrite POSIX drive-letter
-    // paths (/e/...) to Windows form (E:/...) first — see prepare_command.
+    // paths (/e/...) to Windows form (E:/...) first — see prepare_command
+    // for the rationale.  Use `raw_arg` to skip Rust's argv quoting so
+    // inner quotes in the command survive cmd.exe's `/C` parsing.
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
         let rewritten = rewrite_posix_drive_paths_for_windows(command);
+
         let mut prepared = TokioCommand::new("cmd");
-        prepared.arg("/C").arg(&rewritten).current_dir(cwd);
+        prepared.raw_arg(format!("/C {rewritten}")).current_dir(cwd);
         if sandbox_status.filesystem_active {
             prepared.env("USERPROFILE", cwd.join(".sandbox-home"));
             prepared.env("TEMP", cwd.join(".sandbox-tmp"));

@@ -201,6 +201,51 @@ cd rust && cargo test --workspace
 
 ---
 
+## ★ 2026-07-11 Ctrl+C 中断 + bash 工具 Windows 路径修复（本次会话）
+
+用户报两条 bug：(1) Ctrl+C 跨多轮 turn 失效；(2) claw 里跑含中文路径的 `dir "E:\..." /b` 或 `cd /e/... && php -l` 全挂，报 `The filename, directory name, or volume label syntax is incorrect.` 或 `The system cannot find the path specified.`。
+
+### A. Ctrl+C 跨多轮 turn 中断修复
+
+**根因**：`HookAbortMonitor::spawn` 每轮 turn 调一次 `ctrlc::set_handler`，但 ctrlc crate 全进程只能成功装一次 handler（二次起返回 `Err(MultipleHandlers)`，verified against ctrlc-3.5.2 `init_and_set_handler` 源）。首装 handler 闭包冻结的是首次那个 `abort_signal` 实例——第二轮起 Ctrl+C 调的是死实例的 abort，本轮的 signal 永远不会被 set。
+
+**修法**（3 处）：
+1. `runtime/src/hooks.rs` — `HookAbortSignal` 加 `reset()` 方法，只 reset `aborted` AtomicBool，不动 `Notify`（已 resolve 的 future 不重新 arm，新 `wait()` 落到 `notify.notified().await` 阻塞等新 notify）。
+2. `rusty-claude-cli/src/main.rs` — `LiveCli` 加 `shared_abort_signal: runtime::HookAbortSignal` 字段（进程级共享，`new()` 里初始化一次）；`prepare_turn_runtime` 改成 `self.shared_abort_signal.clone()` + `reset()`，不再每轮 `HookAbortSignal::new()`。
+3. `rusty-claude-cli/src/main.rs` `HookAbortMonitor::spawn` 重写——加进程级 static `CTRL_C_HANDLER_ATTEMPTED: AtomicBool` + `ctrlc_handler_installed()`/`mark_ctrlc_handler_installed()` helper，**首次**才调 `ctrlc::set_handler`，二次起静默跳过（不再误报 warning）；注册失败时才打 stderr 警告暴露终端不投递 CTRL_C_EVENT。
+
+**真机验证**：用户跑两轮 turn 各按 Ctrl+C，每轮都打 `[claw] Ctrl+C received — aborting current turn.` + `Cancelled.`，不再出现 `warning: failed to install Ctrl+C handler`。
+
+### B. bash 工具 Windows 路径三连修
+
+`bash.rs` 的 `prepare_command`/`prepare_tokio_command` 在 Windows 下把命令喂给 `cmd /C`——模型常生成 Git Bash 飽 `/e/NW工程/...` 路径，cmd.exe 不认。
+
+**B-1**：新增 `rewrite_posix_drive_paths_for_windows(command: &str) -> String` 函数——把 `/X/`（X 是单 ASCII 字母）**在 token 边界**（前导是空格/`;`/`&`/`|`/行首）且**后跟 `/`**的位置重写成 `X:/`。8 个单元测试在 `bash.rs::drive_path_tests` mod。喂给 `cmd /C` 前在两处 `#[cfg(windows)]` 分支调用。
+
+**B-2**：改用 `std::os::windows::process::CommandExt::raw_arg`（Rust 1.95+）跳过 Rust `Command::arg` 的 argv 引号包裹——之前 `.arg("/C").arg(cmd)` 让 cmd.exe 收到 `cmd /C "dir \"E:\...\""`，内引号被当转义割裂路径。改成 `prepared.raw_arg(format!("/C {rewritten}"))` 单条裸传，内引号原貌保留。
+
+**B-3**：B-1 函数 pattern 收紧——原本 `next_is_slash_or_end`（认末尾）会把 cmd.exe flag `/b`/`/s`/`/h` 误当 drive path 重写成 `b:`/`s:`/`h:`（真机 diag 抓到 `/b` → `b:` 的怪变）。改成 `next_is_slash`（**只认 `/`，不认末尾**），新增 `leaves_cmd_exe_flags_untouched` 测试覆盖 `dir /b`、`findstr /I /S` 不被改。
+
+**真机验证**（用户跑三条全通）：
+1. `dir "E:\NW工程\资料库\html\application\index\controller\" /b` → 列出全部 php 文件
+2. `cd /e/NW工程/资料库/html && php -l application/.../CmsController.php` → `No syntax errors detected`
+3. `findstr /I /S "controller" "E:\...\*.php"` → 正常输出
+
+**关键诊断教训**：B-3 那个 flag 误改 bug 我**靠埋 diag stderr 日志**抓到的——`eprintln!("[claw diag] prepare_tokio_command raw_arg: /C {rewritten}")` 一行，用户跑一次就看到 `/b` 变成 `b:`。**下次遇到"命令被改坏"类 bug，先埋 diag 打出真传字符串，不要靠推论**。diag 已删。
+
+### 顺手修的预存债（让 runtime lib test target 在 Windows 下能编）
+
+1. **mcp_stdio.rs / mcp_tool_bridge.rs**：5 处 `permissions.set_mode(0o755)` + 2 处 `use std::os::unix::fs::PermissionsExt` 加 `#[cfg(unix)]` 守卫。Windows 下跳过 chmod（脚本可执行性靠扩展名 + PATHEXT，不靠 mode bits）。**这条解了 ATOMCODE_MEMORY 之前记的"Windows 下 cargo test -p runtime --lib 编译失败"预存坑**。
+2. **conversation.rs**：孤儿 `parse_auto_compaction_threshold`（源里无定义，只在 import + 测试里被引，编不过）—— import 列表去掉它，测试改成 inline 实现 preserve coverage。
+3. **rusty-claude-cli/src/main.rs**：3 处 `role: "assistant".to_string()` 改 `role: Some("assistant".to_string())`（2026-06-28 GLM SSE 兼容改造把 `MessageResponse.role` 改 `Option` 时漏了测试桩），让 bin test target 能编。
+
+### 已知未修的旁注 bug（本次会话暴露但未动）
+
+- **`PowerShell executable not found (expected pwsh or powershell in PATH)`**——GLM 模型在 bash 工具失败后尝试 fallback 走 PowerShell 工具时触发。claw 在 PATH 里找不到 `pwsh`（PowerShell 7+）或 `powershell`（Windows PowerShell 5.1），但用户机器上肯定有 `powershell.exe`。是独立 bug，下次接手可查 `rust/crates/runtime/src/` 里 PowerShell 工具的 exe 探测逻辑。
+- **`/stop` slash 命令仍是注册未实现占位**（跟 `/context`/`/files`/`/plan`/`/review`/`/tasks` 等一大票同在 `main.rs:5355-5393` 那个"not yet implemented"分支）——本次会话原计划做 B 实现 `/stop` 作为 Ctrl+C 的补充路径，但 A 修好后 Ctrl+C 跨多轮工作，`/stop` 不必做。
+
+---
+
 ## 下次接手清单
 
 1. **先读本文件** 还原全貌
@@ -210,3 +255,5 @@ cd rust && cargo test --workspace
 5. 如果用户报新 bug，**先看 `claw_glm_diag.log` 尾部**（用 .ps1 脚本读），再读代码
 6. 改 `file_ops.rs` 时记得同步看 `rusty-claude-cli/src/main.rs` 里的 `format_grep_result` / `format_glob_result` 渲染
 7. 改路径/权限相关逻辑时，**务必用中文路径测试**（`E:/内网工程/...` 是现成的测试用例）
+8. **★ 2026-07-11 新增**：`bash` 工具改完后必跑 `cargo test -p runtime --lib drive_path` 那 8 个测试（`/e/` 重写 + cmd.exe flag 不动），Windows 下现在能编能跑（预存债已解）。改 `rewrite_posix_drive_paths_for_windows` pattern 时**务必加新测试覆盖你新认的边界**——pattern 收紧放过 cmd.exe flag 那条教训不能忘
+9. **★ 2026-07-11 新增**：遇"命令被改坏"类 bug，**先埋 `eprintln!("[claw diag] ...")` 打出真传字符串**再推理，不要纯靠推论——本次 B-3 那个 `/b`→`b:` 怪变就是靠 diag 抓到的，纯推论我会一直以为是 raw_arg 没生效
