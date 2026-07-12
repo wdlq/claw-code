@@ -6151,12 +6151,23 @@ fn detect_powershell_shell() -> std::io::Result<&'static str> {
     }
 }
 
+/// Check whether a command-name is resolvable on the parent process PATH.
+///
+/// #186: was previously `sh -lc 'command -v {command}'`, but that runs a
+/// Git Bash `sh.exe` sub-process which rewrites PATH per msys2 rules —
+/// `C:\Windows\System32\WindowsPowerShell\v1.0\` ends up shadowed and
+/// `command -v powershell` returns not-found even when the parent claw
+/// process has powershell.exe on PATH.  Switch to pure-Rust PATH scan
+/// (mirrors `runtime/src/sandbox.rs::command_exists`), which uses the
+/// parent env verbatim with no sub-process PATH rewriting.
 fn command_exists(command: &str) -> bool {
-    std::process::Command::new("sh")
-        .arg("-lc")
-        .arg(format!("command -v {command} >/dev/null 2>&1"))
-        .status()
-        .is_ok_and(|status| status.success())
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            // On Windows the executable may be `command` or `command.exe`.
+            dir.join(command).exists()
+                || dir.join(format!("{command}.exe")).exists()
+        })
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -9793,11 +9804,17 @@ printf 'pwsh:%s' "$1"
 "#,
         )
         .expect("write script");
-        std::process::Command::new("/bin/chmod")
-            .arg("+x")
-            .arg(&script)
-            .status()
-            .expect("chmod");
+        // #186: chmod is Unix-only — on Windows the script's executability is
+        // governed by extension + PATHEXT, not mode bits.  Skip on Windows so
+        // this PowerShell stub-shell test compiles+runs there too.
+        #[cfg(unix)]
+        {
+            std::process::Command::new("/bin/chmod")
+                .arg("+x")
+                .arg(&script)
+                .status()
+                .expect("chmod");
+        }
         let original_path = std::env::var("PATH").unwrap_or_default();
         std::env::set_var("PATH", format!("{}:{}", dir.display(), original_path));
 
