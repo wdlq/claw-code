@@ -48,6 +48,8 @@ WINDOWS_CMD_REPLACEMENTS = {
     "ls ": "dir ",
     "ls\t": "dir\t",
     "ls": "dir",
+    # find files (recursive, wildcard)
+    "find ": "dir /s /b ",
     # remove
     "rm ": "del ",
     "rm\t": "del\t",
@@ -86,17 +88,62 @@ def convert_unix_cmd_to_windows(command: str) -> str:
     if platform.system() != "Windows":
         return command
 
+    # Iterate by precedence: longer Unix prefixes (e.g. "grep -r ") must be
+    # checked before shorter ones (e.g. "grep ") so a command like
+    # `grep -r foo bar` is converted to `findstr /S /I foo bar`, not
+    # `findstr /I -r foo bar`.
+    sorted_items = sorted(
+        WINDOWS_CMD_REPLACEMENTS.items(),
+        key=lambda kv: len(kv[0]),
+        reverse=True,
+    )
+
+    # Special handling for `grep -<flags>` variants: collapse any
+    # `grep -rn` / `grep -rl` / `grep -rF` etc. to `findstr /S /I`,
+    # stripping the Unix flag cluster.  Without this, only the exact
+    # prefix `grep -r ` matches and `grep -rn foo bar` would leave `-rn`
+    # dangling into the findstr call.
+    def convert_one(token: str) -> str:
+        # `grep -<flags> ...` → `findstr /S /I ...` (flags stripped)
+        # greedy: matches `grep -rn`, `grep -rl`, `grep -rF`, etc.
+        import re
+        m = re.match(r'^grep -[A-Za-z]+ ', token)
+        if m:
+            return 'findstr /S /I ' + token[m.end():]
+        return None
+
     result = command
-    for unix_cmd, windows_cmd in WINDOWS_CMD_REPLACEMENTS.items():
-        # Only replace at the beginning of command or after pipe/semicolon
-        # Simple approach: replace if command starts with unix_cmd
+    for unix_cmd, windows_cmd in sorted_items:
+        # Replace at the beginning of the command
         if result.startswith(unix_cmd):
-            result = windows_cmd + result[len(unix_cmd):]
+            # Special: `grep -<flags>` variant
+            converted = convert_one(result)
+            if converted is not None:
+                result = converted
+            else:
+                result = windows_cmd + result[len(unix_cmd):]
             break
-        # Also handle commands after pipe
-        if "| " + unix_cmd in result:
-            result = result.replace("| " + unix_cmd, "| " + windows_cmd, 1)
-            break
+        # Replace after a separator: | && || ;  (the model often emits
+        # `cd /path && ls ...` — without this branch ls never converts)
+        for sep in ("| ", "&& ", "|| ", "; "):
+            needle = sep + unix_cmd
+            if needle in result:
+                # Special: `grep -<flags>` variant after separator.
+                # Pass the tail *after* the separator (which starts with
+                # the Unix cmd) so convert_one's `^grep -` regex matches.
+                tail = result[result.find(needle) + len(sep):]
+                converted_tail = convert_one(tail)
+                if converted_tail is not None:
+                    result = (
+                        result[:result.find(needle) + len(sep)]
+                        + converted_tail
+                    )
+                else:
+                    result = result.replace(needle, sep + windows_cmd, 1)
+                break
+        else:
+            continue
+        break
 
     return result
 

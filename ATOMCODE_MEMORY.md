@@ -241,8 +241,59 @@ cd rust && cargo test --workspace
 
 ### 已知未修的旁注 bug（本次会话暴露但未动）
 
-- **`PowerShell executable not found (expected pwsh or powershell in PATH)`**——GLM 模型在 bash 工具失败后尝试 fallback 走 PowerShell 工具时触发。claw 在 PATH 里找不到 `pwsh`（PowerShell 7+）或 `powershell`（Windows PowerShell 5.1），但用户机器上肯定有 `powershell.exe`。是独立 bug，下次接手可查 `rust/crates/runtime/src/` 里 PowerShell 工具的 exe 探测逻辑。
+- ~~**`PowerShell executable not found (expected pwsh or powershell in PATH)`**——已解决，见下方 2026-07-12 记录~~
 - **`/stop` slash 命令仍是注册未实现占位**（跟 `/context`/`/files`/`/plan`/`/review`/`/tasks` 等一大票同在 `main.rs:5355-5393` 那个"not yet implemented"分支）——本次会话原计划做 B 实现 `/stop` 作为 Ctrl+C 的补充路径，但 A 修好后 Ctrl+C 跨多轮工作，`/stop` 不必做。
+- **`powershell_runs_via_stub_shell` 测试断言格式对不上**（`crates/tools/src/lib.rs:9837`）——预存测试桩债，stub shell 期望 `pwsh:Write-Output hello` 但实际输出 `hello\r\n`。是测试断言假错，不是 claw 代码 bug，下次接手可对照实际 `execute_shell_command` 调 pwsh 的参数格式修断言。
+- **`find -name -type` 等 Unix flag 转 `dir /s /b` 后 cmd.exe 不认**——hook 腄本 `convert_unix_cmd_to_windows` 把 `find` 转成 `dir /s /b` 但 find 的 `-name`/`-type` flag 没剥，cmd.exe 仍挂。治本要么 claw 走 bash.exe，要么模型改用 Windows 原生命令形态。
+
+---
+
+## ★ 2026-07-12 PowerShell 工具探测 + hook 腄本 `&&` 分隔支持（本次会话）
+
+### A. PowerShell 工具 `executable not found` 修复
+
+**根因**：`crates/tools/src/lib.rs:6164` 那个 `command_exists(command)` 用 `std::process::Command::new("sh").arg("-lc").arg(format!("command -v {command} >/dev/null 2>&1"))`——在 Git Bash 的 `sh.exe` 子进程里跑 `command -v`。Git Bash 启 sh.exe 时会用 msys2 的环境重写规则过滤父 PATH，导致 `C:\Windows\System32\WindowsPowerShell\v1.0\` 这段虽在 claw 父进程 PATH 里却看不到，`command -v powershell` 返回 not-found。
+
+**关键证据**：diag 日志埋点（`eprintln!("[claw diag] detect_powershell_shell: ... parent PATH = {}")`）打出 claw 父进程 PATH **含** `C:\Windows\System32\WindowsPowerShell\v1.0\;`——PATH 没问题，是 `sh.exe` 子进程的重写吞了这段。同一问题在 `runtime/src/sandbox.rs:280` 那个 `command_exists` 里**不存在**——它用纯 Rust `std::env::split_paths` 遍历父 PATH，不调 sh.exe。
+
+**修法**（`crates/tools/src/lib.rs`）：把 `command_exists` 改成跟 `sandbox.rs` 那个正确实现对齐的纯 Rust PATH 遍历，不再调 sh.exe：
+
+```rust
+fn command_exists(command: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            dir.join(command).exists()
+                || dir.join(format!("{command}.exe")).exists()
+        })
+    })
+}
+```
+
+Windows 下额外试 `command.exe`（cmd.exe 命令申明可不带扩展名）。diag 日志已删。
+
+**预存债顺手修**：`crates/tools/src/lib.rs:9807` 那处 `std::process::Command::new("/bin/chmod")` 加 `#[cfg(unix)]` 守卫——Windows 下没 `/bin/chmod` 路径，让 `powershell_runs_via_stub_shell` 测试 target 在 Windows 下能编能跑。
+
+**真机验证**：用户跑 `用 PowerShell 跑这条：Get-ChildItem "E:\..." -Name`，PowerShell 工具成功调起不再报 not found。
+
+**残留预存债**（未动）：`powershell_runs_via_stub_shell` 测试断言 `right: "pwsh:Write-Output hello"` 跟实际输出 `left: "hello\r\n"` 对不上——是测试桩 stub shell 期望的参数格式跟实际 `execute_shell_command` 调 pwsh 的参数格式不同，是测试断言假错，不是 claw 代码 bug。下次接手可对照实际参数格式修断言。
+
+### B. PreToolUse hook `convert_unix_cmd_to_windows` 加 `&&`/`;`/`||` 分隔支持
+
+**根因**：`E:/NW工程/资料库/html/.claw/hooks/keyword_restorer.py` 里 `convert_unix_cmd_to_windows` 只在命令**行首**或 `|` 后替换 Unix 命令（`ls`/`grep`/`cat` 等）成 Windows 命令（`dir`/`findstr`/`type`）。但 GLM 模型常生成 `cd /e/... && ls ...` / `cd /e/... && grep -rn ...` 模式——`ls`/`grep` 在 `&&` 后面，hook 不触发，原样喂给 cmd.exe 报 `'ls' is not recognized as an internal or external command.`。
+
+**修法**（`keyword_restorer.py`，5 处改动）：
+1. `WINDOWS_CMD_REPLACEMENTS` 表加 `"find ": "dir /s /b "` 一行
+2. `convert_unix_cmd_to_windows` 函数重写——`sorted_items` 按 prefix 长度降序排（`grep -r ` 妈先于 `grep `），separator 分支扩到 `| `/`&& `/`; `/`|| ` 全部
+3. 加 `convert_one` helper 用 regex `^grep -[A-Za-z]+ ` 剥 `grep -rn`/`grep -rl`/`grep -rF` 等 flag 变体段，统一转 `findstr /S /I`——之前只转 `grep -r ` 字面变体，`grep -rn` 会漏转出 `findstr /I -rn` 怪串
+
+**验证**：Python 直接调 `convert_unix_cmd_to_windows` 跑 6+ 条用例全通——`cd /e/... && ls ...` → `cd /e/... && dir ...`、`cd /e/... && grep -rn refresh ...` → `cd /e/... && findstr /S /I refresh ...`、`grep -rl foo` → `findstr /S /I foo` 等。
+
+**残 bug**（hook 改不到的）：`find application -name route* -type f` 转成 `dir /s /b application -name route* -type f`——find 的 `-name`/`-type` flag cmd.exe 不认。治本要么 claw 走 bash.exe，要么模型改用 Windows 原生命令形态。
+
+### 本次会话两改动的共通教训
+
+- **同名函数两份实现不同**：`command_exists` 在 `runtime/src/sandbox.rs` 和 `tools/src/lib.rs` 各一份，前者正确（纯 Rust PATH 遍历），后者 buggy（调 sh.exe）。下次接手遇到跨 crate 同名函数，**先 diff 两份实现**——bug 常在抄袭走样里。
+- **hook 腄本是 Python 改完即生效**——不用重编 claw。但 hook 改坏影响所有 bash/PowerShell 工具调用，改完用 `python -c "from keyword_restorer import convert_unix_cmd_to_windows; ..."` 直接跑几条用例验证再放手。
 
 ---
 
@@ -257,3 +308,5 @@ cd rust && cargo test --workspace
 7. 改路径/权限相关逻辑时，**务必用中文路径测试**（`E:/内网工程/...` 是现成的测试用例）
 8. **★ 2026-07-11 新增**：`bash` 工具改完后必跑 `cargo test -p runtime --lib drive_path` 那 8 个测试（`/e/` 重写 + cmd.exe flag 不动），Windows 下现在能编能跑（预存债已解）。改 `rewrite_posix_drive_paths_for_windows` pattern 时**务必加新测试覆盖你新认的边界**——pattern 收紧放过 cmd.exe flag 那条教训不能忘
 9. **★ 2026-07-11 新增**：遇"命令被改坏"类 bug，**先埋 `eprintln!("[claw diag] ...")` 打出真传字符串**再推理，不要纯靠推论——本次 B-3 那个 `/b`→`b:` 怪变就是靠 diag 抓到的，纯推论我会一直以为是 raw_arg 没生效
+10. **★ 2026-07-12 新增**：跨 crate 同名函数（`command_exists` 在 `runtime/src/sandbox.rs` 和 `tools/src/lib.rs` 各一份）**先 diff 两份实现**——bug 常在抄袭走样里。本次 PowerShell 探测那条根因就是 `tools` 那份调 sh.exe 走样了，`sandbox` 那份纯 Rust 实现是对的
+11. **★ 2026-07-12 新增**：改 `E:/NW工程/资料库/html/.claw/hooks/keyword_restorer.py` 后**不用重编 claw**（Python 腄本即改即生效），但改坏影响所有 bash/PowerShell 工具调用——改完用 `python -c "from keyword_restorer import convert_unix_cmd_to_windows; ..."` 直接跑几条用例验证再放手
