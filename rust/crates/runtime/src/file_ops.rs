@@ -348,7 +348,8 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
     fs::write(&absolute_path, content)?;
 
     // For large files, include first 10 lines + modified parts + last 10 lines
-    let is_large_file = original_file.as_ref().map_or(false, |f| f.len() > 100000) || content.len() > 100000;
+    let is_large_file =
+        original_file.as_ref().map_or(false, |f| f.len() > 100000) || content.len() > 100000;
 
     let original_file_output = original_file.as_ref().map(|f| {
         if is_large_file {
@@ -391,15 +392,22 @@ pub fn edit_file(
     }
 
     // Normalize line endings: convert old_string to match file's line endings
-    let (normalized_old, normalized_new) = if original_file.contains("\r\n") && !old_string.contains("\r\n") {
-        // File uses \r\n, but old_string uses \n - convert old_string and new_string
-        (old_string.replace("\n", "\r\n"), new_string.replace("\n", "\r\n"))
-    } else if !original_file.contains("\r\n") && old_string.contains("\r\n") {
-        // File uses \n, but old_string uses \r\n - convert old_string and new_string
-        (old_string.replace("\r\n", "\n"), new_string.replace("\r\n", "\n"))
-    } else {
-        (old_string.to_string(), new_string.to_string())
-    };
+    let (normalized_old, normalized_new) =
+        if original_file.contains("\r\n") && !old_string.contains("\r\n") {
+            // File uses \r\n, but old_string uses \n - convert old_string and new_string
+            (
+                old_string.replace("\n", "\r\n"),
+                new_string.replace("\n", "\r\n"),
+            )
+        } else if !original_file.contains("\r\n") && old_string.contains("\r\n") {
+            // File uses \n, but old_string uses \r\n - convert old_string and new_string
+            (
+                old_string.replace("\r\n", "\n"),
+                new_string.replace("\r\n", "\n"),
+            )
+        } else {
+            (old_string.to_string(), new_string.to_string())
+        };
 
     if !original_file.contains(normalized_old.as_str()) {
         return Err(io::Error::new(
@@ -689,7 +697,10 @@ fn grep_search_impl_with_allowed(
 /// the function returns `None` (the caller should fall back to inline output).
 fn persist_large_output(content: &str) -> Option<String> {
     let workspace_root = std::env::current_dir().ok()?;
-    let persisted_dir = workspace_root.join(".claw").join("persisted").join("grep_results");
+    let persisted_dir = workspace_root
+        .join(".claw")
+        .join("persisted")
+        .join("grep_results");
     fs::create_dir_all(&persisted_dir).ok()?;
 
     // Generate a unique filename using timestamp and a short hash of the content.
@@ -706,7 +717,10 @@ fn persist_large_output(content: &str) -> Option<String> {
     // Use hex encoding but remove non-alphanumeric characters
     let hash_hex = format!("{:016x}", content_hash);
     let hash_clean: String = hash_hex.chars().filter(|c| c.is_alphanumeric()).collect();
-    let filename = format!("grep_{timestamp}_{}.txt", &hash_clean[..hash_clean.len().min(16)]);
+    let filename = format!(
+        "grep_{timestamp}_{}.txt",
+        &hash_clean[..hash_clean.len().min(16)]
+    );
     let file_path = persisted_dir.join(&filename);
 
     fs::write(&file_path, content).ok()?;
@@ -899,10 +913,14 @@ fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
     let mut hunks = Vec::new();
 
     // First hunk: first 10 lines
-    let first_chunk_orig: Vec<String> = original_lines.iter().take(header_lines)
+    let first_chunk_orig: Vec<String> = original_lines
+        .iter()
+        .take(header_lines)
         .map(|l| format!("-{l}"))
         .collect();
-    let first_chunk_upd: Vec<String> = updated_lines.iter().take(header_lines)
+    let first_chunk_upd: Vec<String> = updated_lines
+        .iter()
+        .take(header_lines)
         .map(|l| format!("+{l}"))
         .collect();
 
@@ -924,7 +942,10 @@ fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
 
     while i < original_lines.len() || j < updated_lines.len() {
         // Skip matching lines
-        while i < original_lines.len() && j < updated_lines.len() && original_lines[i] == updated_lines[j] {
+        while i < original_lines.len()
+            && j < updated_lines.len()
+            && original_lines[i] == updated_lines[j]
+        {
             i += 1;
             j += 1;
         }
@@ -938,16 +959,23 @@ fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
         let change_start_upd = j;
 
         // Find end of changed region
-        while i < original_lines.len() && j < updated_lines.len() && original_lines[i] != updated_lines[j] {
+        while i < original_lines.len()
+            && j < updated_lines.len()
+            && original_lines[i] != updated_lines[j]
+        {
             i += 1;
             j += 1;
         }
 
         // Also handle additions or deletions
-        while i < original_lines.len() && (j >= updated_lines.len() || original_lines[i] != updated_lines[j]) {
+        while i < original_lines.len()
+            && (j >= updated_lines.len() || original_lines[i] != updated_lines[j])
+        {
             i += 1;
         }
-        while j < updated_lines.len() && (i >= original_lines.len() || original_lines[i] != updated_lines[j]) {
+        while j < updated_lines.len()
+            && (i >= original_lines.len() || original_lines[i] != updated_lines[j])
+        {
             j += 1;
         }
 
@@ -977,10 +1005,18 @@ fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
     }
 
     // Last hunk: last 10 lines
-    let last_chunk_orig: Vec<String> = original_lines.iter().rev().take(footer_lines).rev()
+    let last_chunk_orig: Vec<String> = original_lines
+        .iter()
+        .rev()
+        .take(footer_lines)
+        .rev()
         .map(|l| format!("-{l}"))
         .collect();
-    let last_chunk_upd: Vec<String> = updated_lines.iter().rev().take(footer_lines).rev()
+    let last_chunk_upd: Vec<String> = updated_lines
+        .iter()
+        .rev()
+        .take(footer_lines)
+        .rev()
         .map(|l| format!("+{l}"))
         .collect();
 
@@ -1011,19 +1047,17 @@ fn normalize_path(path: &str) -> io::Result<PathBuf> {
     // the directory exists (os error 2).  Fall back to the un-canonicalized
     // candidate so the operation can still proceed — the path is valid, just
     // not in its canonical form.
-    candidate
-        .canonicalize()
-        .or_else(|_| {
-            // If the parent exists, at least normalise that part.
-            if let Some(parent) = candidate.parent() {
-                if let Ok(canonical_parent) = parent.canonicalize() {
-                    if let Some(name) = candidate.file_name() {
-                        return Ok(canonical_parent.join(name));
-                    }
+    candidate.canonicalize().or_else(|_| {
+        // If the parent exists, at least normalise that part.
+        if let Some(parent) = candidate.parent() {
+            if let Ok(canonical_parent) = parent.canonicalize() {
+                if let Some(name) = candidate.file_name() {
+                    return Ok(canonical_parent.join(name));
                 }
             }
-            Ok(candidate)
-        })
+        }
+        Ok(candidate)
+    })
 }
 
 fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
@@ -1108,7 +1142,14 @@ pub fn edit_file_in_workspace(
     replace_all: bool,
     workspace_root: &Path,
 ) -> io::Result<EditFileOutput> {
-    edit_file_in_workspace_with_allowed(path, old_string, new_string, replace_all, workspace_root, &[])
+    edit_file_in_workspace_with_allowed(
+        path,
+        old_string,
+        new_string,
+        replace_all,
+        workspace_root,
+        &[],
+    )
 }
 
 /// Edit a file with workspace boundary enforcement, honouring allowed

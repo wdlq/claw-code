@@ -338,9 +338,12 @@ impl LineEditor {
                     // If the returned line ends with the first line of clipboard,
                     // it's likely a paste (user may have typed text before pasting)
                     if line.trim().ends_with(first_line.trim()) && !first_line.trim().is_empty() {
-                        if let Some(label) = self.paste_manager.register_paste(clipboard_after.trim()) {
+                        if let Some(label) =
+                            self.paste_manager.register_paste(clipboard_after.trim())
+                        {
                             // Check if this is a large paste that should suppress display
-                            self.paste_manager.is_large_paste = clipboard_line_count > PASTE_DISPLAY_THRESHOLD;
+                            self.paste_manager.is_large_paste =
+                                clipboard_line_count > PASTE_DISPLAY_THRESHOLD;
 
                             let mut stdout = io::stdout();
                             writeln!(stdout)?;

@@ -322,11 +322,7 @@ fn rewrite_posix_drive_paths_for_windows(command: &str) -> String {
             // MUST be followed by `/` — not space, not end.  This prevents
             // misdetecting cmd.exe flags (`/b`, `/s`, `/h`) as drive paths.
             let next_is_slash = chars[i + 2] == '/';
-            let at_token_boundary = i == 0
-                || matches!(
-                    chars[i - 1],
-                    ' ' | '\t' | ';' | '&' | '|'
-                );
+            let at_token_boundary = i == 0 || matches!(chars[i - 1], ' ' | '\t' | ';' | '&' | '|');
             if is_letter && next_is_slash && at_token_boundary {
                 out.push(letter);
                 out.push(':');
@@ -364,10 +360,7 @@ mod drive_path_tests {
     fn leaves_bare_drive_prefix_without_trailing_slash_untouched() {
         // `/e` alone (no trailing `/`) is ambiguous — could be a cmd.exe
         // flag.  We no longer rewrite this; only `/e/` is rewritten.
-        assert_eq!(
-            rewrite_posix_drive_paths_for_windows("cd /e"),
-            "cd /e"
-        );
+        assert_eq!(rewrite_posix_drive_paths_for_windows("cd /e"), "cd /e");
     }
 
     #[test]

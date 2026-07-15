@@ -831,9 +831,7 @@ fn normalize_markdown(markdown: &str) -> String {
         // --- Table fix: insert separator row if missing ---
         // Only check on the FIRST row of a table (not preceded by another table row or separator).
         let prev_is_table = i > 0 && {
-            let prev_trimmed = lines[i - 1]
-                .trim_end_matches('\n')
-                .trim_end_matches('\r');
+            let prev_trimmed = lines[i - 1].trim_end_matches('\n').trim_end_matches('\r');
             is_table_row(prev_trimmed)
         };
         if is_table_row(trimmed) && !is_table_separator(trimmed) && !prev_is_table {
@@ -848,7 +846,11 @@ fn normalize_markdown(markdown: &str) -> String {
 
             if !next_is_separator {
                 // Count columns from this row.
-                let col_count = trimmed.split('|').filter(|c| !c.trim().is_empty()).count().max(1);
+                let col_count = trimmed
+                    .split('|')
+                    .filter(|c| !c.trim().is_empty())
+                    .count()
+                    .max(1);
                 // Ensure previous line is blank (CommonMark requires it).
                 if i > 0 {
                     let prev = lines[i - 1]
@@ -888,7 +890,9 @@ fn normalize_markdown(markdown: &str) -> String {
         }
 
         // --- Blank line before list items ---
-        if (trimmed.starts_with("- ") || trimmed.starts_with("* ") || starts_with_ordered_list(trimmed))
+        if (trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+            || starts_with_ordered_list(trimmed))
             && i > 0
         {
             let prev = lines[i - 1]
@@ -945,8 +949,7 @@ fn is_atx_heading(line: &str) -> bool {
         return false;
     }
     // Must have a space after the hashes (or be exactly hashes only).
-    trimmed.len() == hashes
-        || trimmed.as_bytes().get(hashes).map_or(false, |&b| b == b' ')
+    trimmed.len() == hashes || trimmed.as_bytes().get(hashes).map_or(false, |&b| b == b' ')
 }
 
 fn find_stream_safe_boundary(markdown: &str) -> Option<usize> {
@@ -1135,19 +1138,33 @@ mod tests {
     fn normalizes_table_without_separator_and_blank_line() {
         let renderer = TerminalRenderer::new();
         // LLM output: table without separator, preceded by text without blank line.
-        let output = renderer.render_markdown("some text\n| Name | Value |\n| alpha | 1 |\n| beta | 22 |");
+        let output =
+            renderer.render_markdown("some text\n| Name | Value |\n| alpha | 1 |\n| beta | 22 |");
         let plain = strip_ansi(&output);
         let lines = plain.lines().collect::<Vec<_>>();
 
         // Should render as a table (not raw text with | pipes).
         // Header row should have properly aligned cells.
-        let header = lines.iter().find(|l| l.contains("Name") && l.contains("Value")).expect("header row");
+        let header = lines
+            .iter()
+            .find(|l| l.contains("Name") && l.contains("Value"))
+            .expect("header row");
         let header_borders: Vec<usize> = header.match_indices('│').map(|(i, _)| i).collect();
-        assert!(header_borders.len() >= 3, "header should have at least 3 borders, got {:?}", header_borders);
+        assert!(
+            header_borders.len() >= 3,
+            "header should have at least 3 borders, got {:?}",
+            header_borders
+        );
         // Data rows should have matching border positions.
-        let data_row = lines.iter().find(|l| l.contains("alpha") && l.contains("1")).expect("alpha row");
+        let data_row = lines
+            .iter()
+            .find(|l| l.contains("alpha") && l.contains("1"))
+            .expect("alpha row");
         let data_borders: Vec<usize> = data_row.match_indices('│').map(|(i, _)| i).collect();
-        assert_eq!(header_borders, data_borders, "data row borders don't match header");
+        assert_eq!(
+            header_borders, data_borders,
+            "data row borders don't match header"
+        );
     }
 
     #[test]
@@ -1159,7 +1176,10 @@ mod tests {
 
         assert!(plain.contains("Heading"));
         // The heading should be rendered as a heading (with styling), not as literal "## Heading".
-        assert!(output.contains('\u{1b}'), "heading should be styled with ANSI");
+        assert!(
+            output.contains('\u{1b}'),
+            "heading should be styled with ANSI"
+        );
     }
 
     #[test]

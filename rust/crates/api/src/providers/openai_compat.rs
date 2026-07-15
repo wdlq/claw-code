@@ -504,6 +504,7 @@ impl StreamState {
                         cache_creation_input_tokens: 0,
                         cache_read_input_tokens: 0,
                         output_tokens: 0,
+                        ..Usage::default()
                     },
                     request_id: None,
                 },
@@ -648,6 +649,7 @@ impl StreamState {
                     cache_creation_input_tokens: 0,
                     cache_read_input_tokens: 0,
                     output_tokens: 0,
+                    ..Usage::default()
                 }),
             }));
             events.push(StreamEvent::MessageStop(MessageStopEvent {}));
@@ -810,6 +812,7 @@ impl OpenAiUsage {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: cached_tokens,
             output_tokens: self.completion_tokens,
+            ..Usage::default()
         }
     }
 }
@@ -1171,11 +1174,19 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
             let mut tool_calls = Vec::new();
             for block in &message.content {
                 match block {
-                    InputContentBlock::Text { text: value } => text.push_str(value),
+                    InputContentBlock::Text {
+                        text: value,
+                        cache_control: _,
+                    } => text.push_str(value),
                     InputContentBlock::Thinking {
                         thinking: value, ..
                     } => reasoning.push_str(value),
-                    InputContentBlock::ToolUse { id, name, input } => tool_calls.push(json!({
+                    InputContentBlock::ToolUse {
+                        id,
+                        name,
+                        input,
+                        cache_control: _,
+                    } => tool_calls.push(json!({
                         "id": id,
                         "type": "function",
                         "function": {
@@ -1210,7 +1221,10 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
             .content
             .iter()
             .filter_map(|block| match block {
-                InputContentBlock::Text { text } => Some(json!({
+                InputContentBlock::Text {
+                    text,
+                    cache_control: _,
+                } => Some(json!({
                     "role": "user",
                     "content": text,
                 })),
@@ -1218,6 +1232,7 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                     tool_use_id,
                     content,
                     is_error,
+                    cache_control: _,
                 } => {
                     let mut msg = json!({
                         "role": "tool",
@@ -1668,6 +1683,7 @@ mod tests {
                     content: vec![
                         InputContentBlock::Text {
                             text: "hello".to_string(),
+                            cache_control: None,
                         },
                         InputContentBlock::ToolResult {
                             tool_use_id: "tool_1".to_string(),
@@ -1675,14 +1691,17 @@ mod tests {
                                 value: json!({"ok": true}),
                             }],
                             is_error: false,
+                            cache_control: None,
                         },
                     ],
+                    cache_control: None,
                 }],
                 system: Some("be helpful".to_string()),
                 tools: Some(vec![ToolDefinition {
                     name: "weather".to_string(),
                     description: Some("Get weather".to_string()),
                     input_schema: json!({"type": "object"}),
+                    cache_control: None,
                 }]),
                 tool_choice: Some(ToolChoice::Auto),
                 stream: false,
@@ -2049,11 +2068,14 @@ mod tests {
                     InputContentBlock::Thinking {
                         thinking: "prior reasoning".to_string(),
                         signature: None,
+                        cache_control: None,
                     },
                     InputContentBlock::Text {
                         text: "answer".to_string(),
+                        cache_control: None,
                     },
                 ],
+                cache_control: None,
             }],
             stream: false,
             ..Default::default()
@@ -2277,7 +2299,9 @@ mod tests {
                 role: "assistant".to_string(),
                 content: vec![InputContentBlock::Text {
                     text: "Hello".to_string(),
+                    cache_control: None,
                 }],
+                cache_control: None,
             }],
             stream: false,
             ..Default::default()
@@ -2309,7 +2333,9 @@ mod tests {
                     id: "call_1".to_string(),
                     name: "read_file".to_string(),
                     input: serde_json::json!({"path": "/tmp/test"}),
+                    cache_control: None,
                 }],
+                cache_control: None,
             }],
             stream: false,
             ..Default::default()
@@ -2428,7 +2454,9 @@ mod tests {
                     text: "Error occurred".to_string(),
                 }],
                 is_error: true,
+                cache_control: None,
             }],
+            cache_control: None,
         };
 
         let translated = super::translate_message(&message, "gpt-4o");
@@ -2452,7 +2480,9 @@ mod tests {
                     text: "Success".to_string(),
                 }],
                 is_error: false,
+                cache_control: None,
             }],
+            cache_control: None,
         };
 
         let translated2 = super::translate_message(&message2, "grok-3");
@@ -2483,7 +2513,9 @@ mod tests {
                     text: "Error occurred".to_string(),
                 }],
                 is_error: true,
+                cache_control: None,
             }],
+            cache_control: None,
         };
 
         let translated = super::translate_message(&message, "kimi-k2.5");
@@ -2527,7 +2559,9 @@ mod tests {
                         id: "call_1".to_string(),
                         name: "read_file".to_string(),
                         input: serde_json::json!({"path": "/tmp/test"}),
+                        cache_control: None,
                     }],
+                    cache_control: None,
                 },
                 InputMessage {
                     role: "user".to_string(),
@@ -2537,7 +2571,9 @@ mod tests {
                             text: "file contents".to_string(),
                         }],
                         is_error: false,
+                        cache_control: None,
                     }],
+                    cache_control: None,
                 },
             ],
             stream: false,

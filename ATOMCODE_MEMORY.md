@@ -244,11 +244,11 @@ cd rust && cargo test --workspace
 - ~~**`PowerShell executable not found (expected pwsh or powershell in PATH)`**——已解决，见下方 2026-07-12 记录~~
 - **`/stop` slash 命令仍是注册未实现占位**（跟 `/context`/`/files`/`/plan`/`/review`/`/tasks` 等一大票同在 `main.rs:5355-5393` 那个"not yet implemented"分支）——本次会话原计划做 B 实现 `/stop` 作为 Ctrl+C 的补充路径，但 A 修好后 Ctrl+C 跨多轮工作，`/stop` 不必做。
 - **`powershell_runs_via_stub_shell` 测试断言格式对不上**（`crates/tools/src/lib.rs:9837`）——预存测试桩债，stub shell 期望 `pwsh:Write-Output hello` 但实际输出 `hello\r\n`。是测试断言假错，不是 claw 代码 bug，下次接手可对照实际 `execute_shell_command` 调 pwsh 的参数格式修断言。
-- **`find -name -type` 等 Unix flag 转 `dir /s /b` 后 cmd.exe 不认**——hook 腄本 `convert_unix_cmd_to_windows` 把 `find` 转成 `dir /s /b` 但 find 的 `-name`/`-type` flag 没剥，cmd.exe 仍挂。治本要么 claw 走 bash.exe，要么模型改用 Windows 原生命令形态。
+- **`find -name -type` 等 Unix flag 转 `dir /s /b` 后 cmd.exe 不认**——hook 脚本 `convert_unix_cmd_to_windows` 把 `find` 转成 `dir /s /b` 但 find 的 `-name`/`-type` flag 没剥，cmd.exe 仍挂。治本要么 claw 走 bash.exe，要么模型改用 Windows 原生命令形态。
 
 ---
 
-## ★ 2026-07-12 PowerShell 工具探测 + hook 腄本 `&&` 分隔支持（本次会话）
+## ★ 2026-07-12 PowerShell 工具探测 + hook 脚本 `&&` 分隔支持（本次会话）
 
 ### A. PowerShell 工具 `executable not found` 修复
 
@@ -293,7 +293,7 @@ Windows 下额外试 `command.exe`（cmd.exe 命令申明可不带扩展名）�
 ### 本次会话两改动的共通教训
 
 - **同名函数两份实现不同**：`command_exists` 在 `runtime/src/sandbox.rs` 和 `tools/src/lib.rs` 各一份，前者正确（纯 Rust PATH 遍历），后者 buggy（调 sh.exe）。下次接手遇到跨 crate 同名函数，**先 diff 两份实现**——bug 常在抄袭走样里。
-- **hook 腄本是 Python 改完即生效**——不用重编 claw。但 hook 改坏影响所有 bash/PowerShell 工具调用，改完用 `python -c "from keyword_restorer import convert_unix_cmd_to_windows; ..."` 直接跑几条用例验证再放手。
+- **hook 脚本是 Python 改完即生效**——不用重编 claw。但 hook 改坏影响所有 bash/PowerShell 工具调用，改完用 `python -c "from keyword_restorer import convert_unix_cmd_to_windows; ..."` 直接跑几条用例验证再放手。
 
 ---
 
@@ -374,5 +374,203 @@ msg[5] Tool:       tool_result(call_01)    ← 又一条独立消息
 8. **★ 2026-07-11 新增**：`bash` 工具改完后必跑 `cargo test -p runtime --lib drive_path` 那 8 个测试（`/e/` 重写 + cmd.exe flag 不动），Windows 下现在能编能跑（预存债已解）。改 `rewrite_posix_drive_paths_for_windows` pattern 时**务必加新测试覆盖你新认的边界**——pattern 收紧放过 cmd.exe flag 那条教训不能忘
 9. **★ 2026-07-11 新增**：遇"命令被改坏"类 bug，**先埋 `eprintln!("[claw diag] ...")` 打出真传字符串**再推理，不要纯靠推论——本次 B-3 那个 `/b`→`b:` 怪变就是靠 diag 抓到的，纯推论我会一直以为是 raw_arg 没生效
 10. **★ 2026-07-12 新增**：跨 crate 同名函数（`command_exists` 在 `runtime/src/sandbox.rs` 和 `tools/src/lib.rs` 各一份）**先 diff 两份实现**——bug 常在抄袭走样里。本次 PowerShell 探测那条根因就是 `tools` 那份调 sh.exe 走样了，`sandbox` 那份纯 Rust 实现是对的
-11. **★ 2026-07-12 新增**：改 `E:/NW工程/资料库/html/.claw/hooks/keyword_restorer.py` 后**不用重编 claw**（Python 腄本即改即生效），但改坏影响所有 bash/PowerShell 工具调用——改完用 `python -c "from keyword_restorer import convert_unix_cmd_to_windows; ..."` 直接跑几条用例验证再放手
+11. **★ 2026-07-12 新增**：改 `E:/NW工程/资料库/html/.claw/hooks/keyword_restorer.py` 后**不用重编 claw**（Python 脚本即改即生效），但改坏影响所有 bash/PowerShell 工具调用——改完用 `python -c "from keyword_restorer import convert_unix_cmd_to_windows; ..."` 直接跑几条用例验证再放手
 12. **★ 2026-07-14 新增**：接入新 Anthropic-协议网关（DeepSeek/Bedrock/联通云 GLM 等）前**先过一遍官方 claude-code 的 `src/utils/messages.ts`**（`E:\内网工程\ClaudeCode2.1.88开源版\claude-code-source-code`），对齐 `normalizeMessagesForAPI`（连续 user 合并）和 `ensureToolResultPairing`（孤儿配对修复）的协议合规做法，避免在 GLM 容忍的违规路径上欠债翻车。`convert_messages` 两份（`main.rs`+`tools/src/lib.rs`）是请求体序列化出口，改其中一份务必同步另一份+各加测试。顺手修 api crate 测试桩 role 类型债后 `cargo test --workspace --lib` 终于能编能跑。
+
+---
+
+## ★ 2026-07-15 DeepSeek V4 Pro 缓存命中率提升：一期 cache_control 注入（本次会话）
+
+### 背景
+用户把后端从 GLM-5.1 切到 DeepSeek V4 Pro[1m]（`https://api.deepseek.com/anthropic`，走 Anthropic Messages 协议）后，报"云端 LLM 缓存命中率非常低，官方原版 claude-code 命中率要高一些"。对照官方源码 `E:\内网工程\ClaudeCode2.1.88开源版\claude-code-source-code` 分析。
+
+### 核因（已核实）
+**claw-code 的请求体从未包含 Anthropic 的 `cache_control` 字段**——client 从不构造该字段去测试任何后端。
+- **日志铁证**：`E:/NW工程/资料库/html/claw_glm_diag.log` 共 139 次 API 调用，`cache_control` 出现 **0 次**（grep 全日志）。日志只记 request body，不记 response usage，所以"基线命中率 ~50%"是用户口述（DeepSeek 后台所见），claw 端无法自证——那 50% 只能是 DeepSeek **网关侧自动前缀缓存**（某些网关会自动 cache 最近请求前缀，不需客户端发 cache_control），不是 Anthropic 协议级 prompt caching。
+- **源码铁证**：`api/src/types.rs` 的 `MessageRequest`/`InputMessage`/`InputContentBlock`/`ToolDefinition` 全无 `cache_control`/`CacheControl`/`ephemeral` 字段（2026-07-09 核实记录已记此事实，本次改动前再确认）。全 `rust/crates/api/src` grep `cache_control` 零命中（除本次新增）。
+- **官方对照**：`src/services/api/claude.ts:3063 addCacheBreakpoints` 在**最后一条消息**打恰好一个 message-level `cache_control: {type:"ephemeral"}` marker；`getCacheControl`（claude.ts:358）按用户类型/订阅决定 TTL 5m/1h 并 **session 级 latch**（`should1hCacheTTL` bootstrap-state latch，避免中途翻转 TTL 击穿缓存键）；`buildSystemPromptBlocks`（claude.ts:3213）给 system prompt 分块打 cache_control；tools 数组尾部也打 marker。
+
+### 方案征求过程
+先向用户提分析方案（不动代码），用户让我看了网上专家拆解 `E:/内网工程/.../1.html`（第三章 API 通信层）。专家思路与本 Agent **一致**——都定位到 claude.ts 主动打 cache 锚点、TTL session 级 latch。专家文章多提醒一条：**请求头/字段中途切换会击穿 cache 键**（3.3.3 Header 策略）。本 Agent 据此修正方案：TTL 在 `CacheConfig` 构造时一次性读 env、整个会话不变。用户同意后动手。
+
+### 一期改动（已完成，全部在 `rust/`）
+
+| 文件 | 改动 |
+|------|------|
+| `api/src/cache_control.rs` | **新建**。`CacheConfig`（session latch TTL，`from_env()` 读 `CLAW_CACHE_TTL` 默认 `"5m"`、`DISABLE_PROMPT_CACHING` 禁用）+ `add_cache_breakpoints(&mut [InputMessage], &CacheConfig)`（最后一条消息打 message-level marker）+ `add_tools_cache_marker(&mut [ToolDefinition], &CacheConfig)`（最后一个 tool def 打 marker）。14 个单元测试（env 串行化用 `static OnceLock<Mutex>` 避免并行干扰） |
+| `api/src/types.rs` | 新增 `CacheControl { type_: String, ttl: Option<String> }`（`#[serde(rename="type")]`，`ephemeral(ttl)` 构造器）；给 `InputMessage`/`InputContentBlock` 各变体（Text/Thinking/ToolUse/ToolResult）/`ToolDefinition` 加 `cache_control: Option<CacheControl>` 字段，全部 `#[serde(default, skip_serializing_if="Option::is_none")]` 向后兼容 |
+| `api/src/lib.rs` | 注册 `cache_control` 模块，导出 `CacheControl`/`CacheConfig`/`add_cache_breakpoints`/`add_tools_cache_marker` |
+| `rusty-claude-cli/src/main.rs` | `AnthropicRuntimeClient` 加 `cache_config: api::CacheConfig` 字段（`new()` 里 `from_env()` 一次 latch）；`stream()` 在序列化出口对 messages 和 tools 注入 cache marker；`convert_messages` 拆出 `convert_messages_with_cache(messages, &CacheConfig)` 变体 |
+| `tools/src/lib.rs` | `ProviderRuntimeClient` 同样加 `cache_config`；`stream()` 同步注入；`convert_messages` 同样拆 `_with_cache` 变体 |
+| `mock-anthropic-service/src/lib.rs` | 2 处 pattern 补 `..` 兼容新字段 |
+| `api/src/providers/{openai_compat,mod}.rs` | 测试桩 literal 批量补 `cache_control: None`（Python 脚本处理 33 处）+ `openai_compat.rs` 的 `translate_message` 4 处 pattern 补 `cache_control: _` |
+
+### 一期不做（留二期）
+- **System prompt 分块 cache_control**（官方 `splitSysPromptPrefix` + `buildSystemPromptBlocks`）：需 boundary marker 拆 static/global/dynamic，claw 当前 system 是单一 `Option<String>`，改类型面大。一期靠 message-level marker 已能让前缀（含 system）进 cache。
+- **Tool result `cache_reference`**（官方 claude.ts:3164-3207）：配合 `cache_edits`（microro KV 删除）的高级功能，需 `InputContentBlock::ToolResult` 加 `cache_reference` 字段 + 一套 cache_edits 块逻辑。
+- **micro_compact 与 cache 协同调参**：micro_compact 清空旧 tool result 换占位符会变前缀字节，可能击穿 cache。二期待一期实机验证后决定 micro_compact 是保留、调参还是禁用。
+- **`anthropic-beta` header**：DeepSeek 是否需要 `prompt-caching-2024-07-31` beta header 才开启 cache，未测。一期靠字段注入，如果实机 cache_read 仍为 0，二期补 header。
+
+### 验证
+- `cargo check --workspace` ✅
+- `cargo test -p api --lib` ✅ 160 passed 0 failed
+- `cargo test -p tools --lib` ✅ 94 passed 13 failed（**基线同 13 个预存 Windows 基，未新增**）
+- `cargo test -p rusty-claude-cli --bin claw` ✅ 196 passed 5 failed（基线同 5，未新增）
+- `cargo test -p runtime --lib` ✅ 537 passed 38 failed（基线 39，未新增）
+- `scripts/fmt.sh --check` ✅
+
+
+---
+
+## ★★ 2026-07-15 一期实机验证失败 + 根因纠错（本次会话，关键纠错）
+
+### 实机结果
+用户编译一期改动后真机跑，**DeepSeek �页端后台统计界面显示命中率依然是 ~50%，没变化**。
+
+### 根因（已核实 DeepSeek 官方 API 手册）
+用户保存 DeepSeek 官方 API 手册至 `docs/DeepseekAPI/{1,2,3,4}.md`。本 Agent 读后核实：
+
+**`docs/DeepseekAPI/1.md` 白纸黑字——DeepSeek 的 Anthropic-compat 接口对 `cache_control` 全部 Ignored**：
+
+| 字段位置 | Support Status |
+|---------|---------------|
+| `tools[].cache_control` | **Ignored** |
+| `content[].cache_control`（text block） | **Ignored** |
+| `content[].cache_control`（tool_use block） | **Ignored** |
+| `content[].cache_control`（tool_result block） | **Ignored** |
+| `anthropic-beta` header | **Ignored** |
+| `anthropic-version` header | **Ignored** |
+
+**一期方案的前提是错的**——假设"DeepSeek 认 cache_control 字段，注入后触发 Anthropic 协议级 prompt caching"。实际上 DeepSeek Anthropic-compat 接口**完全不认该字段**，发出去直接丢弃。一期注入的 cache_control 对 DeepSeek 后端零效果，命中率当然还是 50%。
+
+那 50% 一直是 DeepSeek **自家硬盘缓存**（docs/DeepseekAPI/2.md"上下文硬盘缓存"），机制与 Anthropic prompt caching 完全不同：
+- DeepSeek 硬盘缓存：自动开启，无需客户端发任何字段。命中条件是**前缀完整匹配"缓存前缀单元"**，部分匹配不命中。
+- Anthropic prompt caching：客户端发 cache_control 字段显式标注断点，服务端按断点缓存。
+
+一期拿 Anthropic 协议的字段去喂一个不认该字段的后端，等于白做。**这是方案设计阶段的核实债**——接入新网关前应先读该网关官方 API 手册确认字段支持，而非假设它完整实现 Anthropic 协议。
+
+### DeepSeek 硬盘缓存的真正命中规则（docs/DeepseekAPI/2.md 核实）
+关键在"缓存前缀单元"——完整匹配才命中，部分匹配不命中：
+1. 请求结束位置落盘：每次请求的"用户输入结束位置"和"模型输出结束位置"各产生一个缓存前缀单元。下一轮若完整匹配到这俩单元，命中。
+2. 公共前缀检测落盘：系统检测到多次请求间存在公共前缀时，把公共前缀单独落盘。要等第三次请求才能命中。
+3. 按固定 token 间隔落盘：长输入中按固定 token 间隔截单元。
+
+命中率低的真正原因：claw 的请求前缀每轮都在变，无法完整匹配缓存单元。变的原因：
+- micro_compact 清空旧 tool result 换占位符——前缀字节变了，完整匹配失败
+- auto-compact 触发后历史被压成摘要——整个前缀字节彻底改变，必然 miss
+- system prompt 每轮动态拼（含时间、cwd、git status 等）——前缀字节变了
+- tools schema 顺序或内容变——前缀字节变了
+
+DeepSeek 的缓存是字节级完整匹配，比 Anthropic 的断点缓存苛刻得多。
+
+### usage 字段名差异（重要，二期-E 要用对）
+DeepSeek 回执的 usage 字段（docs/DeepseekAPI/2.md:65-67）：
+- `prompt_cache_hit_tokens`：缓存命中的 tokens 数
+- `prompt_cache_miss_tokens`：缓存未命中的 tokens 数
+
+不是 Anthropic 的 cache_read_input_tokens/cache_creation_input_tokens。claw 的 Usage struct 当前只有 Anthropic 字段名，DeepSeek 回执的 prompt_cache_hit_tokens/prompt_cache_miss_tokens 会因 #[serde(default)] 落到 0——claw 端根本看不到 DeepSeek 的真实命中率，只能靠 DeepSeek 后台看。二期-E 要补对字段名。
+
+### 一期改动的处置
+一期改动保留不删，理由：
+1. cache_control 字段对 DeepSeek 是 Ignored（无害），对真 Anthropic 后端（联通云 GLM、官方 Anthropic）是正确生效的。claw 是多后端 CLI，删了一期反而在真 Anthropic 后端上退化。
+2. CacheConfig/add_cache_breakpoints/add_tools_cache_marker 模块结构对二期仍有用（二期换方向后可复用 session latch 思路）。
+3. 一期的错误是方案前提错（没核实 DeepSeek 字段支持），不是代码错。代码本身编译通过 + 测试不退化，留着不亏。
+
+---
+
+## ★★ 2026-07-15 auto-compact 频繁触发是命中率杀手（本次会话核心发现）
+
+### 日志铁证
+claw_glm_diag.log 的 est_tokens 轨迹：6265 → 14203 → 95504 → **9106** → 9126 → ... → 93795 → **7867** → 10719。每次 auto-compact 后 est_tokens 断崖跌（95504→9106, 93795→7867），历史被压成摘要，整个前缀字节序列彻底改变。DeepSeek 硬盘缓存是字节级完整匹配，compact 后前缀全变必然 miss。
+
+命中率低的真正杀手链：上下文涨 → 触 auto-compact(75%阈值) → 前缀字节全变 → DeepSeek 缓存 miss → 命中率低。
+
+### 官方 claude-code 怎么同时做到"不撑爆上下文 + 高命中率"
+读了官方 services/compact/{microCompact,timeBasedMCConfig,autoCompact,compact}.ts，它用三个 claw-code 完全没有的机制：
+
+**机制 1：Cached Microcompact（cache_edits）**——清旧 tool_result时不改本地消息内容，只在请求体加 cache_edits �块让服务端删。本地前缀字节不变 → DeepSeek 缓存仍命中。但这条对 DeepSeek 无效（cache_edits 也是 Ignored）。
+
+**机制 2：Compact Boundary**——compact 后保留前缀的"边界消息"，不让历史完全断。getMessagesAfterCompactBoundary（query.ts:365）保留 compact boundary 之前的不变前缀，只压缩 boundary 之后的。下一轮请求的前缀 = compact 之前的不变段 + 摘要 + 新对话，不变段字节稳定仍能命中。claw 的 compact.rs 是全量压摘要，没有 boundary 保留。
+
+**机制 3：auto-compact 阈值动态化 + reactive compact**——阈值不是固定 75%，而是 getAutoCompactThreshold(model) 按模型上下文窗口动态算。DeepSeek V4 Pro 1M 上下文，官方放阈值到 ~750K 才压；claw 固定 75%×131K=~98K 就压，当然频繁触发。还有 reactive compact：宁可先让请求发出去，收到 413 prompt-too-long 才压，避免 proactive compact 不必要击穿缓存。
+
+官方在 GLM 5.1（200K）不撑爆的原因：阈值动态 = contextWindow × 0.75，200K×0.75=150K 才压，GLM 200K够用。在 DeepSeek（1M）高命中率的原因：机制 1+2 让 compact 不击穿前缀，且阈值放到 750K 才压，几乎不触发。
+
+---
+
+## ★ 二期改动计划（重写，2026-07-15 纠错后）
+
+前提纠错：DeepSeek 不认 cache_control/anthropic-beta。二期方向从"注入 Anthropic cache 字段"彻底转向"稳住请求前缀字节，适配 DeepSeek 硬盘缓存的完整匹配规则"。原二期-A/B/D/F 全废，C/E 升为最高优先并重写，新增 G/H。
+
+### 二期-C1（最高优先）：auto-compact 阈值按模型上下文窗口动态化
+目标：让 claw 的 auto-compact 阈值随模型上下文窗口动态算，DeepSeek 1M → 750K 才压，几乎不触发，前缀稳定。
+
+改动：
+1. runtime/src/compact.rs 或 conversation.rs：当前固定 CLAUDE_CODE_AUTO_COMPACT_WINDOW=131000 → 改成 model_token_limit × 0.75。需要拿到模型上下文窗口大小（api/src/types.rs 的 ModelInfo 或 providers 的 token_limit）。
+2. DeepSeek V4 Pro 1M → 750K，GLM 5.1 200K → 150K，都不撑爆。
+3. 测试：阈值计算函数单测覆盖几个模型上下文窗口值。
+
+预期：命中率 50% → 70-80%（compact 几乎不触发，前缀稳定段能命中）。
+
+### 二期-C2（高优先，面大）：Compact Boundary 保留不变前缀
+目标：compact 时不全部压摘要，保留 compact_boundary 之前的不变前缀，只压缩 boundary 之后的。
+
+改动：
+1. runtime/src/compact.rs：compact 时插入 compact_boundary 标记，boundary 之前的消息原样保留。
+2. 序列化时 boundary 之前的不变段字节稳定 → DeepSeek 缓存前缀单元仍能命中。
+3. 测试：compact 后 boundary 之前消息不变 + boundary 之后被压摘要。
+
+预期：命中率 70-80% → 85%（即使触发 compact，不变前缀段仍命中）。
+
+### 二期-C3（中优先）：micro_compact 改成固定长度占位符
+目标：清空 tool_result 时换固定长度占位符，不随内容变，让被清空前的前缀单元字节稳定。
+
+改动：runtime/src/micro_compact.rs 的占位符长度固定（如 [CLEARED:512bytes] 固定 512 字节）。
+
+预期：再 +5%。
+
+### 二期-E（最高优先，辅助验证）：diag 日志补 DeepSeek cache 命中回执
+目标：让 claw 端能看到 DeepSeek 的真实命中率，不再靠人肉看 DeepSeek 后台。
+
+改动：
+1. api/src/types.rs 的 Usage struct：加 prompt_cache_hit_tokens: u32 / prompt_cache_miss_tokens: u32 字段（#[serde(default)]），对齐 DeepSeek 回执字段名（docs/DeepseekAPI/2.md:65-67）。Anthropic 后端不发这俩字段→default 0，兼容。
+2. api/src/providers/anthropic.rs 的 diag 埋点：response usage 解析后追加一行 claw_cache_diag t=... hit=... miss=... input=... output=...。
+3. 仓库根加 analyze_cache.ps1 腄本（沿用 analyze_log.ps1 模式）。
+
+预期：实机量化命中率，二期-C 改完后能对比前后。
+
+### 二期-G（核实）：确认 DeepSeek 硬盘缓存对 Anthropic 协议路径是否生效
+目标：核实 DeepSeek 的硬盘缓存是否对 /anthropic 路径（Anthropic 协议）生效，还是只对 /chat/completions（OpenAI 协议）生效。
+
+现状：docs/DeepseekAPI/2.md 的缓存说明写在 OpenAI 协议文档里。DeepSeek 的 Anthropic-compat 接口（1.md）没提缓存。可能 Anthropic 路径根本没接硬盘缓存→那 50% 是别的机制，二期-C 再怎么稳前缀也没用。
+
+动作：
+1. 先做二期-E（能看到 hit/miss 字段）。
+2. 跑两轮相同前缀的请求，看 prompt_cache_hit_tokens 是否 >0。
+3. 如果 0→Anthropic 路径没接硬盘缓存，二期要改走 OpenAI 协议调 DeepSeek（base_url=https://api.deepseek.com，走 openai_compat.rs 而非 anthropic.rs），那路径才有缓存。这是大改，需用户同意。
+4. 如果 >0→Anthropic 路径有缓存，二期-C 稳前缀方向正确，继续。
+
+### 二期-H（新增）：必要时切 OpenAI 协议调 DeepSeek
+目标：如果二期-G 确认 Anthropic 路径无缓存，改走 OpenAI 协议。
+
+改动（大）：
+1. api/src/providers/mod.rs 的 detect_provider_kind：deepseek-* 改路由到 ProviderKind::OpenAi。
+2. 验证 openai_compat.rs 的 translate_message 对 DeepSeek 思考模式（reasoning_effort/output_config.effort）的字段映射正确（docs/DeepseekAPI/3.md）。
+3. 重新跑二期-G 验证缓存生效。
+
+预期：如果 Anthropic 路径无缓存而 OpenAI 路径有，切完命中率直接到 70-80%。
+
+### 废弃的原二期项
+- 二期-A（system 分块 cache_control）：DeepSeek 不认该字段，无效
+- 二期-B（tool_result cache_reference）：同上，无效
+- 二期-D（beta header）：手册明确 ignored，无效
+- 二期-F（TTL 1h latch）：DeepSeek 不认 TTL，无效
+- 机制 1（cache_edits）：DeepSeek 不认 cache_edits，无法复刻官方 cached MC
+
+---
+
+## 下次接手清单（更新）
+
+13. ★ 2026-07-15 新增（纠错版）：二期启动前先读 docs/DeepseekAPI/{1,2,3,4}.md 确认 DeepSeek 的字段支持——一期栽在没读手册假设它认 cache_control。二期顺序：先做二期-E（补 prompt_cache_hit_tokens/prompt_cache_miss_tokens 字段看命中率）→ 二期-G（确认 Anthropic 路径有无缓存）→ 若无缓存走二期-H（切 OpenAI 协议）→ 若有缓存走二期-C（稳前缀）。api/src/cache_control.rs 一期模块保留（对真 Anthropic 后端仍有效），但二期方向转向"稳前缀字节"不再在那扩。接入新网关前必读该网关官方 API 手册，不要假设它完整实现 Anthropic 协议——这是一期教训。Python 腄本批量补字段那招（本次处理 33 处）二期补 prompt_cache_hit_tokens/prompt_cache_miss_tokens 字段时可复用。
+
+14. ★ 2026-07-15 新增（auto-compact 杀手）：claw_glm_diag.log 的 est_tokens 轨迹暴露 auto-compact 频繁触发是 DeepSeek 缓存命中率杀手——每次 compact 后前缀字节全变，DeepSeek 硬盘缓存必然 miss。二期-C1（阈值动态化）是性价比最高的一改，只动 compact 阈值计算逻辑就能让 DeepSeek 1M 窗口下几乎不 compact。官方 claude-code 的三个机制（cached MC/compact boundary/阈值动态化）中，机制 1 对 DeepSeek 无效（cache_edits 也 Ignored），机制 2+3 是二期-C2+C1 对应。compact.rs 和 micro_compact.rs 是二期改动核心。

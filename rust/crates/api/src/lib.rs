@@ -1,3 +1,4 @@
+mod cache_control;
 mod client;
 mod error;
 mod http_client;
@@ -6,6 +7,7 @@ mod providers;
 mod sse;
 mod types;
 
+pub use cache_control::{add_cache_breakpoints, add_tools_cache_marker, CacheConfig};
 pub use client::{
     oauth_token_is_expired, read_base_url, read_xai_base_url, resolve_saved_oauth_token,
     resolve_startup_auth_source, MessageStream, OAuthTokenSet, ProviderClient,
@@ -27,15 +29,16 @@ pub use providers::openai_compat::{
 };
 pub use providers::{
     detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,
-    model_family_identity_for, model_family_identity_for_kind, provider_diagnostics_for_model,
-    resolve_model_alias, ProviderDiagnostics, ProviderKind,
+    model_family_identity_for, model_family_identity_for_kind, model_token_limit,
+    provider_diagnostics_for_model, resolve_model_alias, ModelTokenLimit, ProviderDiagnostics,
+    ProviderKind,
 };
 pub use sse::{parse_frame, SseParser};
 pub use types::{
-    ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
-    InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
-    MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock, StreamEvent,
-    ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
+    CacheControl, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
+    ContentBlockStopEvent, InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent,
+    MessageRequest, MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock,
+    StreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
 
 pub use telemetry::{

@@ -12,11 +12,8 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    check_freshness, dedupe_superseded_commit_events,
-    edit_file_in_workspace_with_allowed,
-    execute_bash,
-    glob_search_in_workspace_with_allowed,
-    grep_search_in_workspace_with_allowed,
+    check_freshness, dedupe_superseded_commit_events, edit_file_in_workspace_with_allowed,
+    execute_bash, glob_search_in_workspace_with_allowed, grep_search_in_workspace_with_allowed,
     load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
@@ -26,8 +23,7 @@ use runtime::{
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
-    write_file_in_workspace_with_allowed,
-    ApiClient, ApiRequest, AssistantEvent, BashCommandInput,
+    write_file_in_workspace_with_allowed, ApiClient, ApiRequest, AssistantEvent, BashCommandInput,
     BashCommandOutput, BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage,
     ConversationRuntime, GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
     LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole,
@@ -265,6 +261,7 @@ impl GlobalToolRegistry {
                 name: spec.name.to_string(),
                 description: Some(spec.description.to_string()),
                 input_schema: spec.input_schema,
+                cache_control: None,
             });
         let runtime = self
             .runtime_tools
@@ -274,6 +271,7 @@ impl GlobalToolRegistry {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
                 input_schema: tool.input_schema.clone(),
+                cache_control: None,
             });
         let plugin = self
             .plugin_tools
@@ -286,6 +284,7 @@ impl GlobalToolRegistry {
                 name: tool.definition().name.clone(),
                 description: tool.definition().description.clone(),
                 input_schema: tool.definition().input_schema.clone(),
+                cache_control: None,
             });
         builtin.chain(runtime).chain(plugin).collect()
     }
@@ -1322,10 +1321,7 @@ fn execute_tool_with_enforcer(
 /// Extract allowed external path prefixes from the permission enforcer
 /// for a given tool name.  Returns an empty vector when no enforcer is
 /// present or no allow rules match.
-fn allowed_external_paths(
-    enforcer: Option<&PermissionEnforcer>,
-    tool_name: &str,
-) -> Vec<String> {
+fn allowed_external_paths(enforcer: Option<&PermissionEnforcer>, tool_name: &str) -> Vec<String> {
     enforcer
         .map(|e| e.allowed_path_prefixes(tool_name))
         .unwrap_or_default()
@@ -2132,16 +2128,26 @@ fn branch_divergence_output(
 fn run_read_file_with_allowed(input: ReadFileInput, allowed: &[String]) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     to_pretty_json(
-        read_file_in_workspace_with_allowed(&input.path, input.offset, input.limit, &workspace, allowed)
-            .map_err(io_to_string)?,
+        read_file_in_workspace_with_allowed(
+            &input.path,
+            input.offset,
+            input.limit,
+            &workspace,
+            allowed,
+        )
+        .map_err(io_to_string)?,
     )
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_write_file_with_allowed(input: WriteFileInput, allowed: &[String]) -> Result<String, String> {
+fn run_write_file_with_allowed(
+    input: WriteFileInput,
+    allowed: &[String],
+) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     to_pretty_json(
-        write_file_in_workspace_with_allowed(&input.path, &input.content, &workspace, allowed).map_err(io_to_string)?,
+        write_file_in_workspace_with_allowed(&input.path, &input.content, &workspace, allowed)
+            .map_err(io_to_string)?,
     )
 }
 
@@ -2162,18 +2168,31 @@ fn run_edit_file_with_allowed(input: EditFileInput, allowed: &[String]) -> Resul
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_glob_search_with_allowed(input: GlobSearchInputValue, allowed: &[String]) -> Result<String, String> {
+fn run_glob_search_with_allowed(
+    input: GlobSearchInputValue,
+    allowed: &[String],
+) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     to_pretty_json(
-        glob_search_in_workspace_with_allowed(&input.pattern, input.path.as_deref(), &workspace, allowed)
-            .map_err(io_to_string)?,
+        glob_search_in_workspace_with_allowed(
+            &input.pattern,
+            input.path.as_deref(),
+            &workspace,
+            allowed,
+        )
+        .map_err(io_to_string)?,
     )
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_grep_search_with_allowed(input: GrepSearchInput, allowed: &[String]) -> Result<String, String> {
+fn run_grep_search_with_allowed(
+    input: GrepSearchInput,
+    allowed: &[String],
+) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
-    to_pretty_json(grep_search_in_workspace_with_allowed(&input, &workspace, allowed).map_err(io_to_string)?)
+    to_pretty_json(
+        grep_search_in_workspace_with_allowed(&input, &workspace, allowed).map_err(io_to_string)?,
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -3784,17 +3803,23 @@ fn build_agent_runtime(
         .clone()
         .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
     let allowed_tools = job.allowed_tools.clone();
-    let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
+    let api_client = ProviderRuntimeClient::new(model.clone(), allowed_tools.clone())?;
     let permission_policy = agent_permission_policy();
     let tool_executor = SubagentToolExecutor::new(allowed_tools)
         .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
-    Ok(ConversationRuntime::new(
+    let mut runtime = ConversationRuntime::new(
         Session::new(),
         api_client,
         tool_executor,
         permission_policy,
         job.system_prompt.clone(),
-    ))
+    );
+    // 二期-C1：按模型上下文窗口动态算auto-compact阈值。
+    // DeepSeek V4 Pro 1M窗口→750K才压，几乎不触发，前缀稳定→DeepSeek硬盘缓存命中。
+    if let Some(limit) = api::model_token_limit(&model) {
+        runtime = runtime.with_model_context_window(limit.context_window_tokens);
+    }
+    Ok(runtime)
 }
 
 fn build_agent_system_prompt(subagent_type: &str, model: &str) -> Result<Vec<String>, String> {
@@ -4692,6 +4717,11 @@ struct ProviderRuntimeClient {
     runtime: tokio::runtime::Runtime,
     chain: Vec<ProviderEntry>,
     allowed_tools: BTreeSet<String>,
+    /// Session-latched prompt-cache config. The TTL is read from
+    /// `CLAW_CACHE_TTL` (default `"5m"`) once at construction and
+    /// never changed, so mid-session TTL flips cannot bust the
+    /// server-side prompt cache key.
+    cache_config: api::CacheConfig,
 }
 
 impl ProviderRuntimeClient {
@@ -4724,6 +4754,7 @@ impl ProviderRuntimeClient {
             runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
             chain,
             allowed_tools,
+            cache_config: api::CacheConfig::from_env(),
         })
     }
 }
@@ -4748,15 +4779,22 @@ fn load_provider_fallback_config() -> ProviderFallbackConfig {
 
 impl ApiClient for ProviderRuntimeClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let tools = tool_specs_for_allowed_tools(Some(&self.allowed_tools))
+        let mut tools = tool_specs_for_allowed_tools(Some(&self.allowed_tools))
             .into_iter()
             .map(|spec| ToolDefinition {
                 name: spec.name.to_string(),
                 description: Some(spec.description.to_string()),
                 input_schema: spec.input_schema,
+                cache_control: None,
             })
             .collect::<Vec<_>>();
-        let messages = convert_messages(&request.messages);
+        // Place a `cache_control` marker on the last tool definition so the
+        // whole tool-schema prefix gets cached (mirrors upstream
+        // `addCacheBreakpoints` tail-of-tools marker).
+        api::add_tools_cache_marker(&mut tools, &self.cache_config);
+        // Build messages with session-latched prompt-cache marker injection.
+        let mut messages = convert_messages_with_cache(&request.messages, &self.cache_config);
+        api::add_cache_breakpoints(&mut messages, &self.cache_config);
         let system =
             (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"));
         let tool_choice = (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto);
@@ -4947,6 +4985,13 @@ fn tool_specs_for_allowed_tools(allowed_tools: Option<&BTreeSet<String>>) -> Vec
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
+    convert_messages_with_cache(messages, &api::CacheConfig::default())
+}
+
+fn convert_messages_with_cache(
+    messages: &[ConversationMessage],
+    cache_config: &api::CacheConfig,
+) -> Vec<InputMessage> {
     // Anthropic Messages protocol requires every `tool_use` block in an
     // assistant message to have a matching `tool_result` block in the *single*
     // user message that immediately follows it. The runtime session stores each
@@ -4966,7 +5011,10 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             MessageRole::Assistant => "assistant",
         };
         let mut content = convert_content_blocks(&message.blocks);
-        if matches!(message.role, MessageRole::System | MessageRole::User | MessageRole::Tool) {
+        if matches!(
+            message.role,
+            MessageRole::System | MessageRole::User | MessageRole::Tool
+        ) {
             while let Some(next) = iter.peek() {
                 if matches!(next.role, MessageRole::Assistant) {
                     break;
@@ -4979,9 +5027,16 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             out.push(InputMessage {
                 role: role.to_string(),
                 content,
+                cache_control: None,
             });
         }
     }
+    // Inject exactly one message-level `cache_control: ephemeral` marker on
+    // the last message (mirrors upstream claude-code's
+    // `addCacheBreakpoints`). The TTL is latched per-session inside
+    // `CacheConfig` to avoid mid-session flips that would bust the
+    // server-side prompt cache key.
+    api::add_cache_breakpoints(&mut out, cache_config);
     out
 }
 
@@ -4989,19 +5044,24 @@ fn convert_content_blocks(blocks: &[ContentBlock]) -> Vec<InputContentBlock> {
     blocks
         .iter()
         .map(|block| match block {
-            ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+            ContentBlock::Text { text } => InputContentBlock::Text {
+                text: text.clone(),
+                cache_control: None,
+            },
             ContentBlock::Thinking {
                 thinking,
                 signature,
             } => InputContentBlock::Thinking {
                 thinking: thinking.clone(),
                 signature: signature.clone(),
+                cache_control: None,
             },
             ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
                 id: id.clone(),
                 name: name.clone(),
                 input: serde_json::from_str(input)
                     .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
+                cache_control: None,
             },
             ContentBlock::ToolResult {
                 tool_use_id,
@@ -5014,11 +5074,10 @@ fn convert_content_blocks(blocks: &[ContentBlock]) -> Vec<InputContentBlock> {
                     text: output.clone(),
                 }],
                 is_error: *is_error,
+                cache_control: None,
             },
         })
-        .filter(
-            |block| !matches!(block, InputContentBlock::Text { text } if text.is_empty()),
-        )
+        .filter(|block| !matches!(block, InputContentBlock::Text { text, .. } if text.is_empty()))
         .collect()
 }
 
@@ -6189,8 +6248,7 @@ fn command_exists(command: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|paths| {
         std::env::split_paths(&paths).any(|dir| {
             // On Windows the executable may be `command` or `command.exe`.
-            dir.join(command).exists()
-                || dir.join(format!("{command}.exe")).exists()
+            dir.join(command).exists() || dir.join(format!("{command}.exe")).exists()
         })
     })
 }
@@ -6615,7 +6673,7 @@ mod tests {
             .content
             .iter()
             .filter_map(|b| match b {
-                InputContentBlock::Text { text } => Some(text.as_str()),
+                InputContentBlock::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect();

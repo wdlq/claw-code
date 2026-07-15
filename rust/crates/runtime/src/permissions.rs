@@ -335,11 +335,7 @@ impl PermissionPolicy {
     ///
     /// Returns `Some(Allow)` if an allow rule matches (and no deny rule does),
     /// `Some(Deny)` if a deny rule matches, or `None` when no rule applies.
-    pub fn check_rules_only(
-        &self,
-        tool_name: &str,
-        input: &str,
-    ) -> Option<PermissionOutcome> {
+    pub fn check_rules_only(&self, tool_name: &str, input: &str) -> Option<PermissionOutcome> {
         if let Some(rule) = Self::find_matching_rule(&self.deny_rules, tool_name, input) {
             return Some(PermissionOutcome::Deny {
                 reason: format!(
@@ -426,15 +422,19 @@ impl PermissionRule {
         match &self.matcher {
             PermissionRuleMatcher::Any => true,
             PermissionRuleMatcher::Exact(expected) => extract_permission_subject(input)
-                .is_some_and(|candidate| normalize_path_separators(&candidate) == *normalize_path_separators(expected)),
-            PermissionRuleMatcher::Prefix(prefix) => extract_permission_subject(input)
                 .is_some_and(|candidate| {
+                    normalize_path_separators(&candidate) == *normalize_path_separators(expected)
+                }),
+            PermissionRuleMatcher::Prefix(prefix) => {
+                extract_permission_subject(input).is_some_and(|candidate| {
                     let normalized_candidate = normalize_path_separators(&candidate);
                     let normalized_prefix = normalize_path_separators(prefix);
                     // Handle trailing slash: "path/" should match both "path/file" and "path"
                     normalized_candidate.starts_with(&normalized_prefix)
-                        || normalized_candidate.starts_with(&format!("{}/", normalized_prefix.trim_end_matches('/')))
-                }),
+                        || normalized_candidate
+                            .starts_with(&format!("{}/", normalized_prefix.trim_end_matches('/')))
+                })
+            }
         }
     }
 }

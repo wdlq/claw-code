@@ -620,8 +620,8 @@ mod tests {
             vec![],
             vec![],
         );
-        let policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite)
-            .with_permission_rules(&config);
+        let policy =
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite).with_permission_rules(&config);
         let enforcer = PermissionEnforcer::new(policy);
 
         // when: read_file on the allowed external path requires DangerFullAccess
@@ -644,8 +644,8 @@ mod tests {
             vec!["read_file(/other/project/secret/:*)".to_owned()],
             vec![],
         );
-        let policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite)
-            .with_permission_rules(&config);
+        let policy =
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite).with_permission_rules(&config);
         let enforcer = PermissionEnforcer::new(policy);
 
         // when: reading a file under the denied sub-path

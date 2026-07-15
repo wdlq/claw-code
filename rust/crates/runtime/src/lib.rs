@@ -10,7 +10,6 @@ pub mod bash_validation;
 mod bootstrap;
 pub mod branch_lock;
 mod compact;
-mod micro_compact;
 mod config;
 pub mod config_validate;
 mod conversation;
@@ -28,6 +27,7 @@ pub mod mcp_lifecycle_hardened;
 pub mod mcp_server;
 mod mcp_stdio;
 pub mod mcp_tool_bridge;
+mod micro_compact;
 mod oauth;
 pub mod permission_enforcer;
 mod permissions;
@@ -82,13 +82,13 @@ pub use conversation::{
     ToolExecutor, TurnSummary,
 };
 pub use file_ops::{
-    edit_file, edit_file_in_workspace, edit_file_in_workspace_with_allowed,
-    glob_search, glob_search_in_workspace, glob_search_in_workspace_with_allowed,
-    grep_search, grep_search_in_workspace, grep_search_in_workspace_with_allowed,
-    read_file, read_file_in_workspace, read_file_in_workspace_with_allowed,
-    write_file, write_file_in_workspace, write_file_in_workspace_with_allowed,
-    EditFileOutput, GlobSearchOutput, GrepSearchInput, GrepSearchOutput,
-    ReadFileOutput, StructuredPatchHunk, TextFilePayload, WriteFileOutput,
+    edit_file, edit_file_in_workspace, edit_file_in_workspace_with_allowed, glob_search,
+    glob_search_in_workspace, glob_search_in_workspace_with_allowed, grep_search,
+    grep_search_in_workspace, grep_search_in_workspace_with_allowed, read_file,
+    read_file_in_workspace, read_file_in_workspace_with_allowed, write_file,
+    write_file_in_workspace, write_file_in_workspace_with_allowed, EditFileOutput,
+    GlobSearchOutput, GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk,
+    TextFilePayload, WriteFileOutput,
 };
 pub use git_context::{GitCommitEntry, GitContext};
 pub use hooks::{

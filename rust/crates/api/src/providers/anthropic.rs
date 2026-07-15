@@ -441,7 +441,12 @@ impl AnthropicClient {
             match self.send_raw_request(request).await {
                 Ok(response) => match expect_success(response).await {
                     Ok(response) => {
-                        write_glm_diag(attempts, response.status().as_u16(), None, &diag_request_body);
+                        write_glm_diag(
+                            attempts,
+                            response.status().as_u16(),
+                            None,
+                            &diag_request_body,
+                        );
                         if let Some(session_tracer) = &self.session_tracer {
                             session_tracer.record_http_request_succeeded(
                                 attempts,
@@ -455,13 +460,23 @@ impl AnthropicClient {
                         return Ok(response);
                     }
                     Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => {
-                        write_glm_diag(attempts, error_status(&error), Some(&error), &diag_request_body);
+                        write_glm_diag(
+                            attempts,
+                            error_status(&error),
+                            Some(&error),
+                            &diag_request_body,
+                        );
                         self.record_request_failure(attempts, &error);
                         last_error = Some(error);
                     }
                     Err(error) => {
                         let error = enrich_bearer_auth_error(error, &self.auth);
-                        write_glm_diag(attempts, error_status(&error), Some(&error), &diag_request_body);
+                        write_glm_diag(
+                            attempts,
+                            error_status(&error),
+                            Some(&error),
+                            &diag_request_body,
+                        );
                         self.record_request_failure(attempts, &error);
                         return Err(error);
                     }
@@ -882,6 +897,13 @@ impl MessageStream {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
                 }
+                // DeepSeek硬盘缓存命中率回执（docs/DeepseekAPI/2.md:65-67）。
+                // 二期-E：无条件写usage全量，不靠hit>0||miss>0条件——
+                // DeepSeek SSE delta 里可能根本没这俩字段名（只在非流响应回），或字段名不同。
+                // 无条件写才能让 claw 端看到真实 usage，人肉对比 DeepSeek 后台确认字段名。
+                if let Some(usage) = self.latest_usage.as_ref() {
+                    log_cache_diag(usage);
+                }
                 self.usage_recorded = true;
             }
             _ => {}
@@ -1038,6 +1060,34 @@ fn log_request_size(body_bytes: usize, base_url: &str) {
     let est_tokens = body_bytes / 4;
     let record = format!(
         "\n==== claw_request_size t={timestamp} bytes={body_bytes} est_tokens={est_tokens} url={base_url} ====\n"
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("claw_glm_diag.log")
+    {
+        let _ = f.write_all(record.as_bytes());
+    }
+}
+
+/// Append a DeepSeek硬盘缓存命中率回执到 `claw_glm_diag.log`（docs/DeepseekAPI/2.md:65-67）。
+/// 字段名是DeepSeek回执的`prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`，
+/// 不是Anthropic的`cache_read_input_tokens`/`cache_creation_input_tokens`。
+/// 只在DeepSeek（或兼容该字段的后端）回执非零时写，Anthropic后端default 0不写。
+fn log_cache_diag(usage: &Usage) {
+    use std::io::Write;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let record = format!(
+        "\n==== claw_cache_diag t={timestamp} hit={hit} miss={miss} input={input} output={output} cache_read={cache_read} cache_creation={cache_creation} ====\n",
+        hit = usage.prompt_cache_hit_tokens,
+        miss = usage.prompt_cache_miss_tokens,
+        input = usage.input_tokens,
+        output = usage.output_tokens,
+        cache_read = usage.cache_read_input_tokens,
+        cache_creation = usage.cache_creation_input_tokens,
     );
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)

@@ -1211,7 +1211,9 @@ mod tests {
 
         assert_eq!(
             result.updated_tool_output(),
-            Some(r#"{"stdout":"replaced content","stderr":"","interrupted":false,"isImage":false}"#)
+            Some(
+                r#"{"stdout":"replaced content","stderr":"","interrupted":false,"isImage":false}"#
+            )
         );
     }
 

@@ -4,6 +4,31 @@ use runtime::{pricing_for_model, TokenUsage, UsageCostEstimate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Anthropic prompt-cache marker. Serialized as
+/// `{"type":"ephemeral"[,"ttl":"5m"|"1h"]}`. Placing one on a content block,
+/// a message, a tool definition, or a system block tells the server to cache
+/// everything up to that point. The TTL is latched per-session in
+/// `cache_control::CacheConfig` to avoid mid-session flips that would bust
+/// the server-side cache key (see upstream claude-code
+/// `getCacheControl` + `addCacheBreakpoints`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheControl {
+    #[serde(rename = "type")]
+    pub type_: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
+}
+
+impl CacheControl {
+    #[must_use]
+    pub fn ephemeral(ttl: Option<&str>) -> Self {
+        Self {
+            type_: "ephemeral".to_string(),
+            ttl: ttl.map(str::to_string),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct MessageRequest {
     pub model: String,
@@ -55,6 +80,11 @@ impl MessageRequest {
 pub struct InputMessage {
     pub role: String,
     pub content: Vec<InputContentBlock>,
+    /// Message-level prompt-cache marker. Mirrors upstream claude-code
+    /// `addCacheBreakpoints` placing one message-level `cache_control` on the
+    /// last message of each request. `None` everywhere except that one marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 impl InputMessage {
@@ -62,7 +92,11 @@ impl InputMessage {
     pub fn user_text(text: impl Into<String>) -> Self {
         Self {
             role: "user".to_string(),
-            content: vec![InputContentBlock::Text { text: text.into() }],
+            content: vec![InputContentBlock::Text {
+                text: text.into(),
+                cache_control: None,
+            }],
+            cache_control: None,
         }
     }
 
@@ -80,7 +114,9 @@ impl InputMessage {
                     text: content.into(),
                 }],
                 is_error,
+                cache_control: None,
             }],
+            cache_control: None,
         }
     }
 }
@@ -90,22 +126,30 @@ impl InputMessage {
 pub enum InputContentBlock {
     Text {
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     Thinking {
         thinking: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     ToolUse {
         id: String,
         name: String,
         input: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     ToolResult {
         tool_use_id: String,
         content: Vec<ToolResultContentBlock>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
 }
 
@@ -122,6 +166,11 @@ pub struct ToolDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub input_schema: Value,
+    /// Cache marker on the last tool definition so the whole tool array prefix
+    /// gets cached. Mirrors upstream claude-code placing `cache_control` on
+    /// the tail of `tools`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,6 +239,12 @@ pub struct Usage {
     pub cache_read_input_tokens: u32,
     #[serde(default)]
     pub output_tokens: u32,
+    // DeepSeek硬盘缓存回执字段（docs/DeepseekAPI/2.md:65-67）。
+    // Anthropic后端不发这俩字段→default 0，兼容。
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: u32,
+    #[serde(default)]
+    pub prompt_cache_miss_tokens: u32,
 }
 
 impl Usage {
@@ -295,6 +350,7 @@ mod tests {
             cache_creation_input_tokens: 2,
             cache_read_input_tokens: 3,
             output_tokens: 4,
+            ..Usage::default()
         };
 
         assert_eq!(usage.total_tokens(), 19);
@@ -316,6 +372,7 @@ mod tests {
                 cache_creation_input_tokens: 100_000,
                 cache_read_input_tokens: 200_000,
                 output_tokens: 500_000,
+                ..Usage::default()
             },
             request_id: None,
         };
@@ -331,6 +388,7 @@ mod tests {
         let block = InputContentBlock::Thinking {
             thinking: "pondering".to_string(),
             signature: Some("sig_123".to_string()),
+            cache_control: None,
         };
 
         // when

@@ -606,7 +606,10 @@ pub fn max_tokens_for_model_with_override(model: &str, plugin_override: Option<u
 #[must_use]
 pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
     let canonical = resolve_model_alias(model);
-    let base_model = canonical.rsplit('/').next().unwrap_or(canonical.as_str());
+    // 剖路径前缀和方括号后缀（如 deepseek-v4-pro[1m] → deepseek-v4-pro）。
+    // [1m] 是用户配的上下文窗口标记，不参与模型身份匹配。
+    let after_slash = canonical.rsplit('/').next().unwrap_or(canonical.as_str());
+    let base_model = after_slash.split('[').next().unwrap_or(after_slash);
     match base_model {
         "claude-opus-4-6" => Some(ModelTokenLimit {
             max_output_tokens: 32_000,
@@ -645,6 +648,16 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
         "glm-5" | "glm-5.1" => Some(ModelTokenLimit {
             max_output_tokens: 128_000,
             context_window_tokens: 200_000,
+        }),
+        // DeepSeek V4 family — V4 Pro 1M context, V4 Flash 128K context
+        // Source: docs/DeepseekAPI/1.md (Anthropic-compat映射 claude-opus→v4-pro, claude-haiku/sonnet→v4-flash)
+        "deepseek-v4-pro" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 1_000_000,
+        }),
+        "deepseek-v4-flash" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 128_000,
         }),
         _ => None,
     }
@@ -969,11 +982,13 @@ mod tests {
                     name: "web_search".to_string(),
                     description: Some("Search the web".to_string()),
                     input_schema: json!({"type": "object"}),
+                    cache_control: None,
                 },
                 ToolDefinition {
                     name: "web_fetch".to_string(),
                     description: Some("Fetch a URL".to_string()),
                     input_schema: json!({"type": "object"}),
+                    cache_control: None,
                 },
             ]),
             stream: true,
@@ -1213,7 +1228,9 @@ mod tests {
                 role: "user".to_string(),
                 content: vec![InputContentBlock::Text {
                     text: "x".repeat(600_000),
+                    cache_control: None,
                 }],
+                cache_control: None,
             }],
             system: Some("Keep the answer short.".to_string()),
             tools: Some(vec![ToolDefinition {
@@ -1223,6 +1240,7 @@ mod tests {
                     "type": "object",
                     "properties": { "city": { "type": "string" } },
                 }),
+                cache_control: None,
             }]),
             tool_choice: Some(ToolChoice::Auto),
             stream: true,
@@ -1259,7 +1277,9 @@ mod tests {
                 role: "user".to_string(),
                 content: vec![InputContentBlock::Text {
                     text: "x".repeat(3_900_000),
+                    cache_control: None,
                 }],
+                cache_control: None,
             }],
             system: Some("Keep the answer short.".to_string()),
             tools: None,
@@ -1295,7 +1315,9 @@ mod tests {
                 role: "user".to_string(),
                 content: vec![InputContentBlock::Text {
                     text: "x".repeat(600_000),
+                    cache_control: None,
                 }],
+                cache_control: None,
             }],
             system: None,
             tools: None,
@@ -1348,7 +1370,9 @@ mod tests {
                 role: "user".to_string(),
                 content: vec![InputContentBlock::Text {
                     text: "x".repeat(1_000_000), // Large input to exceed context window
+                    cache_control: None,
                 }],
+                cache_control: None,
             }],
             system: Some("Keep the answer short.".to_string()),
             tools: None,

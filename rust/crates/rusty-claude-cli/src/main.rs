@@ -8648,14 +8648,15 @@ fn build_runtime_with_plugin_state(
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
-    let tool_registry =
-        tool_registry.with_enforcer(runtime::permission_enforcer::PermissionEnforcer::new(policy.clone()));
+    let tool_registry = tool_registry.with_enforcer(
+        runtime::permission_enforcer::PermissionEnforcer::new(policy.clone()),
+    );
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         {
             let mut client = AnthropicRuntimeClient::new(
                 session_id,
-                model,
+                model.clone(),
                 enable_tools,
                 emit_output,
                 allowed_tools.clone(),
@@ -8675,6 +8676,11 @@ fn build_runtime_with_plugin_state(
         system_prompt,
         &feature_config,
     );
+    // 二期-C1：按模型上下文窗口动态算auto-compact阈值。
+    // DeepSeek V4 Pro 1M窗口→750K才压，几乎不触发，前缀稳定→DeepSeek硬盘缓存命中。
+    if let Some(limit) = api::model_token_limit(&model) {
+        runtime = runtime.with_model_context_window(limit.context_window_tokens);
+    }
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
@@ -8782,6 +8788,13 @@ struct AnthropicRuntimeClient {
     reasoning_effort: Option<String>,
     abort_signal: Option<runtime::HookAbortSignal>,
     plugin_max_output_tokens: Option<u32>,
+    /// Session-latched prompt-cache config. Constructed once in
+    /// `AnthropicRuntimeClient::new`; the TTL is read from
+    /// `CLAW_CACHE_TTL` (default `"5m"`) and never changed for the
+    /// lifetime of this client, so mid-session TTL flips cannot bust
+    /// the server-side prompt cache key (mirrors upstream
+    /// claude-code's `should1hCacheTTL` bootstrap-state latch).
+    cache_config: api::CacheConfig,
 }
 
 impl AnthropicRuntimeClient {
@@ -8849,6 +8862,7 @@ impl AnthropicRuntimeClient {
             reasoning_effort: None,
             abort_signal: None,
             plugin_max_output_tokens: None,
+            cache_config: api::CacheConfig::from_env(),
         })
     }
 
@@ -8877,14 +8891,30 @@ impl ApiClient for AnthropicRuntimeClient {
             progress_reporter.mark_model_phase();
         }
         let is_post_tool = request_ends_with_tool_result(&request);
+        // Build messages with session-latched prompt-cache marker injection.
+        // `convert_messages_with_cache` places exactly one message-level
+        // `cache_control: ephemeral` on the last message (mirrors upstream
+        // `addCacheBreakpoints`).
+        let mut messages = convert_messages_with_cache(&request.messages, &self.cache_config);
+        api::add_cache_breakpoints(&mut messages, &self.cache_config);
+        let mut tools = self
+            .enable_tools
+            .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref()))
+            .unwrap_or_default();
+        // Place a `cache_control` marker on the last tool definition so the
+        // whole tool-schema prefix gets cached (mirrors upstream
+        // `addCacheBreakpoints` tail-of-tools marker).
+        api::add_tools_cache_marker(&mut tools, &self.cache_config);
+        let tools = (!tools.is_empty()).then_some(tools);
         let message_request = MessageRequest {
             model: self.model.clone(),
-            max_tokens: max_tokens_for_model_with_override(&self.model, self.plugin_max_output_tokens),
-            messages: convert_messages(&request.messages),
+            max_tokens: max_tokens_for_model_with_override(
+                &self.model,
+                self.plugin_max_output_tokens,
+            ),
+            messages,
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
-            tools: self
-                .enable_tools
-                .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
+            tools,
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
             reasoning_effort: self.reasoning_effort.clone(),
@@ -9000,7 +9030,10 @@ impl AnthropicRuntimeClient {
                 } else {
                     match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
                         Ok(inner) => inner.map_err(|error| {
-                            RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                            RuntimeError::new(format_user_visible_api_error(
+                                &self.session_id,
+                                &error,
+                            ))
                         })?,
                         Err(_elapsed) => {
                             return Err(RuntimeError::new(
@@ -10213,6 +10246,13 @@ fn permission_policy(
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
+    convert_messages_with_cache(messages, &api::CacheConfig::default())
+}
+
+fn convert_messages_with_cache(
+    messages: &[ConversationMessage],
+    cache_config: &api::CacheConfig,
+) -> Vec<InputMessage> {
     // Anthropic Messages protocol requires that every `tool_use` block in an
     // assistant message has a matching `tool_result` block in the *single* user
     // message that immediately follows it. When a single assistant message
@@ -10239,7 +10279,10 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             MessageRole::Assistant => "assistant",
         };
         let mut content = convert_content_blocks(&message.blocks);
-        if matches!(message.role, MessageRole::System | MessageRole::User | MessageRole::Tool) {
+        if matches!(
+            message.role,
+            MessageRole::System | MessageRole::User | MessageRole::Tool
+        ) {
             // Coalesce any immediately-following non-Assistant (user-wire)
             // messages into this same user message — same rule as upstream
             // claude-code's normalizeMessagesForAPI merge of consecutive user
@@ -10257,9 +10300,16 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             out.push(InputMessage {
                 role: role.to_string(),
                 content,
+                cache_control: None,
             });
         }
     }
+    // Inject exactly one message-level `cache_control: ephemeral` marker on
+    // the last message, mirroring upstream claude-code's
+    // `addCacheBreakpoints`. The TTL is latched per-session inside
+    // `CacheConfig` to avoid mid-session flips that would bust the
+    // server-side prompt cache key.
+    api::add_cache_breakpoints(&mut out, cache_config);
     out
 }
 
@@ -10267,15 +10317,17 @@ fn convert_content_blocks(blocks: &[ContentBlock]) -> Vec<InputContentBlock> {
     blocks
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Text { text } => {
-                Some(InputContentBlock::Text { text: text.clone() })
-            }
+            ContentBlock::Text { text } => Some(InputContentBlock::Text {
+                text: text.clone(),
+                cache_control: None,
+            }),
             ContentBlock::Thinking { .. } => None,
             ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
                 id: id.clone(),
                 name: name.clone(),
                 input: serde_json::from_str(input)
                     .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
+                cache_control: None,
             }),
             ContentBlock::ToolResult {
                 tool_use_id,
@@ -10288,6 +10340,7 @@ fn convert_content_blocks(blocks: &[ContentBlock]) -> Vec<InputContentBlock> {
                     text: output.clone(),
                 }],
                 is_error: *is_error,
+                cache_control: None,
             }),
         })
         .collect()
@@ -14313,7 +14366,11 @@ UU conflicted.rs",
         let converted = super::convert_messages(&messages);
         // user, assistant (with both tool_use), then ONE coalesced user message
         // holding both tool_result blocks — not two separate user messages.
-        assert_eq!(converted.len(), 3, "expected both tool_results coalesced into one user message");
+        assert_eq!(
+            converted.len(),
+            3,
+            "expected both tool_results coalesced into one user message"
+        );
         assert_eq!(converted[0].role, "user");
         assert_eq!(converted[1].role, "assistant");
         assert_eq!(converted[2].role, "user");
@@ -14398,7 +14455,7 @@ UU conflicted.rs",
             .content
             .iter()
             .filter_map(|b| match b {
-                InputContentBlock::Text { text } => Some(text.as_str()),
+                InputContentBlock::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect();

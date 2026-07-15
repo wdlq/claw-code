@@ -208,6 +208,30 @@ where
         self
     }
 
+    /// 按**模型上下文窗口**动态算auto-compact阈值（二期-C1）。
+    ///
+    /// DeepSeek V4 Pro 1M窗口→750K才压，几乎不触发，前缀稳定→DeepSeek硬盘缓存命中。
+    /// GLM 5.1 200K窗口→150K才压，不撑爆200K上下文。
+    ///
+    /// **优先级**：env显式阈值（`CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS` /
+    /// `CLAUDE_CODE_AUTO_COMPACT_PCT_OVERRIDE`+`CLAUDE_CODE_AUTO_COMPACT_WINDOW`）
+    /// 优先于本builder。只有env没显式设阈值时，才用`context_window × pct`动态算。
+    /// 默认pct=75（对齐官方claude-code的0.75阈值）。
+    #[must_use]
+    pub fn with_model_context_window(mut self, context_window_tokens: u32) -> Self {
+        // env没显式设阈值时才动态算，避免覆盖用户显式配置。
+        if std::env::var(AUTO_COMPACTION_THRESHOLD_ENV_VAR).is_err()
+            && std::env::var(AUTO_COMPACT_PCT_OVERRIDE_ENV_VAR).is_err()
+        {
+            let pct = 75u32; // 对齐官方claude-code的0.75阈值
+            let dynamic_threshold = (context_window_tokens as u64 * pct as u64 / 100) as u32;
+            // 下限保护：太小阈值会频繁compact反伤缓存，至少给到默认阈值
+            self.auto_compaction_input_tokens_threshold =
+                dynamic_threshold.max(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD);
+        }
+        self
+    }
+
     #[must_use]
     pub fn with_hook_abort_signal(mut self, hook_abort_signal: HookAbortSignal) -> Self {
         self.hook_abort_signal = hook_abort_signal;
@@ -369,7 +393,10 @@ where
             // request bodies — tool results (file reads, grep output, …)
             // are replaced with a placeholder once they're old enough that
             // the model no longer needs the verbatim content.
-            let mc_result = crate::micro_compact::microcompact_session(&mut self.session);
+            let mc_result = crate::micro_compact::microcompact_session(
+                &mut self.session,
+                self.auto_compaction_input_tokens_threshold,
+            );
             if mc_result.cleared_count > 0 {
                 eprintln!(
                     "[micro-compact: cleared {} old tool result(s), freed {} chars]",
@@ -605,14 +632,22 @@ where
         let input_tokens = self.usage_tracker.cumulative_usage().input_tokens;
         let estimated_tokens = if input_tokens == 0 {
             // Rough estimate: ~4 chars per token across all message content
-            let char_count: usize = self.session.messages.iter().map(|m| {
-                m.blocks.iter().map(|b| match b {
-                    ContentBlock::Text { text } => text.len(),
-                    ContentBlock::ToolUse { input, .. } => input.to_string().len(),
-                    ContentBlock::ToolResult { output, .. } => output.len(),
-                    _ => 0,
-                }).sum::<usize>()
-            }).sum::<usize>();
+            let char_count: usize = self
+                .session
+                .messages
+                .iter()
+                .map(|m| {
+                    m.blocks
+                        .iter()
+                        .map(|b| match b {
+                            ContentBlock::Text { text } => text.len(),
+                            ContentBlock::ToolUse { input, .. } => input.to_string().len(),
+                            ContentBlock::ToolResult { output, .. } => output.len(),
+                            _ => 0,
+                        })
+                        .sum::<usize>()
+                })
+                .sum::<usize>();
             (char_count / 4) as u32
         } else {
             input_tokens
@@ -644,14 +679,22 @@ where
     /// be compacted BEFORE the next API call.
     fn session_needs_pre_flight_compact(&self) -> bool {
         // Estimate token count from message content (~4 chars/token).
-        let char_count: usize = self.session.messages.iter().map(|m| {
-            m.blocks.iter().map(|b| match b {
-                ContentBlock::Text { text } => text.len(),
-                ContentBlock::ToolUse { input, .. } => input.to_string().len(),
-                ContentBlock::ToolResult { output, .. } => output.len(),
-                _ => 0,
-            }).sum::<usize>()
-        }).sum::<usize>();
+        let char_count: usize = self
+            .session
+            .messages
+            .iter()
+            .map(|m| {
+                m.blocks
+                    .iter()
+                    .map(|b| match b {
+                        ContentBlock::Text { text } => text.len(),
+                        ContentBlock::ToolUse { input, .. } => input.to_string().len(),
+                        ContentBlock::ToolResult { output, .. } => output.len(),
+                        _ => 0,
+                    })
+                    .sum::<usize>()
+            })
+            .sum::<usize>();
         let estimated_tokens = (char_count / 4) as u32;
         estimated_tokens >= self.auto_compaction_input_tokens_threshold
     }
@@ -928,9 +971,9 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_assistant_message, ApiClient, ApiRequest,
-        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        build_assistant_message, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
+        ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};

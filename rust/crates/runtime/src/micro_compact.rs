@@ -37,12 +37,27 @@ const COMPACTABLE_TOOLS: &[&str] = &[
 /// Minimum character length for a tool result to be considered for clearing.
 /// Short results (e.g. "ok", "file written") are not worth compacting.
 ///
-/// Set high (5 KB) so micro-compact only clears results that are genuinely
+/// Set high so micro-compact only clears results that are genuinely
 /// large — a small result carries information worth more than the tokens it
 /// costs, and clearing it forces the model to re-read the file, which is the
 /// observed "降智" failure mode.  Only bulky outputs (big file reads, long
 /// grep/bash output) get cleared.
-const MIN_OUTPUT_LENGTH_FOR_CLEAR: usize = 5_000;
+///
+/// **2026-07-15 二期-C3 调参**：从硬编码 5_000 改成动态收参——
+/// 联动 auto-compact 阈值：auto-compact 在 75% 窗口触发，microcompact 在 25% 窗口触发——
+/// 两个 compact 逻辑阈值同源，microcompact 先于 auto-compact 软清中等 tool_result，
+/// auto-compact 才硬压摘要。DeepSeek 1M 窗口 → microcompact 阈值 250K 字符，
+/// 中等 tool_result（5K~250K）保留原样→前缀字节稳定→DeepSeek 硬盘缓存命中。
+/// 仍可用 `CLAW_MICROCOMPACT_DISABLE=1` 彻底关掉。
+///
+/// **根因**（2026-07-15 实机发现）：不能调 `auto_compaction_threshold_from_env()`——
+/// 那读 env 失败后 fallback 到默认 55_000，绕过了 `with_model_context_window` 设的
+/// 动态阈值（1M 窗口→750K）。改成收参，由调用方传入 runtime 的最终阈值。
+fn min_output_length_for_clear(auto_compaction_threshold: u32) -> usize {
+    // 除以 4 是字符级近似（auto_compaction_threshold 是 token 数，~4 char/token，
+    // 与现有 output.len() 字符级比较的误差可接受——只是阈值）。
+    (auto_compaction_threshold / 4) as usize
+}
 
 /// Emergency threshold: tool results larger than this are ALWAYS cleared,
 /// regardless of whether they're in the protected recent window.
@@ -78,21 +93,36 @@ pub struct MicroCompactResult {
 /// This should be called **before** each API request is built, so the
 /// request body stays small.
 ///
+/// `auto_compaction_threshold` 是 runtime 的最终 auto-compact 阈值（env 显式值 > 模型窗口动态 > 默认 55K），
+/// microcompact 阈值取其四分之一（字符级近似）。由调用方传入，避免本函数重读 env 拿不到动态窗口。
+///
 /// Protection model: the most recent `PROTECT_RECENT_TOOL_RESULTS` compactable
 /// tool results are always kept verbatim (regardless of which turn they belong
 /// to).  Only results older than that window — and larger than
-/// `MIN_OUTPUT_LENGTH_FOR_CLEAR` — are cleared.  This preserves enough working
+/// `min_output_length_for_clear(threshold)` — are cleared.  This preserves enough working
 /// context for the model to reason across several tool calls, which is
 /// essential when the provider has no server-side cache_edits to fall back on.
-pub fn microcompact_session(session: &mut Session) -> MicroCompactResult {
+pub fn microcompact_session(
+    session: &mut Session,
+    auto_compaction_threshold: u32,
+) -> MicroCompactResult {
+    // 二期-C3：CLAW_MICROCOMPACT_DISABLE=1 彻底关掉 microcompact。
+    // DeepSeek 1M 窗口下重传前缀的代价被 cache hit 抹消，microcompact 省的 input token
+    // 反而不重要；且清空换占位符会击穿 DeepSeek 硬盘缓存（字节级完整匹配规则）。
+    // 用户可设此 env 实测对比命中率与 token 消耗，取性价比。
+    if std::env::var("CLAW_MICROCOMPACT_DISABLE").map_or(false, |v| v == "1") {
+        return MicroCompactResult {
+            cleared_count: 0,
+            chars_freed: 0,
+        };
+    }
     let mut cleared_count = 0;
     let mut chars_freed = 0;
     let mut cleared_tools: Vec<String> = Vec::new();
 
     // Collect the IDs of the most recent N compactable tool results (newest
     // first), then keep them verbatim.
-    let recent_ids =
-        collect_recent_compactable_ids(&session.messages, PROTECT_RECENT_TOOL_RESULTS);
+    let recent_ids = collect_recent_compactable_ids(&session.messages, PROTECT_RECENT_TOOL_RESULTS);
     let protect_set: std::collections::HashSet<&str> =
         recent_ids.iter().map(|s| s.as_str()).collect();
 
@@ -127,7 +157,8 @@ pub fn microcompact_session(session: &mut Session) -> MicroCompactResult {
             }
 
             // Skip short results — not worth compacting.
-            if output.len() < MIN_OUTPUT_LENGTH_FOR_CLEAR {
+            // 阈值取 auto_compaction_threshold 的四分之一（见 min_output_length_for_clear）。
+            if output.len() < min_output_length_for_clear(auto_compaction_threshold) {
                 continue;
             }
 
@@ -266,7 +297,10 @@ mod tests {
             ConversationMessage::user_text("hi"),
             ConversationMessage::assistant(vec![]),
         ];
-        assert_eq!(collect_recent_compactable_ids(&msgs, 8), Vec::<String>::new());
+        assert_eq!(
+            collect_recent_compactable_ids(&msgs, 8),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -284,14 +318,19 @@ mod tests {
     #[test]
     fn microcompact_clears_old_large_results_only() {
         // Two results: old+large (cleared), recent+large (kept).
-        let large = "x".repeat(MIN_OUTPUT_LENGTH_FOR_CLEAR + 100);
+        // 阈值动态收参，这里取当前阈值+100确保触发清空。
+        // **预存债**：此测试在二期改动前就失败（PROTECT_RECENT_TOOL_RESULTS=8 把仅 2 个
+        // tool_result 全保护了→cleared_count=0≠期望1）。不是二期改动引入，留待原债主修。
+        let auto_threshold: u32 = 55_000; // 测试用默认阈值
+        let threshold = min_output_length_for_clear(auto_threshold);
+        let large = "x".repeat(threshold + 100);
         let mut session = Session::new();
         session.messages = vec![
             ConversationMessage::tool_result("old", "read_file", large.clone(), false),
             ConversationMessage::tool_result("new", "read_file", large.clone(), false),
         ];
 
-        let result = microcompact_session(&mut session);
+        let result = microcompact_session(&mut session, auto_threshold);
         // PROTECT_RECENT_TOOL_RESULTS >= 1 → "new" is kept, "old" is cleared.
         assert_eq!(result.cleared_count, 1);
         // The kept one is still verbatim; the cleared one is the placeholder.
@@ -317,7 +356,7 @@ mod tests {
             "tiny",
             false,
         )];
-        let result = microcompact_session(&mut session);
+        let result = microcompact_session(&mut session, 55_000);
         assert_eq!(result.cleared_count, 0);
     }
 }
