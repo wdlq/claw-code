@@ -297,6 +297,71 @@ Windows 下额外试 `command.exe`（cmd.exe 命令申明可不带扩展名）�
 
 ---
 
+## ★ 2026-07-14 DeepSeek V4 接入：连续 user 消息合并修复（本次会话）
+
+### 背景
+用户把后端从联通云 GLM-5.1（200K）切到 DeepSeek V4 Pro[1m]（1M 上下文，`https://api.deepseek.com/anthropic`，走 Anthropic Messages 协议）。配置在 `.claw/settings.json` 的 `env` 段。CLI 跑到第二轮就报 400：
+
+```
+messages.3:`tool_use` ids were found without `tool_result` blocks immediately after: call_01_M6DrymvtB3mYIcSWTLxv7423. Each `tool_use` block must have a corresponding `tool_result` block in the next message.
+```
+
+GLM-5.1 工作正常，DeepSeek V4 立即报错——**根因是两家对 Anthropic 协议校验严格度不同**。
+
+### 根因
+**Anthropic Messages 协议要求**：一条 assistant 消息里的所有 `tool_use` 块，其对应的 `tool_result` 块必须**全部合并到同一条 user 消息**里紧跟在 assistant 消息之后；协议也拒绝连续 user 消息（Bedrock 强制 role 邻接交替）。
+
+**claw 的会话存储**（`runtime/src/conversation.rs:440` 的 turn 循环）：assistant 返回多个 tool_use 时，代码用 `for` 循环逐个执行工具，每个 tool_result 通过 `push_message` **单独** push 成一条 `ConversationMessage { role: MessageRole::Tool, blocks: [ToolResult {...}] }`。会话里出现：
+
+```
+msg[3] assistant:  text + tool_use(call_00) + tool_use(call_01)
+msg[4] Tool:       tool_result(call_00)    ← 独立消息
+msg[5] Tool:       tool_result(call_01)    ← 又一条独立消息
+```
+
+**请求体序列化**（`rusty-claude-cli/src/main.rs:10215` 和 `tools/src/lib.rs:4949` 的 `convert_messages`）：把每条 `ConversationMessage` 一对一映射成一条 `InputMessage`，`MessageRole::System|User|Tool` → `role:"user"`。于是请求体里出现两条独立 user 消息各带一个 tool_result——违反协议。GLM-5.1 容忍拆分，DeepSeek V4 严格校验报 400。
+
+### 对齐官方 claude-code 做法（E:\内网工程\ClaudeCode2.1.88开源版\claude-code-source-code）
+读官方源码确认做法：`src/utils/messages.ts:1989 normalizeMessagesForAPI` 在序列化前**合并任何连续 user-wire 消息**成一条（注释明确："Merge consecutive user messages because Bedrock doesn't support multiple user messages in a row"）。另有 `src/utils/messages.ts:5133 ensureToolResultPairing` 做防御性配对修复（给孤儿 tool_use 插合成 error tool_result、删孤儿 tool_result）——那处理 resume/compact 产生的畸形，不是本次多 tool_use 正常路径。
+
+**本次修法与官方方向一致**：在 `convert_messages` 里合并连续非 Assistant 消息成一条 user InputMessage。比官方窄到只合并 Tool——第二轮读到官方做法后**把合并逻辑通用化到所有映射成 user 的连续消息**（System|User|Tool），完全对齐官方 `normalizeMessagesForAPI`。`ensureToolResultPairing` 那种孤儿修复本次不做（claw 当前无 resume/compact 产生孤儿路径，且预存债面大，留待真正报该 400 时再补）。
+
+### 修法（请求体序列化层，不动 runtime 会话结构）
+两份 `convert_messages`（`main.rs:10215`、`tools/src/lib.rs:4949`）都改成：遍历消息时若当前是非 Assistant（即映射成 user），用 **peekable iterator 把紧随其后的所有连续非 Assistant 消息的 content blocks 合并到同一条 user InputMessage**。抽出 `convert_content_blocks` helper 复用 block 转换逻辑。runtime 会话结构（micro_compact、compact、session 持久化、jsonl 重放）全不动——只改请求体出口的合并。
+
+**为什么不在 runtime 层合并**：runtime 把每个 tool_result 存独立消息有正当理由——独立执行、独立 micro_compact 清空、独立 jsonl 持久化。在序列化出口合并是最小侵入，且对 resume/重放历史会话也即时生效。
+
+### 测试
+两份各加 3 个测试：
+1. `converts_coalesces_consecutive_tool_messages_into_one_user_message`——多 tool_result 合并成一条 user（直接覆盖本次报错场景）
+2. `converts_keeps_separate_user_turns_when_split_by_assistant`——验只合并连续，不跨 assistant 边界
+3. `converts_coalesces_consecutive_user_messages_into_one`——连续纯 User 文本消息也合并（对齐官方通用做法）
+
+现有 `converts_tool_roundtrip_messages` 不变仍过。`cargo test -p rusty-claude-cli --bin claw converts`（4 passed）+ `cargo test -p tools --lib convert_messages`（3 passed）全绿。
+
+### 顺手修的预存债（让 api crate lib test target 在 Windows 下能编）
+**根因同 2026-07-11 那批**：2026-06-28 把 `MessageResponse.role`/`kind` 改 `Option<String>` 兼容 GLM SSE 时漏改了一批测试桩。2026-07-11 只修了 `rusty-claude-cli` 的 3 处，**`api` crate 这批 12 处没动**，导致 `cargo test --workspace --lib` 编不过。本次为让验证跑起来一并修了：
+
+| 文件 | 处数 | 类型 | 改法 |
+|------|------|------|------|
+| `api/src/types.rs:309` | 1 | `MessageResponse` 桩（role 应 `Option`） | `"assistant"` → `Some("assistant")` |
+| `api/src/prompt_cache.rs:719` | 1 | `MessageResponse` 桩（role 应 `Option`） | 同上 |
+| `api/src/providers/openai_compat.rs` | 10 | 测试桩构造 `InputMessage`（role 是 `String`）和 `ChatMessage`（role 是 `String`） | 错用 `Some("...")` → 去掉 `Some` |
+
+**注意区分两类相反改法**：`MessageResponse.role` 是 `Option<String>`（要加 `Some`）；`InputMessage.role` 和 `ChatMessage.role` 是 `String`（要去 `Some`）。`openai_compat.rs:497` 那处是**非测试代码**的合法 `MessageResponse` 构造（`Some` 正确），不能动。
+
+### 已知未做（本次不动）
+- **DeepSeek V4 实机验证未做**——本次只做编译+单元测试层验证。用户需重编 `cargo build --release` 替换 `claw.exe` 后真机跑一轮确认 400 消失。`max_tokens: 256000` 是否被 DeepSeek 接受也需实机确认（GLM 接受，DeepSeek 上限未测）。
+- **`ensureToolResultPairing` 风格的孤儿配对防御修复未做**——claw 当前无 resume/compact 产生孤儿 tool_use/tool_result 的路径，且该修复面大（要处理 resume 偏截、compact 边界割、流中断等），留待真正报该 400 时再补。本次只做"正常多 tool_use 路径的合并"，与官方 `normalizeMessagesForAPI` 对齐。
+- **micro_compact 注释那条"GLM has no server-side cache_edits"断言**——见 2026-07-09 核实记录，对 DeepSeek 同样适用（client 从不构造 `cache_control` 字段，无论后端是否支持都无差别）。
+
+### 教训
+- **不同 Anthropic-协议网关对协议校验严格度差异巨大**——GLM-5.1 容忍 tool_result 拆分和连续 user 消息，DeepSeek V4 严格。claw 之前只在 GLM 上跑通，协议合规性债被掩盖。**接入新网关前应过一遍 Anthropic 官方 Messages API 的消息结构约束**（tool_use/tool_result 配对、连续 user 合并、role 枚举值）。
+- **官方 claude-code 源码是协议合规的参考实现**——`E:\内网工程\ClaudeCode2.1.88开源版\claude-code-source-code` 可读。关键函数：`src/utils/messages.ts` 的 `normalizeMessagesForAPI`（连续 user 合并）和 `ensureToolResultPairing`（孤儿配对修复）。下次遇协议合规问题**先查官方对应函数**再动手，避免做窄了要返工（本次第一版只合并 Tool，读官方后扩成通用合并）。
+- **预存测试桩债会阻塞验证**——`api` crate 那 12 处 role 类型不匹配是 2026-06-28 改造的遗留，本次为跑测试不得不顺手修。下次接手遇 `cargo test --workspace --lib` 编不过先看是不是同类 role Option 不匹配桩。
+
+---
+
 ## 下次接手清单
 
 1. **先读本文件** 还原全貌
@@ -310,3 +375,4 @@ Windows 下额外试 `command.exe`（cmd.exe 命令申明可不带扩展名）�
 9. **★ 2026-07-11 新增**：遇"命令被改坏"类 bug，**先埋 `eprintln!("[claw diag] ...")` 打出真传字符串**再推理，不要纯靠推论——本次 B-3 那个 `/b`→`b:` 怪变就是靠 diag 抓到的，纯推论我会一直以为是 raw_arg 没生效
 10. **★ 2026-07-12 新增**：跨 crate 同名函数（`command_exists` 在 `runtime/src/sandbox.rs` 和 `tools/src/lib.rs` 各一份）**先 diff 两份实现**——bug 常在抄袭走样里。本次 PowerShell 探测那条根因就是 `tools` 那份调 sh.exe 走样了，`sandbox` 那份纯 Rust 实现是对的
 11. **★ 2026-07-12 新增**：改 `E:/NW工程/资料库/html/.claw/hooks/keyword_restorer.py` 后**不用重编 claw**（Python 腄本即改即生效），但改坏影响所有 bash/PowerShell 工具调用——改完用 `python -c "from keyword_restorer import convert_unix_cmd_to_windows; ..."` 直接跑几条用例验证再放手
+12. **★ 2026-07-14 新增**：接入新 Anthropic-协议网关（DeepSeek/Bedrock/联通云 GLM 等）前**先过一遍官方 claude-code 的 `src/utils/messages.ts`**（`E:\内网工程\ClaudeCode2.1.88开源版\claude-code-source-code`），对齐 `normalizeMessagesForAPI`（连续 user 合并）和 `ensureToolResultPairing`（孤儿配对修复）的协议合规做法，避免在 GLM 容忍的违规路径上欠债翻车。`convert_messages` 两份（`main.rs`+`tools/src/lib.rs`）是请求体序列化出口，改其中一份务必同步另一份+各加测试。顺手修 api crate 测试桩 role 类型债后 `cargo test --workspace --lib` 终于能编能跑。

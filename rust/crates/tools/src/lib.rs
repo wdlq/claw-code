@@ -4947,53 +4947,78 @@ fn tool_specs_for_allowed_tools(allowed_tools: Option<&BTreeSet<String>>) -> Vec
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
-    messages
-        .iter()
-        .filter_map(|message| {
-            let role = match message.role {
-                MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
-                MessageRole::Assistant => "assistant",
-            };
-            let content = message
-                .blocks
-                .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::Thinking {
-                        thinking,
-                        signature,
-                    } => InputContentBlock::Thinking {
-                        thinking: thinking.clone(),
-                        signature: signature.clone(),
-                    },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: serde_json::from_str(input)
-                            .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
-                    ContentBlock::ToolResult {
-                        tool_use_id,
-                        output,
-                        is_error,
-                        ..
-                    } => InputContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: output.clone(),
-                        }],
-                        is_error: *is_error,
-                    },
-                })
-                .filter(
-                    |block| !matches!(block, InputContentBlock::Text { text } if text.is_empty()),
-                )
-                .collect::<Vec<_>>();
-            (!content.is_empty()).then(|| InputMessage {
+    // Anthropic Messages protocol requires every `tool_use` block in an
+    // assistant message to have a matching `tool_result` block in the *single*
+    // user message that immediately follows it. The runtime session stores each
+    // tool_result as its own ConversationMessage (role=Tool) for independent
+    // execution/micro-compact reasons; before serializing the request body we
+    // coalesce consecutive Tool messages into one user InputMessage so all
+    // tool_result blocks for one assistant turn land in a single user message.
+    // Some Anthropic-protocol gateways (GLM 5.1) tolerated the split; DeepSeek
+    // V4 enforces the protocol and returns 400 `tool_use ids were found without
+    // tool_result blocks immediately after` if we don't merge. Mirrors upstream
+    // claude-code's normalizeMessagesForAPI merging consecutive user messages.
+    let mut iter = messages.iter().peekable();
+    let mut out: Vec<InputMessage> = Vec::with_capacity(messages.len());
+    while let Some(message) = iter.next() {
+        let role = match message.role {
+            MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
+            MessageRole::Assistant => "assistant",
+        };
+        let mut content = convert_content_blocks(&message.blocks);
+        if matches!(message.role, MessageRole::System | MessageRole::User | MessageRole::Tool) {
+            while let Some(next) = iter.peek() {
+                if matches!(next.role, MessageRole::Assistant) {
+                    break;
+                }
+                content.extend(convert_content_blocks(&next.blocks));
+                iter.next();
+            }
+        }
+        if !content.is_empty() {
+            out.push(InputMessage {
                 role: role.to_string(),
                 content,
-            })
+            });
+        }
+    }
+    out
+}
+
+fn convert_content_blocks(blocks: &[ContentBlock]) -> Vec<InputContentBlock> {
+    blocks
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => InputContentBlock::Thinking {
+                thinking: thinking.clone(),
+                signature: signature.clone(),
+            },
+            ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input: serde_json::from_str(input)
+                    .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
+            },
+            ContentBlock::ToolResult {
+                tool_use_id,
+                output,
+                is_error,
+                ..
+            } => InputContentBlock::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: vec![ToolResultContentBlock::Text {
+                    text: output.clone(),
+                }],
+                is_error: *is_error,
+            },
         })
+        .filter(
+            |block| !matches!(block, InputContentBlock::Text { text } if text.is_empty()),
+        )
         .collect()
 }
 
@@ -6448,6 +6473,153 @@ mod tests {
         assert!(poisoned.is_err(), "poisoning thread should panic");
 
         let _guard = env_guard();
+    }
+
+    #[test]
+    fn convert_messages_coalesces_consecutive_tool_messages_into_one_user_message() {
+        // Anthropic protocol: every tool_use in an assistant message must have
+        // its tool_result in the single user message immediately after. The
+        // runtime session stores each tool_result as its own Tool
+        // ConversationMessage; convert_messages must merge consecutive Tool
+        // messages into one user InputMessage so DeepSeek V4 (which enforces
+        // the protocol, unlike GLM 5.1) does not return 400
+        // `tool_use ids were found without tool_result blocks immediately after`.
+        use super::{ContentBlock, ConversationMessage, InputContentBlock, MessageRole};
+        let messages = vec![
+            ConversationMessage::user_text("please inspect"),
+            ConversationMessage::assistant(vec![
+                ContentBlock::Text {
+                    text: "reading two files".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call_00".to_string(),
+                    name: "read_file".to_string(),
+                    input: "{\"path\":\"a.txt\"}".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call_01".to_string(),
+                    name: "grep_search".to_string(),
+                    input: "{\"pattern\":\"foo\"}".to_string(),
+                },
+            ]),
+            ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_00".to_string(),
+                    tool_name: "read_file".to_string(),
+                    output: "content of a".to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+            },
+            ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_01".to_string(),
+                    tool_name: "grep_search".to_string(),
+                    output: "1 match".to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+            },
+        ];
+
+        let converted = super::convert_messages(&messages);
+        assert_eq!(
+            converted.len(),
+            3,
+            "expected both tool_results coalesced into one user message"
+        );
+        assert_eq!(converted[0].role, "user");
+        assert_eq!(converted[1].role, "assistant");
+        assert_eq!(converted[2].role, "user");
+        let tool_results: Vec<&str> = converted[2]
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                InputContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_results, vec!["call_00", "call_01"]);
+    }
+
+    #[test]
+    fn convert_messages_keeps_separate_user_turns_when_split_by_assistant() {
+        // Sanity: we only merge *consecutive* Tool messages. Two tool turns
+        // separated by an assistant message stay as separate user messages.
+        use super::{ContentBlock, ConversationMessage, MessageRole};
+        let messages = vec![
+            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "call_00".to_string(),
+                name: "bash".to_string(),
+                input: "{\"command\":\"ls\"}".to_string(),
+            }]),
+            ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_00".to_string(),
+                    tool_name: "bash".to_string(),
+                    output: "a b".to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+            },
+            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "call_01".to_string(),
+                name: "bash".to_string(),
+                input: "{\"command\":\"pwd\"}".to_string(),
+            }]),
+            ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_01".to_string(),
+                    tool_name: "bash".to_string(),
+                    output: "/tmp".to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+            },
+        ];
+
+        let converted = super::convert_messages(&messages);
+        assert_eq!(converted.len(), 4);
+        assert_eq!(converted[0].role, "assistant");
+        assert_eq!(converted[1].role, "user");
+        assert_eq!(converted[2].role, "assistant");
+        assert_eq!(converted[3].role, "user");
+    }
+
+    #[test]
+    fn convert_messages_coalesces_consecutive_user_messages_into_one() {
+        // Mirrors upstream claude-code normalizeMessagesForAPI: any run of
+        // consecutive user-wire messages (System|User|Tool all map to role=user)
+        // must merge into a single user InputMessage, not just Tool runs.
+        // Bedrock/DeepSeek reject consecutive user messages with 400.
+        use super::{ContentBlock, ConversationMessage, InputContentBlock};
+        let messages = vec![
+            ConversationMessage::user_text("first prompt"),
+            ConversationMessage::user_text("second prompt"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "ok".to_string(),
+            }]),
+            ConversationMessage::user_text("reply"),
+        ];
+
+        let converted = super::convert_messages(&messages);
+        assert_eq!(converted.len(), 3);
+        assert_eq!(converted[0].role, "user");
+        assert_eq!(converted[1].role, "assistant");
+        assert_eq!(converted[2].role, "user");
+        let texts: Vec<&str> = converted[0]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                InputContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["first prompt", "second prompt"]);
     }
 
     fn temp_path(name: &str) -> PathBuf {

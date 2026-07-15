@@ -1664,7 +1664,7 @@ mod tests {
                 model: "grok-3".to_string(),
                 max_tokens: 64,
                 messages: vec![InputMessage {
-                    role: Some("user".to_string()),
+                    role: "user".to_string(),
                     content: vec![
                         InputContentBlock::Text {
                             text: "hello".to_string(),
@@ -1773,7 +1773,7 @@ mod tests {
             model: "deepseek-v4-pro".to_string(),
             choices: vec![super::ChatChoice {
                 message: super::ChatMessage {
-                    role: Some("assistant".to_string()),
+                    role: "assistant".to_string(),
                     content: Some("final answer".to_string()),
                     reasoning_content: Some("hidden thought".to_string()),
                     tool_calls: Vec::new(),
@@ -2044,7 +2044,7 @@ mod tests {
             model: model.to_string(),
             max_tokens: 100,
             messages: vec![InputMessage {
-                role: Some("assistant".to_string()),
+                role: "assistant".to_string(),
                 content: vec![
                     InputContentBlock::Thinking {
                         thinking: "prior reasoning".to_string(),
@@ -2274,7 +2274,7 @@ mod tests {
             model: "gpt-4o".to_string(),
             max_tokens: 100,
             messages: vec![InputMessage {
-                role: Some("assistant".to_string()),
+                role: "assistant".to_string(),
                 content: vec![InputContentBlock::Text {
                     text: "Hello".to_string(),
                 }],
@@ -2304,7 +2304,7 @@ mod tests {
             model: "gpt-4o".to_string(),
             max_tokens: 100,
             messages: vec![InputMessage {
-                role: Some("assistant".to_string()),
+                role: "assistant".to_string(),
                 content: vec![InputContentBlock::ToolUse {
                     id: "call_1".to_string(),
                     name: "read_file".to_string(),
@@ -2421,7 +2421,7 @@ mod tests {
 
         // Test with gpt-4o (should include is_error)
         let message = InputMessage {
-            role: Some("user".to_string()),
+            role: "user".to_string(),
             content: vec![InputContentBlock::ToolResult {
                 tool_use_id: "call_1".to_string(),
                 content: vec![ToolResultContentBlock::Text {
@@ -2445,7 +2445,7 @@ mod tests {
 
         // Test with grok-3 (should include is_error)
         let message2 = InputMessage {
-            role: Some("user".to_string()),
+            role: "user".to_string(),
             content: vec![InputContentBlock::ToolResult {
                 tool_use_id: "call_2".to_string(),
                 content: vec![ToolResultContentBlock::Text {
@@ -2476,7 +2476,7 @@ mod tests {
 
         // Test with kimi-k2.5 (should EXCLUDE is_error)
         let message = InputMessage {
-            role: Some("user".to_string()),
+            role: "user".to_string(),
             content: vec![InputContentBlock::ToolResult {
                 tool_use_id: "call_1".to_string(),
                 content: vec![ToolResultContentBlock::Text {
@@ -2522,7 +2522,7 @@ mod tests {
             max_tokens: 100,
             messages: vec![
                 InputMessage {
-                    role: Some("assistant".to_string()),
+                    role: "assistant".to_string(),
                     content: vec![InputContentBlock::ToolUse {
                         id: "call_1".to_string(),
                         name: "read_file".to_string(),
@@ -2530,7 +2530,7 @@ mod tests {
                     }],
                 },
                 InputMessage {
-                    role: Some("user".to_string()),
+                    role: "user".to_string(),
                     content: vec![InputContentBlock::ToolResult {
                         tool_use_id: "call_1".to_string(),
                         content: vec![ToolResultContentBlock::Text {

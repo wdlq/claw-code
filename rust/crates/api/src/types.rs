@@ -306,7 +306,7 @@ mod tests {
         let response = MessageResponse {
             id: "msg_cost".to_string(),
             kind: Some("message".to_string()),
-            role: "assistant".to_string(),
+            role: Some("assistant".to_string()),
             content: Vec::new(),
             model: "claude-sonnet-4-20250514".to_string(),
             stop_reason: Some("end_turn".to_string()),
