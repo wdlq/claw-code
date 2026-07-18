@@ -27,3 +27,4 @@ atomcode-v4.25.6-windows-x64.exe.bak
 
 # AtomCode local-scope configs (machine-specific)
 .atomcode/local/
+analyze_autocompact.ps1

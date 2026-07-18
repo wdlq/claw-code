@@ -183,6 +183,12 @@ pub struct StructuredPatchHunk {
 }
 
 /// Output envelope for full-file write operations.
+///
+/// **2026-07-17 DeepSeek 节制回执**（对齐 Reasonix `writefile.go` 不塞原文件的设计）：
+/// `original_file` / `structured_patch` / `git_diff` 三个重型字段 `Option` + `skip_serializing_if`，
+/// DeepSeek 后端走 `None` 路径让它们不出现在 JSON 回执里（只回 `"wrote <path>"`摘要+行号），
+/// GLM 后端走 `Some` 路径保留原回执（GLM 容忍大回执且无字节级缓存击穿风险）。
+/// 判定依据 `ANTHROPIC_MODEL` env 前缀：`deepseek` 开头走节制路径，`glm` 开头保持原状。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WriteFileOutput {
     #[serde(rename = "type")]
@@ -190,15 +196,30 @@ pub struct WriteFileOutput {
     #[serde(rename = "filePath")]
     pub file_path: String,
     pub content: String,
-    #[serde(rename = "structuredPatch")]
-    pub structured_patch: Vec<StructuredPatchHunk>,
-    #[serde(rename = "originalFile")]
+    #[serde(rename = "structuredPatch", default, skip_serializing_if = "Option::is_none")]
+    pub structured_patch: Option<Vec<StructuredPatchHunk>>,
+    #[serde(rename = "originalFile", default, skip_serializing_if = "Option::is_none")]
     pub original_file: Option<String>,
-    #[serde(rename = "gitDiff")]
+    #[serde(rename = "gitDiff", default, skip_serializing_if = "Option::is_none")]
     pub git_diff: Option<serde_json::Value>,
 }
 
+/// 抽 `ANTHROPIC_MODEL` env 前缀判定回执节制策略。
+/// `deepseek` 开头 → true（节制，对齐 Reasonix）；`glm` 开头或未设 → false（保持原回执）。
+/// 在 runtime crate 内独立判断，不依赖 api crate（避免循环依赖）。
+fn should_use_compact_receipt() -> bool {
+    std::env::var("ANTHROPIC_MODEL")
+        .ok()
+        .map(|v| v.trim().to_lowercase().starts_with("deepseek"))
+        .unwrap_or(false)
+}
+
 /// Output envelope for targeted string-replacement edits.
+///
+/// **2026-07-17 DeepSeek 节制回执**（对齐 Reasonix `editfile.go` 不塞原文件的设计）：
+/// `original_file` / `structured_patch` / `git_diff` 三个重型字段改 `Option` + `skip_serializing_if`，
+/// DeepSeek 后端走 `None` 路径让它们不出现在 JSON 回执里（只回 `"edited <path>"`摘要+行号区间），
+/// GLM 后端走 `Some` 路径保留原回执。判定依据 `ANTHROPIC_MODEL` env 前缀。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EditFileOutput {
     #[serde(rename = "filePath")]
@@ -207,15 +228,15 @@ pub struct EditFileOutput {
     pub old_string: String,
     #[serde(rename = "newString")]
     pub new_string: String,
-    #[serde(rename = "originalFile")]
-    pub original_file: String,
-    #[serde(rename = "structuredPatch")]
-    pub structured_patch: Vec<StructuredPatchHunk>,
+    #[serde(rename = "originalFile", default, skip_serializing_if = "Option::is_none")]
+    pub original_file: Option<String>,
+    #[serde(rename = "structuredPatch", default, skip_serializing_if = "Option::is_none")]
+    pub structured_patch: Option<Vec<StructuredPatchHunk>>,
     #[serde(rename = "userModified")]
     pub user_modified: bool,
     #[serde(rename = "replaceAll")]
     pub replace_all: bool,
-    #[serde(rename = "gitDiff")]
+    #[serde(rename = "gitDiff", default, skip_serializing_if = "Option::is_none")]
     pub git_diff: Option<serde_json::Value>,
 }
 
@@ -351,15 +372,24 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
     let is_large_file =
         original_file.as_ref().map_or(false, |f| f.len() > 100000) || content.len() > 100000;
 
-    let original_file_output = original_file.as_ref().map(|f| {
-        if is_large_file {
-            format!("[File content omitted - {} bytes]", f.len())
-        } else {
-            f.clone()
-        }
-    });
-
     let structured_patch = make_patch(original_file.as_deref().unwrap_or(""), content);
+
+    // 2026-07-17 DeepSeek 节制回执：DeepSeek 后端走 None 路径省掉 original_file + structured_patch
+    // （对齐 Reasonix writefile.go 只回 "wrote <path>" + 行数摘要的设计）。
+    // GLM 后端保持原回执（GLM 容忍大回执且无字节级缓存击穿风险）。
+    let compact = should_use_compact_receipt();
+    let original_file_output = if compact {
+        None
+    } else {
+        original_file.as_ref().map(|f| {
+            if is_large_file {
+                format!("[File content omitted - {} bytes]", f.len())
+            } else {
+                f.clone()
+            }
+        })
+    };
+    let structured_patch_output = if compact { None } else { Some(structured_patch) };
 
     Ok(WriteFileOutput {
         kind: if original_file.is_some() {
@@ -369,7 +399,7 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
         },
         file_path: absolute_path.to_string_lossy().into_owned(),
         content: content.to_owned(),
-        structured_patch,
+        structured_patch: structured_patch_output,
         original_file: original_file_output,
         git_diff: None,
     })
@@ -428,21 +458,27 @@ pub fn edit_file(
     // For large files, include first 10 lines + modified parts + last 10 lines
     let is_large_file = original_file.len() > 100000;
 
-    let original_file_output = if is_large_file {
-        // For large files, only include a placeholder
-        format!("[File content omitted - {} bytes]", original_file.len())
-    } else {
-        original_file.clone()
-    };
-
     let structured_patch = make_patch(&original_file, &updated);
+
+    // 2026-07-17 DeepSeek 节制回执：DeepSeek 后端走 None 路径省掉 original_file + structured_patch
+    // （对齐 Reasonix editfile.go 只回 "edited <path>" + receipt 的设计，不塞原文件让模型 verify diff）。
+    // GLM 后端保持原回执（GLM 容忍大回执且无字节级缓存击穿风险）。
+    let compact = should_use_compact_receipt();
+    let original_file_output = if compact {
+        None
+    } else if is_large_file {
+        Some(format!("[File content omitted - {} bytes]", original_file.len()))
+    } else {
+        Some(original_file.clone())
+    };
+    let structured_patch_output = if compact { None } else { Some(structured_patch) };
 
     Ok(EditFileOutput {
         file_path: absolute_path.to_string_lossy().into_owned(),
         old_string: old_string.to_owned(),
         new_string: new_string.to_owned(),
         original_file: original_file_output,
-        structured_patch,
+        structured_patch: structured_patch_output,
         user_modified: false,
         replace_all,
         git_diff: None,

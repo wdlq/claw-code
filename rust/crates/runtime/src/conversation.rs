@@ -413,6 +413,10 @@ where
                         "[auto-compacted: removed {} messages]",
                         event.removed_message_count
                     );
+                    write_auto_compact_diag(
+                        event.removed_message_count,
+                        self.auto_compaction_input_tokens_threshold,
+                    );
                 }
             }
 
@@ -573,6 +577,12 @@ where
         }
 
         let auto_compaction = self.maybe_auto_compact();
+        if let Some(event) = &auto_compaction {
+            write_auto_compact_diag(
+                event.removed_message_count,
+                self.auto_compaction_input_tokens_threshold,
+            );
+        }
 
         let summary = TurnSummary {
             assistant_messages,
@@ -2009,5 +2019,28 @@ mod tests {
 
         // then
         assert_eq!(error.to_string(), "upstream failed");
+    }
+}
+
+/// Append an auto-compact event to `claw_glm_diag.log`（对齐 microcompact 的 write_microcompact_diag）。
+/// 之前 auto-compacted 只 eprintln! 打 stderr 不写 diag 日志，导致从日志判 auto-compact 触发次数时误判为 0。
+fn write_auto_compact_diag(removed_message_count: usize, threshold: u32) {
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let record = format!(
+        "\n==== claw_auto_compact t={timestamp} removed={removed} threshold={threshold} ====\n",
+        removed = removed_message_count,
+        threshold = threshold,
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("claw_glm_diag.log")
+    {
+        let _ = f.write_all(record.as_bytes());
     }
 }

@@ -15,8 +15,61 @@
 
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
-/// Placeholder substituted for cleared tool-result content.
+/// Placeholder substituted for fully pruned tool-result content (emergency clear).
 pub const CLEARED_PLACEHOLDER: &str = "[Old tool result content cleared]";
+
+/// Snip 截短标记前缀（对齐 Reasonix 的 snippedMarker，prune.go:16）。
+/// 比 CLEARED_PLACEHOLDER 强：保留头尾行，头部字节稳定→DeepSeek 缓存能命中到头部结束位置。
+const SNIPPED_MARKER: &str = "[snipped tool result — ";
+
+/// Snip 截短策略：按工具类型分级保留头尾行数（对齐 Reasonix prune.go:186-188）。
+/// 只读工具（read_file/grep）头部是答案，保长头短尾；副作用工具（bash）头尾都可能有关键信息，保均等头尾。
+struct SnipStrategy {
+    head: usize,
+    tail: usize,
+}
+
+/// 只读工具默认策略：保留前 80 行 + 后 12 行（对齐 Reasonix defaultReadOnlySnip）。
+const READ_ONLY_SNIP: SnipStrategy = SnipStrategy { head: 80, tail: 12 };
+
+/// 副作用工具默认策略：保留前 40 行 + 后 40 行（对齐 Reasonix defaultSideEffectingSnip）。
+const SIDE_EFFECTING_SNIP: SnipStrategy = SnipStrategy { head: 40, tail: 40 };
+
+/// 按工具名判定 Snip 策略：副作用工具（bash/PowerShell/write_file/edit_file/search_replace）用均等头尾，
+/// 其他只读工具（read_file/grep/glob/list_directory/WebFetch/WebSearch）用长头短尾。
+fn snip_strategy_for(tool_name: &str) -> &'static SnipStrategy {
+    match tool_name {
+        "bash" | "PowerShell" | "write_file" | "edit_file" | "search_replace" => {
+            &SIDE_EFFECTING_SNIP
+        }
+        _ => &READ_ONLY_SNIP,
+    }
+}
+
+/// Snip 截短 tool_result：保留头 N 行 + 尾 M 行，中间塞 `[... N lines omitted ...]` 标记。
+/// 头部字节稳定→DeepSeek 缓存能命中到头部结束位置，只 miss 中间被截的部分（对齐 Reasonix snipToolResult）。
+fn snip_tool_result(content: &str, tool_name: &str) -> String {
+    let strategy = snip_strategy_for(tool_name);
+    let lines: Vec<&str> = content.lines().collect();
+    // 行数太少不值得截短→直接返回原文（不触发清空，保前缀字节完全稳定）
+    if lines.len() <= strategy.head + strategy.tail {
+        return content.to_string();
+    }
+    let head = lines[..strategy.head].join("\n");
+    let tail = lines[lines.len() - strategy.tail..].join("\n");
+    let omitted = lines.len() - strategy.head - strategy.tail;
+    format!(
+        "{snipped}{name}, {orig} bytes; showing first {head} lines and last {tail} lines]\n{head_lines}\n[... {omitted} lines omitted ...]\n{tail_lines}",
+        snipped = SNIPPED_MARKER,
+        name = tool_name,
+        orig = content.len(),
+        head = strategy.head,
+        tail = strategy.tail,
+        head_lines = head,
+        omitted = omitted,
+        tail_lines = tail,
+    )
+}
 
 /// Tool names whose results are eligible for micro-compact.
 /// Mirrors claude-code's COMPACTABLE_TOOLS set.
@@ -155,6 +208,10 @@ pub fn microcompact_session(
             if output == CLEARED_PLACEHOLDER {
                 continue;
             }
+            // Skip already-snipped results（避免重复截短，对齐 Reasonix shouldMaintainToolResult）。
+            if output.starts_with(SNIPPED_MARKER) {
+                continue;
+            }
 
             // Skip short results — not worth compacting.
             // 阈值取 auto_compaction_threshold 的四分之一（见 min_output_length_for_clear）。
@@ -178,9 +235,26 @@ pub fn microcompact_session(
             }
 
             cleared_count += 1;
-            chars_freed += output.len();
-            cleared_tools.push(tool_name.clone());
-            *output = CLEARED_PLACEHOLDER.to_string();
+            let original_len = output.len();
+            // 思路4：Snip 截短保留头尾，不用一刀清空换占位符。
+            // 头部字节稳定→DeepSeek 缓存能命中到头部结束位置，只 miss 中间被截的部分。
+            // 只有 emergency clear（超 EMERGENCY_CLEAR_THRESHOLD 的巨型输出）才用 CLEARED_PLACEHOLDER 彻底删。
+            if original_len < EMERGENCY_CLEAR_THRESHOLD {
+                let snipped = snip_tool_result(output, tool_name);
+                // snip_tool_result 返回原文表示行数太少不值得截→保持原样不清（保前缀字节完全稳定）
+                if snipped.len() < original_len {
+                    chars_freed += original_len - snipped.len();
+                    *output = snipped;
+                    cleared_tools.push(tool_name.clone());
+                } else {
+                    // 行数太少不值得截短→跳过不清，保前缀字节稳定
+                    cleared_count -= 1;
+                }
+            } else {
+                chars_freed += original_len;
+                cleared_tools.push(tool_name.clone());
+                *output = CLEARED_PLACEHOLDER.to_string();
+            }
         }
     }
 

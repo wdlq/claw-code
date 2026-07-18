@@ -475,102 +475,246 @@ DeepSeek 回执的 usage 字段（docs/DeepseekAPI/2.md:65-67）：
 1. cache_control 字段对 DeepSeek 是 Ignored（无害），对真 Anthropic 后端（联通云 GLM、官方 Anthropic）是正确生效的。claw 是多后端 CLI，删了一期反而在真 Anthropic 后端上退化。
 2. CacheConfig/add_cache_breakpoints/add_tools_cache_marker 模块结构对二期仍有用（二期换方向后可复用 session latch 思路）。
 3. 一期的错误是方案前提错（没核实 DeepSeek 字段支持），不是代码错。代码本身编译通过 + 测试不退化，留着不亏。
+---
+
+## ★ 2026-07-16 Reasonix compact 处理对照 claw（源码核实，避免重复分析）
+
+### Reasonix 的 compact 是四级递进 + 多重防退化（源码 internal/agent/compact.go:85-146）
+
+```
+contextWindow × ratio 触发对应动作：
+├─ softCompactRatio (如 60%) → 只提醒不压（"context 大了，保持缓存前缀"）
+├─ toolResultSnipRatio (如 70%) → Snip 截短旧 tool_result（保头尾行）
+├─ compactRatio (如 80%) → 才真 compact（摘要折叠）
+└─ compactForceRatio (如 95%) → force compact（逼不得已硬压）
+```
+
+每一级故意延迟避免击穿缓存。compact.go:92-98 注释明说 "Between the soft ratio and the trigger, report growing context once without rewriting the prefix — a compaction here would needlessly crater the cache"。
+
+### claw 的 compact 是单阈值硬压摘要（conversation.rs:813 auto_compaction_threshold_from_env）
+
+只有一个阈值，到了就硬压摘要，没有 soft/snip/force 分级。with_model_context_window 只是把阈值从固定 55K 改成模型窗口的 75%，仍然是单阈值。
+
+### 关键差异对照表
+
+| 维度 | claw-code | Reasonix |
+|------|----------|----------|
+| 阈值级数 | 单阈值（75% 窗口）硬压摘要 | 四级：soft 提醒→snip 截短→compact 摘要→force 逼压 |
+| compact 前先减压 | 无，到阈值直接摘要折叠 | 有：compact 前先 PruneStaleToolResults 删旧 tool_result，删完低于阈值就跳过 compact（compact.go:120-128） |
+| 折叠经济性检查 | 无，不管 region 多大都压 | 有：foldEconomics（compact.go:153）region < 400 tokens 不压——压了省的钱还不够付摘要 API 调用费 |
+| 连续 compact 防退化 | 无，每轮都可能触发 | 有：consecutiveCompacts >= 2 暂停 auto-compact（compact.go:140-146），告诉用户 context window 太小 |
+| compact 后防再触发 | 无 | 有：compact.go:135 注释——健康 compact 应让 prompt 跌到阈值下，下一轮不再 compact |
+| Snip 截短（保头尾） | 已加（思路 4 ✅） | 原版机制，compact 前的减压手段 |
+| archive 存档 | 无 | 有，删前存到 /tmp/xxx.log，占位符写明路径，模型可重读恢复 |
+
+### 对命中率影响
+
+Reasonix 这套机制对命中率：soft 提醒不压 ✅ 避免在 60-80% 之间不必要 compact 击穿缓存；Snip 截短保头尾 ✅ 头部字节稳定缓存命中到头部结束位置（claw 刚加的思路 4）；compact 前先 Prune ✅ 可能跳过 compact 避免摘要折叠击穿；foldEconomics 小 region 不压 ✅ 避免无谓 compact；consecutiveCompacts 暂停 ✅ 避免循环 compact 每轮击穿。
+
+claw 当前只有"单阈值硬压摘要 + 刚加的 Snip"——缺 soft 提醒、compact 前先减压、foldEconomics、连续 compact 暂停这四条。
+
+### 判断（当前场景性价比）
+
+思路 4（Snip）已加是最重要的一条——对命中率提升最直接。剩下的四条里最有价值的是"compact 前先减压"——Reasonix 靠这条避免了很多不必要的 compact。claw 加这条改动不大：在 conversation.rs 的 compact 触发处先调一次 microcompact_session（用高的 emergency 阈值），删完如果低于 auto-compact 阈值就跳过 compact。
+
+结论：Reasonix compact 处理比 claw 精细得多（四级 vs 一级），但对当前场景（DeepSeek 1M 窗口 + 阈值动态化后 auto-compact 0 次触发），这些精细机制收益已经边际——真正的杀手 microcompact 刚用思路 4 Snip 解了。等实机验证思路 4 效果后如果命中率还差最后几个点，再考虑加"compact 前先减压"那条。
+
+### 另：DeepSeek 缓存 TTL 实测结论（2026-07-16）
+
+放置几个小时（中途未断网）后新会话首轮 cache_read=35584>0——跨会话缓存命中，证明 DeepSeek 缓存 TTL ≥ 几小时不会在几小时内过期。用户的使用场景（放几个小时再回来用）缓存不会失效命中率不受影响。真正吃掉命中率的不是 TTL 是切任务和 microcompact 击穿（后者刚用思路 4 Snip 解）。首轮命中 35584 就是 system prompt + tools schema 那段（约 8K tokens × 4 字符/token ≈ 35K 字符，和 cache_read=35584 吻合）——证明 claw 的 system prompt + tools schema 跨会话字节稳定，思路 1（调顺序）确实不需要做已经对了。
+
+### 下次接手清单（更新）
+
+15. ★ 2026-07-16 新增（Reasonix 对照）：claw 的 compact 是单阈值硬压摘要，Reasonix 是四级递进（soft/snip/compact/force）+ compact 前先减压 + foldEconomics + 连续 compact 暂停。思路 4（Snip 截短保头尾）已加是最重要的一条。剩下的"compact 前先减压"等实机验证思路 4 后如果命中率还不能提升再考虑。DeepSeek 缓存 TTL ≥ 几小时实测确认，跨会话首轮命中 35584，思路 1（调顺序）已核实不需要做。思路 4 改动集中在 micro_compact.rs：snip_tool_result 函数 + SnipStrategy 按工具类型分级（只读头80尾12，副作用头40尾40）+ 清空逻辑从 *output = CLEARED_PLACEHOLDER 改成调 snip_tool_result。实机验证关键看 microcompact 触发后那一轮 cache_read 是否还断崖跌——如果不跌了说明 Snip 生效，如果还跌说明头部字节也不够稳定要进一步调策略。
 
 ---
 
-## ★★ 2026-07-15 auto-compact 频繁触发是命中率杀手（本次会话核心发现）
+## ★★ 2026-07-17 auto-compact 击穿 DeepSeek 缓存实机复盘 + Reasonix 对照补全（本次会话）
 
-### 日志铁证
-claw_glm_diag.log 的 est_tokens 轨迹：6265 → 14203 → 95504 → **9106** → 9126 → ... → 93795 → **7867** → 10719。每次 auto-compact 后 est_tokens 断崖跌（95504→9106, 93795→7867），历史被压成摘要，整个前缀字节序列彻底改变。DeepSeek 硬盘缓存是字节级完整匹配，compact 后前缀全变必然 miss。
+### 实机事件（claw_glm_diag.log 第 71649-71651 行，唯一一次 auto-compact）
 
-命中率低的真正杀手链：上下文涨 → 触 auto-compact(75%阈值) → 前缀字节全变 → DeepSeek 缓存 miss → 命中率低。
+```
+[71649] claw_cache_diag t=1784254524 hit=0 miss=0 input=211388 output=1523 cache_read=230400 cache_creation=0
+[71651] claw_auto_compact t=1784254524 removed=79 threshold=750000
+```
 
-### 官方 claude-code 怎么同时做到"不撑爆上下文 + 高命中率"
-读了官方 services/compact/{microCompact,timeBasedMCConfig,autoCompact,compact}.ts，它用三个 claw-code 完全没有的机制：
+**threshold=750000** = DeepSeek V4 1M 窗口 × 75%（`CLAUDE_CODE_AUTO_COMPACT_PCT_OVERRIDE=75` 经 `with_model_context_window` 算出），按阈值正常触发，不是 400 兜底。
 
-**机制 1：Cached Microcompact（cache_edits）**——清旧 tool_result时不改本地消息内容，只在请求体加 cache_edits �块让服务端删。本地前缀字节不变 → DeepSeek 缓存仍命中。但这条对 DeepSeek 无效（cache_edits 也是 Ignored）。
+### 关键证据：cache_read 暴跌 48%
 
-**机制 2：Compact Boundary**——compact 后保留前缀的"边界消息"，不让历史完全断。getMessagesAfterCompactBoundary（query.ts:365）保留 compact boundary 之前的不变前缀，只压缩 boundary 之后的。下一轮请求的前缀 = compact 之前的不变段 + 摘要 + 新对话，不变段字节稳定仍能命中。claw 的 compact.rs 是全量压摘要，没有 boundary 保留。
+| 阶段 | t | cache_read |
+|---|---|---|
+| auto-compact 前最后一次请求 | 1784254488 | **446,464** |
+| auto-compact 那次请求 | 1784254524 | **230,400** |
 
-**机制 3：auto-compact 阈值动态化 + reactive compact**——阈值不是固定 75%，而是 getAutoCompactThreshold(model) 按模型上下文窗口动态算。DeepSeek V4 Pro 1M 上下文，官方放阈值到 ~750K 才压；claw 固定 75%×131K=~98K 就压，当然频繁触发。还有 reactive compact：宁可先让请求发出去，收到 413 prompt-too-long 才压，避免 proactive compact 不必要击穿缓存。
+cache_read 从 446K 暴跌到 230K，跌幅 216K tokens（约 48%）。这正是 MEMORY 第 461 行那条预测——**auto-compact 把历史压成摘要，整个前缀字节彻底改变，DeepSeek 字节级完整匹配必然 miss**。
 
-官方在 GLM 5.1（200K）不撑爆的原因：阈值动态 = contextWindow × 0.75，200K×0.75=150K 才压，GLM 200K够用。在 DeepSeek（1M）高命中率的原因：机制 1+2 让 compact 不击穿前缀，且阈值放到 750K 才压，几乎不触发。
+### 三大异常定位
+
+**异常 A —— micro-compact 一次都没触发**
+日志里 `claw_microcompact` 事件 **0 条**。`micro_compact.rs:166` 那个 `CLAW_MICROCOMPACT_DISABLE=1` 开关当时是开着的——**用户在用 `CLAW_MICROCOMPACT_DISABLE=1` 实测对比命中率**。所以这次跑的是"禁用 micro-compact"路径，思路 4 的 Snip 根本没机会生效。
+
+**异常 B —— pre-flight compact 触发条件与 maybe_auto_compact 不一致（需进一步核实）**
+
+| 函数 | 位置 | 判断依据 |
+|---|---|---|
+| `session_needs_pre_flight_compact` | conversation.rs:690 | `messages` 的 `char_count / 4` 估算（**只算 messages body**） |
+| `maybe_auto_compact` | conversation.rs:638-665 | 优先用 `usage_tracker.cumulative_usage().input_tokens`（**实际回执**，含 system+tools），input_tokens==0 时才回退到 char_count/4 |
+
+两者走的是**两套估算路径**。日志显示 compact 那轮 est_tokens≈444K 远未到 750K 阈值，但 pre-flight 仍触发了 compact——**强烈怀疑 pre-flight 的 char_count/4 高估了 est_tokens，把本不需要 compact 的会话硬压了一次**。本次会话没继续追这条，留下次接手或用户决定是否深挖。
+
+**异常 C —— auto-compact 之后日志就结束了（71651 行是最后一行）**
+
+无法判断"compact 后命中率恢复没恢复"。从这次数据只能确认"compact 那一刻 cache 暴跌"。
+
+### Reasonix 对照补全（本次会话核实，补 MEMORY 第 480-528 行漏记的两条）
+
+读了 `E:\Claude Code\DeepSeek-Reasonix-main-v2\internal\agent\compact.go` (760 行) + `prune.go` (289 行) 完整源码。MEMORY 第 480-528 行那份记录**主体准确**，但漏了两个关键细节：
+
+**漏记 1 —— Reasonix `tokPerChar` 动态校准（compact.go:587-596）**
+
+```go
+func (a *Agent) tokPerChar() float64 {
+    if u := a.lastUsage.Load(); u != nil && u.PromptTokens > 0 {
+        if c := charsOfMessages(a.session.Messages); c > 0 {
+            if r := float64(u.PromptTokens) / float64(c); r > 0.05 && r < 2 {
+                return r  // 从上次真实 usage 算 tokens/char 比率
+            }
+        }
+    }
+    return fallbackTokPerChar  // 0.25 ≈ 4 chars/token
+}
+```
+
+Reasonix **用上次真实回执的 PromptTokens / charsOfMessages 校准 tokens-per-char 比率**，区间 (0.05, 2) 才采信，否则 fallback 0.25。
+
+claw 用**固定 char/4**（`estimate_message_tokens` 用 `len(text)/4`，conversation.rs:692 那个 pre-flight 也是 `char_count/4`）。对 CJK 内容（中文路径、中文注释）**char/4 会严重低估真实 token 数**——因为 DeepSeek/Anthropic 的 tokenizer 对中文接近 1 token/字，4 个中文字符 ≈ 4 tokens 而非 1 token。
+
+**这直接影响刚才那次 auto-compact 的触发判断**：claw 的 pre-flight 用 char/4 估算，对中文重的会话可能高估也可能低估；maybe_auto_compact 用回执 input_tokens 更准但走了不同路径。**两套估算路径 + char/4 对 CJK 不准 = 触发时机不可靠**。
+
+**漏记 2 —— Reasonix `pinnedPrefixLen` + `partitionFold` 分级保留（compact.go:377-418）**
+
+MEMORY 只记了"Reasonix 有 archive 存档"，漏了**分级保留机制**：
+
+```go
+func (a *Agent) pinnedPrefixLen(msgs []provider.Message) int {
+    // 锚 system + 首条 user turn（任务 + 约束，pinnableUserTurn 阈值 1500 tokens / 窗口 15%）+ 既有摘要
+    // → 用户事实永不摘要掉，既有摘要永不二次摘要
+}
+
+func (a *Agent) partitionFold(region []provider.Message) (kept, fold []provider.Message) {
+    // 把 region 分"kept verbatim（小 user turn + 既有摘要）"和"fold（其余）"
+    // → 只对 fold 调摘要，用户原文 + 既有摘要保留
+}
+```
+
+claw `compact_session` (compact.rs:96) **没这层**——region 全摘要，用户事实可能被摘要掉，既有摘要可能被二次摘要。MEMORY 第 510 行对照表里"archive 存档"那条**没展开 pinnedPrefixLen/partitionFold 这两层防漂移**，这里补上。
+
+### 对刚才那次 cache 暴跌的具体归因
+
+按 Reasonix 的四级机制，prompt_tokens 在 snip 阈值(0.6×1M=600K)时就该先 Snip 减压；到 compact 阈值(0.8×1M=800K)前再 Prune，删完若 `tokens-saved < high` 就**跳过 compact**。
+
+claw 没这两道前置减压（micro-compact 还被 DISABLE 了），到 750K 直接硬压 79 条消息，前缀字节彻底改变，DeepSeek 硬盘缓存**必然 miss**——这就是 cache_read 暴跌 216K tokens 的根因。
+
+**思路 4 Snip 在这次实机里根本没跑**（异常 A），所以这次暴跌**不能归罪于思路 4 失效**，而是"micro-compact 被禁 + 无 compact 前减压"双重缺失导致的。
+
+### 下次接手清单（更新）
+
+16. ★ 2026-07-17 新增（auto-compact 击穿实机复盘）：claw 的 `session_needs_pre_flight_compact`(conversation.rs:690) 用 char_count/4 估算、`maybe_auto_compact`(conversation.rs:638) 用回执 input_tokens——**两套估算路径不一致**，加上 char/4 对 CJK 严重不准，是 pre-flight 误触发 compact 的嫌疑点。下次接手若用户报"auto-compact 不该触发却触发了"，**先查 pre-flight 的 char_count/4 是否高估**，并对照 Reasonix `tokPerChar`(compact.go:587-596) 的"从上次真实 usage 校准 tokens/char 比率，区间 (0.05, 2) 才采信"做法。
+
+17. ★ 2026-07-17 新增（Reasonix 对照补全两条漏记）：
+    - **tokPerChar 动态校准**：MEMORY 之前那份对照表漏记这条。Reasonix 不用固定 char/4，而是 `lastUsage.PromptTokens / charsOfMessages` 校准 tokens-per-char 比率，区间 (0.05, 2) 才采信，否则 fallback 0.25。claw 改这条对 CJK 重场景收益最大。
+    - **pinnedPrefixLen + partitionFold 分级保留**：MEMORY 之前只记"archive 存档"，漏了"分级保留"这层防漂移。Reasonix 锚 system + 首条 user turn + 既有摘要永不摘要；partitionFold 把 region 分 kept verbatim 和 fold，只对 fold 调摘要。claw `compact_session` region 全摘要，用户事实可能被摘要掉。下次做 compact 改进时这两条要一起补。
+
+18. ★ 2026-07-17 新增（实机验证思路 4 的盲点）：本次用户跑的那轮 `CLAW_MICROCOMPACT_DISABLE=1` 开着，micro-compact 一次没触发（日志 0 条 `claw_microcompact` 事件）。**思路 4 Snip 在这次实机里根本没跑**，所以 cache 暴跌 48% 不能归罪于思路 4 失效——是"micro-compact 被禁 + 无 compact 前减压"双重缺失导致的。下次实机验证思路 4 必须**关掉 `CLAW_MICROCOMPACT_DISABLE`**，并看 `claw_microcompact` 事件是否真的写进日志了再下判断。
+
+  **★★ 2026-07-18 更新（思路 4 Snip 已有 1 条真机实测样本）**：用户照建议关掉 `CLAW_MICROCOMPACT_DISABLE` 重跑一轮，日志 `E:\NW工程\资料库\html\claw_glm_diag.log`（115877 行）数据反转之前判断——
+  - `DISABLE` 字面命中 **0**，`claw_microcompact` 事件 **1**（行 11883）：`t=1784283708 cleared=1 chars_freed=639406 protected=8 [cleared_tools] edit_file` —— Snip 确实跑了
+  - 时序：microcompact 触发前 `cache_read=151680`，触发后第 1 轮 `cache_read=226944`（**反涨 75K**），后续微增到 229K —— 印证头部字节稳定被 DeepSeek 缓存命中
+  - 但 355 秒后（t=1784284063）cache_read 暴跌 97.3%（227K→6K）—— 真因是用户发了新任务（"测试版主页迁到正式版"），新 user input 让前缀彻底变，与 microcompact 无关
+  - **结论**：思路 4 Snip 不再是"没跑过"，而是"跑了 1 次、效果正面（cache_read 反涨 75K 印证头部稳定命中）"。仍需更多样本（特别是连续多次 microcompact + 长会话尾段）才能定论 Snip 在长会话中持续保命中率的效果。`chars_freed=639406` 根因也已落定——claw `EditFileOutput` 塞整份原文件导致单次 edit_file 产生大 output（已在第 19 条那条改动里落地 DeepSeek 节制回执修复）。
 
 ---
 
-## ★ 二期改动计划（重写，2026-07-15 纠错后）
+## ★★ 2026-07-17 edit_file/write_file DeepSeek 节制回执（本次会话，已落地）
 
-前提纠错：DeepSeek 不认 cache_control/anthropic-beta。二期方向从"注入 Anthropic cache 字段"彻底转向"稳住请求前缀字节，适配 DeepSeek 硬盘缓存的完整匹配规则"。原二期-A/B/D/F 全废，C/E 升为最高优先并重写，新增 G/H。
+### 根因（本会话上半场核实）
+对照 Reasonix `internal/tool/builtin/editfile.go:74-78`——**edit_file 永远只回 `"edited <path>"` + receipt（行号/字符数元数据），不塞原文件**。claw `runtime/src/file_ops.rs` 的 `EditFileOutput` / `WriteFileOutput` 反过来——把 `original_file`（整份原文件内容）+ `structured_patch`（unified diff hunks）+ `git_diff` 全塞进回执 JSON。对 80KB PHP 文件单次 edit 就产生 80KB tool_result；**这次实机 microcompact 那条 `chars_freed=639406` 根因就是 claw edit_file 塞原文件**（修正之前判断：639K 是 microcompact 累计清量，但源头确实是 claw edit_file 不该塞原文件的大 output）。
 
-### 二期-C1（最高优先）：auto-compact 阈值按模型上下文窗口动态化
-目标：让 claw 的 auto-compact 阈值随模型上下文窗口动态算，DeepSeek 1M → 750K 才压，几乎不触发，前缀稳定。
+### 用户决策
+按模型前缀分支：`ANTHROPIC_MODEL` 以 `deepseek` 开头 → 走 Reasonix 节制回执；`glm` 开头或未设 → 保持原回执不变。
 
-改动：
-1. runtime/src/compact.rs 或 conversation.rs：当前固定 CLAUDE_CODE_AUTO_COMPACT_WINDOW=131000 → 改成 model_token_limit × 0.75。需要拿到模型上下文窗口大小（api/src/types.rs 的 ModelInfo 或 providers 的 token_limit）。
-2. DeepSeek V4 Pro 1M → 750K，GLM 5.1 200K → 150K，都不撑爆。
-3. 测试：阈值计算函数单测覆盖几个模型上下文窗口值。
+### 落地改动（全部在 `runtime/src/file_ops.rs`）
+| 改动 | 说明 |
+|------|------|
+| `WriteFileOutput` struct | `original_file` / `structured_patch` / `git_diff` 三个重型字段改 `Option<T>` + `#[serde(default, skip_serializing_if="Option::is_none")]`，DeepSeek 路径置 `None` 让它们不出现在 JSON 回执里 |
+| `EditFileOutput` struct | 同上三个字段（`original_file` 原是 `String`，`structured_patch` 原是 `Vec`，`git_diff` 原是 `Option` 但没 `skip_serializing_if`）统一改 `Option` + `skip_serializing_if` |
+| 新增 `should_use_compact_receipt()` | 抽 `ANTHROPIC_MODEL` env 前缀（`.to_lowercase().starts_with("deepseek")`）判定节制策略。**在 runtime crate 内独立判断，不依赖 api crate**（避免循环依赖，对齐 MEMORY 第 51 行已知坑——api crate 的 `detect_provider_kind` 不便从 runtime 反向调用）|
+| `write_file` 实现 | `let compact = should_use_compact_receipt();` 后 DeepSeek 路径 `original_file_output = None` + `structured_patch_output = None`；GLM 路径保留原 `is_large_file` 100KB 阈值逻辑（`original_file.as_ref().map(...)`）|
+| `edit_file` 实现 | 同上分支；GLM 路径保留原 100KB 大文件占位符逻辑 |
 
-预期：命中率 50% → 70-80%（compact 几乎不触发，前缀稳定段能命中）。
+### 死代码清理
+落地时删了两段被新分支覆盖的老 `let original_file_output = ...`（原 `file_ops.rs:375-381` 和 `:461-466`）——`cargo check` 第一次跑暴露了 `unused variable` warning，已删干净。
 
-### 二期-C2（高优先，面大）：Compact Boundary 保留不变前缀
-目标：compact 时不全部压摘要，保留 compact_boundary 之前的不变前缀，只压缩 boundary 之后的。
+### 验证
+- `cargo check --workspace` ✅ 干净（只剩 3 个预存 warning：MEMORY 第 246/278 行已记的 `plugins/hooks.rs Path`、`bash.rs CommandExt`、`tools/lib.rs convert_messages dead_code`，本次未新增）
+- `cargo test -p runtime --lib file_ops` ✅ 13 passed 1 failed。**唯一 FAILED 的 `glob_search_skips_common_heavy_directories` 已用 `git stash` 核实是预存债**（stash 后原始代码跑同一测试同样 FAILED，与本次改动无关）——该测试期望在 `src/AGENTS.md` 找到匹配，但仓库根没这文件，是测试桩与实际仓库布局脱节的预存问题。
 
-改动：
-1. runtime/src/compact.rs：compact 时插入 compact_boundary 标记，boundary 之前的消息原样保留。
-2. 序列化时 boundary 之前的不变段字节稳定 → DeepSeek 缓存前缀单元仍能命中。
-3. 测试：compact 后 boundary 之前消息不变 + boundary 之后被压摘要。
+### 未做（留待实机验证）
+- **真机验证未做**——本次只做编译+单元测试层验证。用户需重编 `cargo build --release` 替换 `claw.exe` 后真机跑一轮，看日志里 `claw_request_size` 的 bytes 是否在 edit_file 后明显变小、`claw_microcompact` 事件触发次数是否减少。
+- **read_file 工具未改**——本次只改 edit_file/write_file。read_file 的 `ReadFileOutput` 本就是按行读 + 行数限制，回执语义合理（不是"塞整份原文件"），不需要这条节制。
+- **search_replace 工具未改**——同理 search_replace 回执语义合理。
+- **`tools/src/lib.rs` 那份 `convert_messages` 的 dead_code warning** 是 2026-07-14 那次改动拆 `_with_cache` 变体后留下的，本次未动，留预存债。
 
-预期：命中率 70-80% → 85%（即使触发 compact，不变前缀段仍命中）。
+### 下次接手清单（更新）
 
-### 二期-C3（中优先）：micro_compact 改成固定长度占位符
-目标：清空 tool_result 时换固定长度占位符，不随内容变，让被清空前的前缀单元字节稳定。
+19. ★ 2026-07-17 新增（edit_file/write_file DeepSeek 节制回执）：`runtime/src/file_ops.rs` 的 `EditFileOutput` / `WriteFileOutput` 三个重型字段（`original_file` / `structured_patch` / `git_diff`）已改 `Option` + `skip_serializing_if`，`should_use_compact_receipt()` 按 `ANTHROPIC_MODEL` env 前缀 `deepseek` 分支。**下次改这两个 struct 加字段时记得 GLM 路径要填 `Some(...)`、DeepSeek 路径要填 `None`**，别在 DeepSeek 路径意外塞原文件——那是这条改动的核心禁忌。真机验证关键看 `claw_request_size` 的 bytes 在 edit_file 后是否明显变小。**★ multiprovider 落地后的强制配套改动（2026-07-17 会话下半场补充）**：当前 `should_use_compact_receipt()` 只读全局 `ANTHROPIC_MODEL` env，multiprovider（`docs/multiprovider.md`）落地后子 agent 走 `ResolvedSubagentProvider.model` 与主 LLM env 不同 provider 会破裂——主=DeepSeek/子=GLM 时子 agent 被误节制（功能退化），主=GLM/子=DeepSeek 时子 agent 漏节制击穿缓存（病在子 agent 路径复发）。必须配套改成 `should_use_compact_receipt(model: &str)` 按**当前调度的 model 名**判定，由 `tools/src/lib.rs` 工具 dispatch 层算好布尔传进 `file_ops::edit_file`/`write_file`（选项 A，加 `compact_receipt: bool` 参数；非选项 B 的 ToolContext 大改）。详见 `docs/multiprovider.md` 3.4bis 节。**不动 `AgentInput` JSON schema**（模型逐调用选 provider 的能力留二期），但要动工具函数签名传 model——前者破坏模型兼容，后者模型看不到，两件事不要混。
+20. ★ 2026-07-17 新增（预存债标记）：`file_ops::tests::glob_search_skips_common_heavy_directories` 测试断言 `src/AGENTS.md` 在 glob 结果里，但仓库根没该文件——是测试桩与实际仓库布局脱节的预存问题，本次未修。下次接手若要修，要么改测试断言用仓库里真存在的文件，要么在测试 tempdir 里造一份 AGENTS.md。
 
-改动：runtime/src/micro_compact.rs 的占位符长度固定（如 [CLEARED:512bytes] 固定 512 字节）。
-
-预期：再 +5%。
-
-### 二期-E（最高优先，辅助验证）：diag 日志补 DeepSeek cache 命中回执
-目标：让 claw 端能看到 DeepSeek 的真实命中率，不再靠人肉看 DeepSeek 后台。
-
-改动：
-1. api/src/types.rs 的 Usage struct：加 prompt_cache_hit_tokens: u32 / prompt_cache_miss_tokens: u32 字段（#[serde(default)]），对齐 DeepSeek 回执字段名（docs/DeepseekAPI/2.md:65-67）。Anthropic 后端不发这俩字段→default 0，兼容。
-2. api/src/providers/anthropic.rs 的 diag 埋点：response usage 解析后追加一行 claw_cache_diag t=... hit=... miss=... input=... output=...。
-3. 仓库根加 analyze_cache.ps1 腄本（沿用 analyze_log.ps1 模式）。
-
-预期：实机量化命中率，二期-C 改完后能对比前后。
-
-### 二期-G（核实）：确认 DeepSeek 硬盘缓存对 Anthropic 协议路径是否生效
-目标：核实 DeepSeek 的硬盘缓存是否对 /anthropic 路径（Anthropic 协议）生效，还是只对 /chat/completions（OpenAI 协议）生效。
-
-现状：docs/DeepseekAPI/2.md 的缓存说明写在 OpenAI 协议文档里。DeepSeek 的 Anthropic-compat 接口（1.md）没提缓存。可能 Anthropic 路径根本没接硬盘缓存→那 50% 是别的机制，二期-C 再怎么稳前缀也没用。
-
-动作：
-1. 先做二期-E（能看到 hit/miss 字段）。
-2. 跑两轮相同前缀的请求，看 prompt_cache_hit_tokens 是否 >0。
-3. 如果 0→Anthropic 路径没接硬盘缓存，二期要改走 OpenAI 协议调 DeepSeek（base_url=https://api.deepseek.com，走 openai_compat.rs 而非 anthropic.rs），那路径才有缓存。这是大改，需用户同意。
-4. 如果 >0→Anthropic 路径有缓存，二期-C 稳前缀方向正确，继续。
-
-### 二期-H（新增）：必要时切 OpenAI 协议调 DeepSeek
-目标：如果二期-G 确认 Anthropic 路径无缓存，改走 OpenAI 协议。
-
-改动（大）：
-1. api/src/providers/mod.rs 的 detect_provider_kind：deepseek-* 改路由到 ProviderKind::OpenAi。
-2. 验证 openai_compat.rs 的 translate_message 对 DeepSeek 思考模式（reasoning_effort/output_config.effort）的字段映射正确（docs/DeepseekAPI/3.md）。
-3. 重新跑二期-G 验证缓存生效。
-
-预期：如果 Anthropic 路径无缓存而 OpenAI 路径有，切完命中率直接到 70-80%。
-
-### 废弃的原二期项
-- 二期-A（system 分块 cache_control）：DeepSeek 不认该字段，无效
-- 二期-B（tool_result cache_reference）：同上，无效
-- 二期-D（beta header）：手册明确 ignored，无效
-- 二期-F（TTL 1h latch）：DeepSeek 不认 TTL，无效
-- 机制 1（cache_edits）：DeepSeek 不认 cache_edits，无法复刻官方 cached MC
+21. ★ 2026-07-18 新增（read_file 防击穿对照 Reasonix——三重门 claw 全缺）：日志 `claw_glm_diag.log` 行 23029 那次 cache_read 暴跌 97.3%（229K→6K）真因是"读大文件击穿缓存"——input 暴涨到 221KB，行 21375~21461 那批 read_file 把 `IndexController.php` + `route.php` + `indextest.html` + `index.html` 一连串文件全文塞进上下文换前缀。对照 Reasonix `internal/tool/builtin/readfile.go` (255 行) 的三重门——**claw 三个全缺**：
+    - **门 1 默认 limit 硬封顶 2000 行**（Reasonix 行 45 `const readFileDefaultLimit = 2000`）——claw `file_ops.rs:303` 的 `read_file` 函数 `limit: Option<usize>` 参数没默认值硬封顶，`file_ops.rs:334` `limit.map_or(lines.len(), ...)` 即 limit=None 时**返回整文件所有行**。模型不传 limit 就 slurp 整文件。**改成**：limit=None 时 fallback 到 2000 而非 `lines.len()`，对齐 Reasonix。
+    - **门 2 流式 break**（Reasonix `scan` 函数行 212-254，遇 cap 即 `break` 不读余下文件）——claw `file_ops.rs:331` `fs::read_to_string` + `:332` `content.lines().collect()` 是**整文件 slurp + 切片**，50MB 文件也一次性进内存再切片。**改成**：用 `BufReader::new(File::open(path))` + `BufRead::lines()` 流式，遇 limit 即 break。这条对 50MB 大文件场景收益明显，但 claw 当前 PHP 资料库单文件常 30~80KB 收益小——优先级低于门 1。
+    - **门 3 SnipHint 头重尾轻 + 字符级封顶**（Reasonix 行 70-72 `SnipHint{Head:120, Tail:12, HeadChars:12000, TailChars:2000}`）——claw `micro_compact.rs:33` `READ_ONLY_SNIP = SnipStrategy { head: 80, tail: 12 }` 是行级封顶对齐了 Reasonix 的 Head/Tail 行数，但**缺字符级 HeadChars/TailChars 字段**。一个超长行（比如 minified JS 一行 50KB）能冲垮行级封顶。**改成**：`SnipStrategy` 加 `head_chars: usize, tail_chars: usize` 字段，对齐 Reasonix 12000/2000。这条优先级中等。
+    - **门 4 二进制 8KB peek 拒读**（Reasonix 行 23 `readFileBinaryPeek = 8*1024` + 行 176 NUL 字节检测）——claw 没这条。但 claw 资料库场景几乎不会读二进制，优先级低。
+    - **结论**：claw read_file 当前是"整文件 slurp + 切片 + 行级 Snip"，Reasonix 是"流式 break + 2000 行硬封顶 + 行级 + 字符级双层 Snip + 二进制 peek 拒读"。**真正该抄的是门 1**（一行 const + fallback 改动），门 2/3 收益看场景，门 4 暂不做。下次接手若用户报"read 大文件击穿缓存"，先看 limit 是不是 None 走了 `lines.len()` 路径。
+    - **与第 19 条的关系**：第 19 条改的是 edit_file/write_file **回执塞原文件**那条路；本条改的是 read_file **读进上下文**那条路。两条是不同的击穿路径，要分开治——前者已落地 DeepSeek 节制回执，后者还没动。
 
 ---
 
-## 下次接手清单（更新）
+## ★★★ 2026-07-18 edit_file/write_file DeepSeek 节制回执真机实测（节制成功）
 
-13. ★ 2026-07-15 新增（纠错版）：二期启动前先读 docs/DeepseekAPI/{1,2,3,4}.md 确认 DeepSeek 的字段支持——一期栽在没读手册假设它认 cache_control。二期顺序：先做二期-E（补 prompt_cache_hit_tokens/prompt_cache_miss_tokens 字段看命中率）→ 二期-G（确认 Anthropic 路径有无缓存）→ 若无缓存走二期-H（切 OpenAI 协议）→ 若有缓存走二期-C（稳前缀）。api/src/cache_control.rs 一期模块保留（对真 Anthropic 后端仍有效），但二期方向转向"稳前缀字节"不再在那扩。接入新网关前必读该网关官方 API 手册，不要假设它完整实现 Anthropic 协议——这是一期教训。Python 腄本批量补字段那招（本次处理 33 处）二期补 prompt_cache_hit_tokens/prompt_cache_miss_tokens 字段时可复用。
+### 实测数据（日志 `E:\NW工程\资料库\html\claw_glm_diag.log` 224424 行 / 80MB，今日 07:34-09:08 那轮）
 
-14. ★ 2026-07-15 新增（auto-compact 杀手）：claw_glm_diag.log 的 est_tokens 轨迹暴露 auto-compact 频繁触发是 DeepSeek 缓存命中率杀手——每次 compact 后前缀字节全变，DeepSeek 硬盘缓存必然 miss。二期-C1（阈值动态化）是性价比最高的一改，只动 compact 阈值计算逻辑就能让 DeepSeek 1M 窗口下几乎不 compact。官方 claude-code 的三个机制（cached MC/compact boundary/阈值动态化）中，机制 1 对 DeepSeek 无效（cache_edits 也 Ignored），机制 2+3 是二期-C2+C1 对应。compact.rs 和 micro_compact.rs 是二期改动核心。
+**回执节制生效证据**（任务 #2 核实）：
+- 全日志 **1002 处 edit_file 调用 + 83 处 write_file 调用**，匹配出 **919 个 edit_file 回执 + 0 个 write_file 回执**（write_file 调用因跨批次 tool_use_id 关联未匹配到回执段，但 edit_file 已能定论）
+- **919 个 edit_file 回执里：含 `originalFile` 字段的 = 0，含 `structuredPatch` 字段的 = 0，含 `gitDiff` 字段的 = 0**——三个重型字段被 `skip_serializing_if="Option::is_none"` 完全 skip 掉，DeepSeek 路径走的 `None` 分支生效
+- 残留字段：`filePath` + `oldString` + `newString` + `replaceAll` + `userModified`（这些是 `String`/`bool` 非重型字段，节制改动没动它们，保留原状）——回执只剩"改了哪个文件+改了哪段"的瘦骨架，对齐 Reasonix `editfile.go:74` 那个 `"edited <path>"` + receipt 哲学
+
+**缓存命中效果**（任务 #3 核实）：
+
+| 指标 | 值 | 评 |
+|---|---|---|
+| 事件分布 | cache_diag=83 / glm_diag=83 / request_size=83 / Reranking=26 / **auto_compact=0 / microcompact=0** | 全程没触发 auto-compact 也没触发 microcompact——节制回执让请求体没到阈值 |
+| cache_read 跌幅点 | **只有 2 个** >30% 跌幅点：t=1784331431 (-45%, cr 10K→5K) 和 t=1784335316 (-50%, cr 287K→142K)。前者是小 cr 值波动无意义；后者是唯一一次实质跌幅但下一轮就回升 | 比上一轮（7-17）的 6 个跌幅点、97.3% 暴跌明显改善 |
+| cache_read 峰值 | 378,752（行 224423，末轮） | 比上一轮峰值 446K 低，但本轮持续到末轮还在攀升——节制回执让 cache 稳定累积而非被巨型 edit 回执冲垮 |
+| edit_file 邻近 cache_read 稳态 | 5 个抽样：use[27711]→235K / use[29588]→239K / use[31495]→252K / use[41620]→258K / use[50417]→262K | **edit_file 调用后 cache_read 不跌反涨**（235K→262K 持续累积），印证"瘦回执不击穿字节级缓存" |
+| request_size bytes | min 20K / 中位 975K / max 1.38MB | 中位 975K 比上一轮大，说明本轮会话更长更深，但 cache_read 峰值仍能爬到 378K——节制回执让 cache 在大请求体下仍能命中 |
+| 命中率粗算 cache_read/input | 中位 31105%（input 含大量首轮 system+tools 命中后的微调用，cache_read 远大于 input） | 命中率高，DeepSeek 字节级缓存持续生效 |
+
+**对比上一轮（7-17）的关键差异**：
+
+| 维度 | 7-17 那轮（节制回执未启用 / microcompact 跑了 1 次） | 7-18 本轮（节制回执已启用） |
+|---|---|---|
+| edit_file 回执含 originalFile | 部分（未实测但代码改动前必然含） | **0** |
+| microcompact 触发 | 1 次（chars_freed=639406） | **0 次**（节制回执让大 output 不再产生，microcompact 无用武之地） |
+| auto_compact 触发 | 2 次（removed=79/74） | **0 次** |
+| cache_read 暴跌点 | 6 个，最深 97.3% | **2 个，最深 50% 且立即回升** |
+| cache_read 峰值 | 446K 后暴跌 | 378K 持续攀升到末轮 |
+
+### 结论
+
+**第 19 条改动 DeepSeek 节制回执真机实测成功**——919 个 edit_file 回执全部节制（originalFile/structuredPatch/gitDiff 三字段 0 命中），cache_read 在 edit_file 调用后不跌反涨（235K→262K），全程零 auto_compact 零 microcompact 触发。这是第 19 条那次改动的正面验证。
+
+**剩余观察**：
+- write_file 回执本次没匹配到（跨批次 tool_use_id 关联未对齐），但 write_file 走同一套 `should_use_compact_receipt` + `Option` 字段逻辑，节制应同样生效——下次接手若要核实 write_file，需改分析脚本按 tool_use_id 全局关联而非局部 200 行窗口。
+- 第 21 条那条 read_file 防"读大文件击穿"还没动——本轮没有 read_file 触发的 cache 暴跌，但本轮场景是连续 edit_file（不是读大文件），第 21 条的真机验证仍欠样本。
