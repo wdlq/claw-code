@@ -679,6 +679,14 @@ claw 没这两道前置减压（micro-compact 还被 DISABLE 了），到 750K �
     - **结论**：claw read_file 当前是"整文件 slurp + 切片 + 行级 Snip"，Reasonix 是"流式 break + 2000 行硬封顶 + 行级 + 字符级双层 Snip + 二进制 peek 拒读"。**真正该抄的是门 1**（一行 const + fallback 改动），门 2/3 收益看场景，门 4 暂不做。下次接手若用户报"read 大文件击穿缓存"，先看 limit 是不是 None 走了 `lines.len()` 路径。
     - **与第 19 条的关系**：第 19 条改的是 edit_file/write_file **回执塞原文件**那条路；本条改的是 read_file **读进上下文**那条路。两条是不同的击穿路径，要分开治——前者已落地 DeepSeek 节制回执，后者还没动。
 
+    **★★ 2026-07-18 落地完成（门 1+2+3 全部抄完，门 4 暂不做）**：
+    - **门 1**：`file_ops.rs:14-20` 新增 `const READ_FILE_DEFAULT_LIMIT: usize = 2000`；`read_file` 里 `let max_lines = limit.unwrap_or(READ_FILE_DEFAULT_LIMIT)` —— limit=None 时不再 fallback 到 `lines.len()` 整文件
+    - **门 2**：`read_file` 改用 `io::BufReader::new(File::open(path))` + `reader.lines()` 流式扫描，收够 `max_lines` 即 `break`；删了 `fs::read_to_string` + `content.lines().collect()` 整 slurp。**代价**：触发 break 时 `total_lines` 只给"至少 start_at+max_lines+1"下界（不重扫余下文件省 IO），Reasonix `scan` 也是 break 即停同样语义。需要 `use std::io::BufRead` import（`file_ops.rs:4`）。
+    - **门 3**：`micro_compact.rs:27-52` `SnipStrategy` 加 `head_chars`/`tail_chars` 字段；`READ_ONLY_SNIP` / `SIDE_EFFECTING_SNIP` 都填 `head_chars: 12000, tail_chars: 2000`；`snip_tool_result` 调 `truncate_to_chars(&head_full, strategy.head_chars)` + 同 tail，新增 `truncate_to_chars` helper 按 UTF-8 字符边界切片（避免截半中文字符）
+    - **门 4**：暂不做（claw 资料库场景几乎不读二进制）
+    - **验证**：`cargo check --workspace` 干净（只剩 3 个预存 warning）；`cargo test -p runtime --lib file_ops` 13 passed 1 failed（唯一 FAILED 是第 20 条已记的 `glob_search_skips_common_heavy_directories` 预存债）；`cargo test -p runtime --lib micro_compact` 5 passed 1 failed（唯一 FAILED 是 `microcompact_clears_old_large_results_only`——**已用 `git stash` 核实是预存债**，stash 后原始代码同一测试同样 FAILED，与本次新增字段无关，测试源码行 442-443 已有预存债注释）
+    - **真机验证待做**：本次只编译+单元测试层验证。下次用户重编 `cargo build --release` 后真机跑一轮读大文件场景，看 `claw_request_size` 的 est_tokens 在 read_file 后是否被 2000 行硬封顶限住、`claw_microcompact` 触发时 `truncate_to_chars` 是否生效。
+
 ---
 
 ## ★★★ 2026-07-18 edit_file/write_file DeepSeek 节制回执真机实测（节制成功）
@@ -718,3 +726,76 @@ claw 没这两道前置减压（micro-compact 还被 DISABLE 了），到 750K �
 **剩余观察**：
 - write_file 回执本次没匹配到（跨批次 tool_use_id 关联未对齐），但 write_file 走同一套 `should_use_compact_receipt` + `Option` 字段逻辑，节制应同样生效——下次接手若要核实 write_file，需改分析脚本按 tool_use_id 全局关联而非局部 200 行窗口。
 - 第 21 条那条 read_file 防"读大文件击穿"还没动——本轮没有 read_file 触发的 cache 暴跌，但本轮场景是连续 edit_file（不是读大文件），第 21 条的真机验证仍欠样本。
+
+---
+
+## ★★★ 2026-07-18 第二次跑旧代码：auto-accumulated removed=185（正常长会话触发，非异常）
+
+### 实测数据（日志追加到 241265 行 / 88MB，07:34→09:49，追加 ~16841 行 / 4 轮 API 调用）
+
+**用户当时还没编译 read_file 三重门代码**，本次日志仍跑旧代码。
+
+**事件分布**（全日志 241265 行）：
+- claw_cache_diag=87 / claw_glm_diag=87 / claw_request_size=87 / Reranking=30
+- **claw_auto_compact=1**（仅在日志末尾触发一次）
+- **claw_microcompact=0**（全程没触发）
+
+**auto_compact 详情**：
+- 唯一一次：行 241264，t=1784339370，**removed=185**, threshold=750000
+- 这是今日日志末尾最后一条事件（09:49:30）
+- 对比早班轮次（07:34-09:08，83 轮，0 auto_compact）：晚班轮次多跑了 4 轮 API 调用（87 轮），累计会话超过 750K 阈值即触发
+
+**cache_read 在 auto_compact 前后的表现**（关键）：
+
+| 序号 | 时间 | cache_read | input | 备注 |
+|---|---|---|---|---|
+| #83 | t=1784339327 | 374,912 | 4,240 | 2414s 间隔后首轮 |
+| #84 | t=1784339338 | 379,264 | 1,302 | 恢复 |
+| #85 | t=1784339354 | 380,928 | **23,354** | input 暴涨（Reranking 大文件回执） |
+| #86 | t=1784339370 | **405,120** | 329 | **auto_compact 后——全日志峰值！** |
+
+**cache_read 跌幅点**：仍只有 2 个（-45.2% / -50.6%），和早班轮次完全一致——auto_compact 没造成额外 cache 暴跌。
+
+**request_size 末尾序列**：
+
+| 序号 | bytes | est_tokens | 备注 |
+|---|---|---|---|
+| #83 | 1,387,856 | 346,964 | |
+| #84 | 1,392,876 | 348,219 | |
+| #85 | 1,461,140 | 365,285 | input 暴涨（#85 cache_diag input=23354 对应这轮） |
+| #86 | 1,463,127 | 365,781 | 最后一条，低于 threshold=750K |
+
+### 分析结论
+
+**1. auto_compact removed=185 是正常长会话行为，不是异常**：
+- 晚班轮次比早班仅多跑了 4 轮 API 调用，累计会话从 ~83 轮增长到 ~87 轮就超过了 750K 阈值
+- 185 条消息被移除说明会话积累很深（这轮用户可能做了大量工具调用、多轮对话）
+- 对比早班轮次 0 auto_compact：早班结束时会话刚好没到阈值，晚班多跑几轮就到了
+
+**2. cache_read 在 auto_compact 后创新高（405K）**：
+- 证实了早班轮次 MEMORY 第 18 条的结论：**auto_compact 只击穿"用户会话内容"前缀，system+tools 前缀跨 compact 稳定**
+- cache_read=405K 是今日全日志最高值，出现在 auto_compact 之后——说明缓存没被 auto_compact 击穿
+
+**3. 曝光 Reranking 大文件回执问题**：
+- 新增行 226531 的 Reranking 事件显示一个 `text_retriever.py`（1281 行）被全文读入回执
+- 这是旧代码行为（read_file 没 limit 封顶），1281 行 < 2000 行所以新代码的门 1 也不会截，但如果是 5000 行的文件就会受 2000 行封顶限制
+- **用户还没编译新代码**，所以 read_file 三重门（门 1 2000 行封顶 + 门 2 流式 break + 门 3 字符级封顶）在这次日志中没生效
+
+**4. 新的认知：Reranking 工具回执也可能贡献大 input**：
+- 早班轮次分析的 cache_read 暴跌 97.3%（第 21 条）是 read_file 直接读文件，而本次 #85 cache_diag input=23354 的暴涨（对应 request_size bytes=1,461,140）可能是因为 Reranking 阶段把大文件回执又送了一遍
+- 这提示：**Reranking 阶段的工具回执重读也可能是 input 暴涨源**，但 claw 代码里 Reranking 是模型端的重排序，claw 侧无法控制
+- 本次没因这个 input 暴涨造成 cache 暴跌（cache_read 稳步从 380K→405K），说明 system+tools 前缀的缓存命中率足够高来吸收 Reranking 的开销
+
+### 对比关键数字
+
+| 维度 | 7-18 早班（83 轮） | 7-18 晚班（87 轮，追加） |
+|---|---|---|
+| auto_compact 触发 | 0 次 | 1 次（removed=185） |
+| microcompact 触发 | 0 次 | 0 次 |
+| cache_read 峰值 | 378,752 | **405,120**（auto_compact 后创新高） |
+| cache_read 跌幅点 >30% | 2 个（-45% / -50%） | 2 个（同，无新增） |
+| request_size 末值 | 1,387,357 / 346,839 | 1,463,127 / 365,781 |
+
+### 判断
+
+**没有新发现需急修**。removed=185 是正常的 auto-accumulated 会话触发，cache_read 没被击穿。第 21 条 read_file 三重门改动（已 `cargo check` + `cargo test` 通过）用户"还没编译"——等用户下次真机跑一轮 read_file 三重门编译版后，再对比 `claw_request_size` 的 est_tokens 在 read_file 后是否被 2000 行硬封顶限住。本次无新增 MEMORY 条目，仅记录此分析结论。

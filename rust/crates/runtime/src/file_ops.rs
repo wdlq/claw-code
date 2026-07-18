@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::fs;
-use std::io;
+use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -12,6 +12,13 @@ use walkdir::{DirEntry, WalkDir};
 
 /// Maximum file size that can be read (10 MB).
 const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Default line limit when `read_file` is called without an explicit `limit`
+/// (对齐 Reasonix `readfile.go:45 readFileDefaultLimit = 2000`).
+/// Prevents slurping an entire file into the tool result when the model omits
+/// `limit` — a 50 MB text file would otherwise enter context verbatim and
+/// thrash DeepSeek's byte-level cache (MEMORY 第 21 条门 1).
+const READ_FILE_DEFAULT_LIMIT: usize = 2000;
 
 /// Maximum file size that can be written (10 MB).
 const MAX_WRITE_SIZE: usize = 10 * 1024 * 1024;
@@ -300,6 +307,12 @@ pub struct GrepSearchOutput {
 }
 
 /// Reads a text file and returns a line-windowed payload.
+///
+/// **2026-07-18 对齐 Reasonix 三重门**（落地 MEMORY 第 21 条）：
+/// - 门 1：`limit=None` 时 fallback 到 `READ_FILE_DEFAULT_LIMIT = 2000` 而非整文件行数
+///   （对齐 Reasonix `readfile.go:45 readFileDefaultLimit = 2000`）
+/// - 门 2：用 `BufReader::lines()` 流式扫描遇 cap 即 `break`，不再 `fs::read_to_string` 整文件 slurp
+///   （对齐 Reasonix `scan` 函数 `readfile.go:212-254`，遇 limit 即停不读余下文件）
 pub fn read_file(
     path: &str,
     offset: Option<usize>,
@@ -328,13 +341,56 @@ pub fn read_file(
         ));
     }
 
-    let content = fs::read_to_string(&absolute_path)?;
-    let lines: Vec<&str> = content.lines().collect();
-    let start_index = offset.unwrap_or(0).min(lines.len());
-    let end_index = limit.map_or(lines.len(), |limit| {
-        start_index.saturating_add(limit).min(lines.len())
-    });
-    let selected = lines[start_index..end_index].join("\n");
+    // 门 1：limit=None 时 fallback 到 READ_FILE_DEFAULT_LIMIT 而非整文件所有行
+    // （对齐 Reasonix readFileDefaultLimit = 2000，防止模型不传 limit 就 slurp 整文件）
+    let start_at = offset.unwrap_or(0);
+    let max_lines = limit.unwrap_or(READ_FILE_DEFAULT_LIMIT);
+
+    // 门 2：流式扫描遇 cap 即 break，不再 fs::read_to_string 整文件 slurp
+    // （对齐 Reasonix scan 函数，50MB 文件也只读够 offset+limit 行就停）
+    let file = fs::File::open(&absolute_path)?;
+    let reader = io::BufReader::new(file);
+    let mut collected: Vec<String> = Vec::new();
+    let mut total_lines: usize = 0;
+    let mut has_more: bool = false;
+    for line in reader.lines() {
+        let line = line?;
+        total_lines += 1;
+        if total_lines <= start_at {
+            continue;
+        }
+        if collected.len() < max_lines {
+            collected.push(line);
+            continue;
+        }
+        // 已收够 max_lines 行 → 立即 break，不读余下文件（对齐 Reasonix scan 的 break）
+        has_more = true;
+        break;
+    }
+    // break 时 total_lines 是已读行数下界；不重扫余下文件省 IO。
+    // Reasonix scan 也是 break 即停，total_lines 给"至少"语义而非精确值——
+    // 调用方看到 total_lines = start_at + max_lines + 1 应推断"文件更长需分页"。
+    // 当前 ReadFileOutput 没 has_more 字段，保留原 total_lines 语义的最小破坏：
+    // has_more 时给 total_lines = start_at + max_lines + 1（"至少"提示），
+    // 没触发 break 时 total_lines 已是精确值。
+    if has_more {
+        total_lines = start_at.saturating_add(max_lines).saturating_add(1);
+    }
+
+    let start_index = start_at;
+    let end_index = start_index.saturating_add(collected.len()).min(total_lines);
+    // 门 2 配套 trailer：触发 break 时追加续读提示，对齐 Reasonix readfile.go:251-253
+    // —— 告诉模型文件更长 + 下一次该传的 offset 值，避免模型盲目翻页浪费轮次。
+    let selected = if has_more {
+        let next_offset = start_index.saturating_add(collected.len());
+        format!(
+            "{}\n\n[more lines below; pass offset={} to continue]\n",
+            collected.join("\n"),
+            next_offset,
+        )
+    } else {
+        collected.join("\n")
+    };
 
     Ok(ReadFileOutput {
         kind: String::from("text"),
@@ -343,7 +399,7 @@ pub fn read_file(
             content: selected,
             num_lines: end_index.saturating_sub(start_index),
             start_line: start_index.saturating_add(1),
-            total_lines: lines.len(),
+            total_lines,
         },
     })
 }

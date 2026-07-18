@@ -22,18 +22,37 @@ pub const CLEARED_PLACEHOLDER: &str = "[Old tool result content cleared]";
 /// 比 CLEARED_PLACEHOLDER 强：保留头尾行，头部字节稳定→DeepSeek 缓存能命中到头部结束位置。
 const SNIPPED_MARKER: &str = "[snipped tool result — ";
 
-/// Snip 截短策略：按工具类型分级保留头尾行数（对齐 Reasonix prune.go:186-188）。
+/// Snip 截短策略：按工具类型分级保留头尾行数 + 字符级封顶（对齐 Reasonix prune.go:186-188 + readfile.go:70-72 SnipHint）。
 /// 只读工具（read_file/grep）头部是答案，保长头短尾；副作用工具（bash）头尾都可能有关键信息，保均等头尾。
+/// **2026-07-18 字符级封顶**（落地 MEMORY 第 21 条门 3）：加 `head_chars`/`tail_chars` 字段，
+/// 对齐 Reasonix `SnipHint{HeadChars:12000, TailChars:2000}`——一个超长行（minified JS 一行 50KB）
+/// 能冲垮行级封顶，字符级封顶兜底。
 struct SnipStrategy {
     head: usize,
     tail: usize,
+    /// 头部保留的字符上限（按 Reasonix 12000 对齐）。超出则按字符截短头部。
+    head_chars: usize,
+    /// 尾部保留的字符上限（按 Reasonix 2000 对齐）。超出则按字符截短尾部。
+    tail_chars: usize,
 }
 
-/// 只读工具默认策略：保留前 80 行 + 后 12 行（对齐 Reasonix defaultReadOnlySnip）。
-const READ_ONLY_SNIP: SnipStrategy = SnipStrategy { head: 80, tail: 12 };
+/// 只读工具默认策略：保留前 80 行 + 后 12 行，字符级 12000/2000
+/// （对齐 Reasonix defaultReadOnlySnip + readfile.go:71 SnipHint）。
+const READ_ONLY_SNIP: SnipStrategy = SnipStrategy {
+    head: 80,
+    tail: 12,
+    head_chars: 12000,
+    tail_chars: 2000,
+};
 
-/// 副作用工具默认策略：保留前 40 行 + 后 40 行（对齐 Reasonix defaultSideEffectingSnip）。
-const SIDE_EFFECTING_SNIP: SnipStrategy = SnipStrategy { head: 40, tail: 40 };
+/// 副作用工具默认策略：保留前 40 行 + 后 40 行，字符级 12000/2000
+/// （对齐 Reasonix defaultSideEffectingSnip；字符级同只读工具——Reasonix 各工具 SnipHint 字符级差异不大）。
+const SIDE_EFFECTING_SNIP: SnipStrategy = SnipStrategy {
+    head: 40,
+    tail: 40,
+    head_chars: 12000,
+    tail_chars: 2000,
+};
 
 /// 按工具名判定 Snip 策略：副作用工具（bash/PowerShell/write_file/edit_file/search_replace）用均等头尾，
 /// 其他只读工具（read_file/grep/glob/list_directory/WebFetch/WebSearch）用长头短尾。
@@ -48,6 +67,12 @@ fn snip_strategy_for(tool_name: &str) -> &'static SnipStrategy {
 
 /// Snip 截短 tool_result：保留头 N 行 + 尾 M 行，中间塞 `[... N lines omitted ...]` 标记。
 /// 头部字节稳定→DeepSeek 缓存能命中到头部结束位置，只 miss 中间被截的部分（对齐 Reasonix snipToolResult）。
+///
+/// **2026-07-18 字符级封顶**（落地 MEMORY 第 21 条门 3）：行级封顶之上再叠字符级封顶，
+/// 对齐 Reasonix `readfile.go:71 SnipHint{HeadChars:12000, TailChars:2000}`——
+/// 一个超长行（minified JS 一行 50KB）能冲垮行级封顶，字符级封顶兜底：
+/// 头部行数够但总字符超 `head_chars` → 按 `tail_chars` 量级再截短头部
+/// 尾部同理。截短时按字符切片保尾（避免截半 multi-byte 中文字符——`floor_char_boundary` 兜底）。
 fn snip_tool_result(content: &str, tool_name: &str) -> String {
     let strategy = snip_strategy_for(tool_name);
     let lines: Vec<&str> = content.lines().collect();
@@ -55,8 +80,11 @@ fn snip_tool_result(content: &str, tool_name: &str) -> String {
     if lines.len() <= strategy.head + strategy.tail {
         return content.to_string();
     }
-    let head = lines[..strategy.head].join("\n");
-    let tail = lines[lines.len() - strategy.tail..].join("\n");
+    let head_full = lines[..strategy.head].join("\n");
+    let tail_full = lines[lines.len() - strategy.tail..].join("\n");
+    // 字符级封顶：超 head_chars/tail_chars 则按字符再截（对齐 Reasonix SnipHint.HeadChars/TailChars）
+    let head = truncate_to_chars(&head_full, strategy.head_chars);
+    let tail = truncate_to_chars(&tail_full, strategy.tail_chars);
     let omitted = lines.len() - strategy.head - strategy.tail;
     format!(
         "{snipped}{name}, {orig} bytes; showing first {head} lines and last {tail} lines]\n{head_lines}\n[... {omitted} lines omitted ...]\n{tail_lines}",
@@ -69,6 +97,24 @@ fn snip_tool_result(content: &str, tool_name: &str) -> String {
         omitted = omitted,
         tail_lines = tail,
     )
+}
+
+/// 按 `max_chars` 截短字符串：超则取前 `max_chars` 字符并按 UTF-8 字符边界对齐，
+/// 不超则原样返回。对齐 Reasonix 字符级封顶语义——防止超长行冲垮行级封顶。
+/// 用 `floor_char_boundary` 兜底避免截半 multi-byte 中文字符。
+fn truncate_to_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    // 取前 max_chars 个字符（按 char_indices 找字节位）
+    let mut byte_end = s.len();
+    for (i, (byte_idx, _)) in s.char_indices().enumerate() {
+        if i == max_chars {
+            byte_end = byte_idx;
+            break;
+        }
+    }
+    s[..byte_end].to_string()
 }
 
 /// Tool names whose results are eligible for micro-compact.

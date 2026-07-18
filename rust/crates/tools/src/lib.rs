@@ -419,7 +419,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_file",
-            description: "Read a text file from the workspace.",
+            description: "Read a text file with optional line offset/limit. Output prefixes each line with its 1-based number so subsequent edit_file calls can target exact lines. When the file has more lines than returned, a trailer tells you the next offset to pass to continue paging. For large log/txt files (>10K lines), prefer grep_search to locate relevant content first; use read_file only for targeted pagination of known regions to avoid wasting turns on blind paging.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
