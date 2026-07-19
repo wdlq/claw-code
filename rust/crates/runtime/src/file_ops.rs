@@ -211,14 +211,16 @@ pub struct WriteFileOutput {
     pub git_diff: Option<serde_json::Value>,
 }
 
-/// 抽 `ANTHROPIC_MODEL` env 前缀判定回执节制策略。
-/// `deepseek` 开头 → true（节制，对齐 Reasonix）；`glm` 开头或未设 → false（保持原回执）。
-/// 在 runtime crate 内独立判断，不依赖 api crate（避免循环依赖）。
-fn should_use_compact_receipt() -> bool {
-    std::env::var("ANTHROPIC_MODEL")
-        .ok()
-        .map(|v| v.trim().to_lowercase().starts_with("deepseek"))
-        .unwrap_or(false)
+/// **2026-07-19 multiprovider 落地**：按**当前调度的 model 名前缀**判定回执节制策略，
+/// 不再读全局 `ANTHROPIC_MODEL` env。对照 `docs/multiprovider.md` 3.4bis 节。
+///
+/// - `deepseek` 开头 → `true`（节制，对齐 Reasonix `editfile.go`/`writefile.go`）
+/// - 其他（含 `glm` 开头、未设、空串）→ `false`（保持原回执）
+///
+/// 由工具 dispatch 层（主 LLM 路径从 `ANTHROPIC_MODEL` env、子 agent 路径从
+/// `ResolvedSubagentProvider.model`）算好布尔值，传给 `edit_file`/`write_file`。
+pub fn should_use_compact_receipt(model: &str) -> bool {
+    model.trim().to_lowercase().starts_with("deepseek")
 }
 
 /// Output envelope for targeted string-replacement edits.
@@ -405,7 +407,16 @@ pub fn read_file(
 }
 
 /// Replaces a file's contents and returns patch metadata.
-pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
+///
+/// **2026-07-19 multiprovider 落地**：新增 `compact_receipt: bool` 参数，由工具 dispatch 层
+/// 按**当前调度的 model 名**（`should_use_compact_receipt(model)`）算好传进来。file_ops 内部
+/// 不再读全局 `ANTHROPIC_MODEL` env，确保主 LLM / 子 agent 路径各自按自己的 model 判定。
+/// 对照 `docs/multiprovider.md` 3.4bis 节选项 A。
+pub fn write_file(
+    path: &str,
+    content: &str,
+    compact_receipt: bool,
+) -> io::Result<WriteFileOutput> {
     if content.len() > MAX_WRITE_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -433,7 +444,8 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
     // 2026-07-17 DeepSeek 节制回执：DeepSeek 后端走 None 路径省掉 original_file + structured_patch
     // （对齐 Reasonix writefile.go 只回 "wrote <path>" + 行数摘要的设计）。
     // GLM 后端保持原回执（GLM 容忍大回执且无字节级缓存击穿风险）。
-    let compact = should_use_compact_receipt();
+    // **2026-07-19 multiprovider**：compact_receipt 由 dispatch 层按 model 算好传入。
+    let compact = compact_receipt;
     let original_file_output = if compact {
         None
     } else {
@@ -462,11 +474,17 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
 }
 
 /// Performs an in-file string replacement and returns patch metadata.
+///
+/// **2026-07-19 multiprovider 落地**：新增 `compact_receipt: bool` 参数，由工具 dispatch 层
+/// 按**当前调度的 model 名**（`should_use_compact_receipt(model)`）算好传进来。file_ops 内部
+/// 不再读全局 `ANTHROPIC_MODEL` env，确保主 LLM / 子 agent 路径各自按自己的 model 判定。
+/// 对照 `docs/multiprovider.md` 3.4bis 节选项 A。
 pub fn edit_file(
     path: &str,
     old_string: &str,
     new_string: &str,
     replace_all: bool,
+    compact_receipt: bool,
 ) -> io::Result<EditFileOutput> {
     let absolute_path = normalize_path(path)?;
     let original_file = fs::read_to_string(&absolute_path)?;
@@ -519,7 +537,8 @@ pub fn edit_file(
     // 2026-07-17 DeepSeek 节制回执：DeepSeek 后端走 None 路径省掉 original_file + structured_patch
     // （对齐 Reasonix editfile.go 只回 "edited <path>" + receipt 的设计，不塞原文件让模型 verify diff）。
     // GLM 后端保持原回执（GLM 容忍大回执且无字节级缓存击穿风险）。
-    let compact = should_use_compact_receipt();
+    // **2026-07-19 multiprovider**：compact_receipt 由 dispatch 层按 model 算好传入。
+    let compact = compact_receipt;
     let original_file_output = if compact {
         None
     } else if is_large_file {
@@ -1207,8 +1226,9 @@ pub fn write_file_in_workspace(
     path: &str,
     content: &str,
     workspace_root: &Path,
+    compact_receipt: bool,
 ) -> io::Result<WriteFileOutput> {
-    write_file_in_workspace_with_allowed(path, content, workspace_root, &[])
+    write_file_in_workspace_with_allowed(path, content, workspace_root, &[], compact_receipt)
 }
 
 /// Write a file with workspace boundary enforcement, honouring allowed
@@ -1218,11 +1238,12 @@ pub fn write_file_in_workspace_with_allowed(
     content: &str,
     workspace_root: &Path,
     allowed: &[String],
+    compact_receipt: bool,
 ) -> io::Result<WriteFileOutput> {
     let absolute_path = normalize_path_allow_missing(path)?;
     let canonical_root = canonicalize_workspace_root(workspace_root);
     validate_workspace_boundary_with_allowed(&absolute_path, &canonical_root, allowed)?;
-    write_file(path, content)
+    write_file(path, content, compact_receipt)
 }
 
 /// Edit a file with workspace boundary enforcement.
@@ -1233,6 +1254,7 @@ pub fn edit_file_in_workspace(
     new_string: &str,
     replace_all: bool,
     workspace_root: &Path,
+    compact_receipt: bool,
 ) -> io::Result<EditFileOutput> {
     edit_file_in_workspace_with_allowed(
         path,
@@ -1241,6 +1263,7 @@ pub fn edit_file_in_workspace(
         replace_all,
         workspace_root,
         &[],
+        compact_receipt,
     )
 }
 
@@ -1253,11 +1276,12 @@ pub fn edit_file_in_workspace_with_allowed(
     replace_all: bool,
     workspace_root: &Path,
     allowed: &[String],
+    compact_receipt: bool,
 ) -> io::Result<EditFileOutput> {
     let absolute_path = normalize_path(path)?;
     let canonical_root = canonicalize_workspace_root(workspace_root);
     validate_workspace_boundary_with_allowed(&absolute_path, &canonical_root, allowed)?;
-    edit_file(path, old_string, new_string, replace_all)
+    edit_file(path, old_string, new_string, replace_all, compact_receipt)
 }
 
 /// Expand a glob pattern with workspace boundary enforcement.
@@ -1358,7 +1382,7 @@ mod tests {
     #[test]
     fn reads_and_writes_files() {
         let path = temp_path("read-write.txt");
-        let write_output = write_file(path.to_string_lossy().as_ref(), "one\ntwo\nthree")
+        let write_output = write_file(path.to_string_lossy().as_ref(), "one\ntwo\nthree", false)
             .expect("write should succeed");
         assert_eq!(write_output.kind, "create");
 
@@ -1370,9 +1394,9 @@ mod tests {
     #[test]
     fn edits_file_contents() {
         let path = temp_path("edit.txt");
-        write_file(path.to_string_lossy().as_ref(), "alpha beta alpha")
+        write_file(path.to_string_lossy().as_ref(), "alpha beta alpha", false)
             .expect("initial write should succeed");
-        let output = edit_file(path.to_string_lossy().as_ref(), "alpha", "omega", true)
+        let output = edit_file(path.to_string_lossy().as_ref(), "alpha", "omega", true, false)
             .expect("edit should succeed");
         assert!(output.replace_all);
     }
@@ -1392,7 +1416,7 @@ mod tests {
     fn rejects_oversized_writes() {
         let path = temp_path("oversize-write.txt");
         let huge = "x".repeat(MAX_WRITE_SIZE + 1);
-        let result = write_file(path.to_string_lossy().as_ref(), &huge);
+        let result = write_file(path.to_string_lossy().as_ref(), &huge, false);
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
@@ -1404,7 +1428,7 @@ mod tests {
         let workspace = temp_path("workspace-boundary");
         std::fs::create_dir_all(&workspace).expect("workspace dir should be created");
         let inside = workspace.join("inside.txt");
-        write_file(inside.to_string_lossy().as_ref(), "safe content")
+        write_file(inside.to_string_lossy().as_ref(), "safe content", false)
             .expect("write inside workspace should succeed");
 
         // Reading inside workspace should succeed
@@ -1414,7 +1438,7 @@ mod tests {
 
         // Reading outside workspace should fail
         let outside = temp_path("outside-boundary.txt");
-        write_file(outside.to_string_lossy().as_ref(), "unsafe content")
+        write_file(outside.to_string_lossy().as_ref(), "unsafe content", false)
             .expect("write outside should succeed");
         let result =
             read_file_in_workspace(outside.to_string_lossy().as_ref(), None, None, &workspace);
@@ -1514,6 +1538,7 @@ mod tests {
         write_file(
             file.to_string_lossy().as_ref(),
             "fn main() {\n println!(\"hello\");\n}\n",
+            false,
         )
         .expect("file write should succeed");
 

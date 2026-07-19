@@ -23,7 +23,7 @@ use runtime::{
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
-    write_file_in_workspace_with_allowed, ApiClient, ApiRequest, AssistantEvent, BashCommandInput,
+    should_use_compact_receipt, write_file_in_workspace_with_allowed, ApiClient, ApiRequest, AssistantEvent, BashCommandInput,
     BashCommandOutput, BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage,
     ConversationRuntime, GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
     LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole,
@@ -1228,14 +1228,21 @@ fn execute_tool_with_enforcer(
             let required_mode = classify_file_path_permission(&file_input.path, true);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
             let allowed = allowed_external_paths(enforcer, name);
-            run_write_file_with_allowed(file_input, &allowed)
+            // **2026-07-19 multiprovider**：按当前调度的 model 名判定节制策略。
+            // 子 agent 路径走 thread-local（`set_subagent_model` 设的 resolved model），
+            // 主 LLM 路径回退到 `ANTHROPIC_MODEL` env。对照 `docs/multiprovider.md` 3.4bis 节选项 A。
+            let model = current_dispatch_model();
+            let compact_receipt = should_use_compact_receipt(&model);
+            run_write_file_with_allowed(file_input, &allowed, compact_receipt)
         }
         "edit_file" => {
             let file_input: EditFileInput = from_value(input)?;
             let required_mode = classify_file_path_permission(&file_input.path, false);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
             let allowed = allowed_external_paths(enforcer, name);
-            run_edit_file_with_allowed(file_input, &allowed)
+            let model = current_dispatch_model();
+            let compact_receipt = should_use_compact_receipt(&model);
+            run_edit_file_with_allowed(file_input, &allowed, compact_receipt)
         }
         "glob_search" => {
             let glob_input: GlobSearchInputValue = from_value(input)?;
@@ -2143,16 +2150,27 @@ fn run_read_file_with_allowed(input: ReadFileInput, allowed: &[String]) -> Resul
 fn run_write_file_with_allowed(
     input: WriteFileInput,
     allowed: &[String],
+    compact_receipt: bool,
 ) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     to_pretty_json(
-        write_file_in_workspace_with_allowed(&input.path, &input.content, &workspace, allowed)
-            .map_err(io_to_string)?,
+        write_file_in_workspace_with_allowed(
+            &input.path,
+            &input.content,
+            &workspace,
+            allowed,
+            compact_receipt,
+        )
+        .map_err(io_to_string)?,
     )
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_edit_file_with_allowed(input: EditFileInput, allowed: &[String]) -> Result<String, String> {
+fn run_edit_file_with_allowed(
+    input: EditFileInput,
+    allowed: &[String],
+    compact_receipt: bool,
+) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     to_pretty_json(
         edit_file_in_workspace_with_allowed(
@@ -2162,6 +2180,7 @@ fn run_edit_file_with_allowed(input: EditFileInput, allowed: &[String]) -> Resul
             input.replace_all.unwrap_or(false),
             &workspace,
             allowed,
+            compact_receipt,
         )
         .map_err(io_to_string)?,
     )
@@ -3787,6 +3806,10 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
 
 fn run_agent_job(job: &AgentJob) -> Result<(), String> {
     let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
+    // **2026-07-19 multiprovider 落地**：把子 agent 的 resolved model 注入 thread-local，
+    // dispatch 层的 `current_dispatch_model()` 优先读 thread-local 算 `compact_receipt`。
+    // 对照 `docs/multiprovider.md` 3.4bis 节选项 A。
+    set_subagent_model(&job.manifest.model.clone().unwrap_or_default());
     let summary = runtime
         .run_turn(job.prompt.clone(), None)
         .map_err(|error| error.to_string())?;
@@ -3803,7 +3826,23 @@ fn build_agent_runtime(
         .clone()
         .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
     let allowed_tools = job.allowed_tools.clone();
-    let api_client = ProviderRuntimeClient::new(model.clone(), allowed_tools.clone())?;
+
+    // **2026-07-19 multiprovider 落地**：按 subagent_type 路由子 agent provider。
+    // 对照 `docs/multiprovider.md` 3.4 节，对齐 Reasonix resolveSubagentProvider。
+    // routing 为空 → resolve_subagent_provider 返回 fallback (base_url=None, auth=None)
+    //   → new_with_resolved 走 build_provider_entry_with_override(...,None,None)
+    //   → 等价原 from_model / from_env 主 env 路径（保持向后兼容）
+    let routing = load_subagent_provider_routing();
+    let subagent_type = job
+        .manifest
+        .subagent_type
+        .as_deref()
+        .unwrap_or("general-purpose");
+    let resolved = resolve_subagent_provider(subagent_type, Some(&model), &routing);
+    let api_client = ProviderRuntimeClient::new_with_resolved(&resolved, allowed_tools.clone())?;
+    // 用 resolved.model（可能是 routing 配的 model）算 context window，
+    // 而不是 job 的 model（那是主 LLM 的 model 名）
+    let resolved_model = &resolved.model;
     let permission_policy = agent_permission_policy();
     let tool_executor = SubagentToolExecutor::new(allowed_tools)
         .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
@@ -3816,8 +3855,13 @@ fn build_agent_runtime(
     );
     // 二期-C1：按模型上下文窗口动态算auto-compact阈值。
     // DeepSeek V4 Pro 1M窗口→750K才压，几乎不触发，前缀稳定→DeepSeek硬盘缓存命中。
-    if let Some(limit) = api::model_token_limit(&model) {
-        runtime = runtime.with_model_context_window(limit.context_window_tokens);
+    // **2026-07-19 multiprovider 落地**：子 agent 走 strict 变体——阈值严格按自己 model 算，
+    // 不读主 LLM 那套全局 env（`CLAUDE_CODE_AUTO_COMPACT_WINDOW` 等）。否则主子不同窗口时会破裂：
+    // 主=DeepSeek 1M + 子=GLM 200K，主那套 env 设的 131K 阈值会误压到子 agent 反伤缓存；
+    // 反过来主=GLM + 子=DeepSeek 1M，子 agent 拿 131K 阈值撑爆 200K GLM 报 ContextWindowExceeded。
+    // 对照 `docs/multiprovider.md` 3.4ter 节。
+    if let Some(limit) = api::model_token_limit(resolved_model) {
+        runtime = runtime.with_model_context_window_strict(limit.context_window_tokens);
     }
     Ok(runtime)
 }
@@ -4725,12 +4769,40 @@ struct ProviderRuntimeClient {
 }
 
 impl ProviderRuntimeClient {
+    /// 主 env 路径构造（无子 agent provider override）。multiprovider 落地后主 LLM
+    /// 路径改走 `new_with_resolved`，本函数仅 fallback 链 + 测试 target 调用。
+    #[allow(dead_code)]
     #[allow(clippy::needless_pass_by_value)]
     fn new(model: String, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
         let fallback_config = load_provider_fallback_config();
         Self::new_with_fallback_config(model, allowed_tools, &fallback_config)
     }
 
+    /// **2026-07-19 multiprovider 落地**：用 `ResolvedSubagentProvider` 构造客户端。
+    /// 对照 `docs/multiprovider.md` 3.4 节。
+    ///
+    /// `resolved.base_url = None` 且 `resolved.auth = None` → 走原 `new` 路径（主 env）。
+    /// 否则调 `build_provider_entry_with_override` 注入独立 base_url + auth。
+    /// fallback 链不动（主 LLM 故障转移链，子 agent 不参与）。
+    fn new_with_resolved(
+        resolved: &ResolvedSubagentProvider,
+        allowed_tools: BTreeSet<String>,
+    ) -> Result<Self, String> {
+        let primary = build_provider_entry_with_override(
+            &resolved.model,
+            resolved.base_url.as_deref(),
+            resolved.auth.as_ref(),
+        )?;
+        Ok(Self {
+            runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
+            chain: vec![primary],
+            allowed_tools,
+            cache_config: api::CacheConfig::from_env(),
+        })
+    }
+
+    /// 带 fallback 链构造（主 env 路径）。multiprovider 落地后仅测试 target 调用。
+    #[allow(dead_code)]
     #[allow(clippy::needless_pass_by_value)]
     fn new_with_fallback_config(
         model: String,
@@ -4759,6 +4831,8 @@ impl ProviderRuntimeClient {
     }
 }
 
+/// 主 env 路径用（无 override）。multiprovider 落地后仅 `new_with_fallback_config` 链 + 测试 target 调用。
+#[allow(dead_code)]
 fn build_provider_entry(model: &str) -> Result<ProviderEntry, String> {
     let resolved = resolve_model_alias(model).clone();
     let client = ProviderClient::from_model(&resolved).map_err(|error| error.to_string())?;
@@ -4768,6 +4842,151 @@ fn build_provider_entry(model: &str) -> Result<ProviderEntry, String> {
     })
 }
 
+/// **2026-07-19 multiprovider 落地**：构建带 `base_url` / `auth` 覆盖的 `ProviderEntry`。
+/// 对照 `docs/multiprovider.md` 3.4 节 `build_provider_entry_with_override`。
+///
+/// - `auth = Some(...)` → 注入子 agent 的独立 auth（`AuthSource::ApiKey`），绕过 env
+/// - `auth = None` → 走 `from_env()`（保持主 LLM env 路径）
+/// - `base_url = Some(...)` → 调 `AnthropicClient::with_base_url` 覆盖 endpoint
+///
+/// 复用 api 层的 `from_model_with_anthropic_auth` 钩子，本函数零改动 api crate。
+fn build_provider_entry_with_override(
+    model: &str,
+    base_url: Option<&str>,
+    auth: Option<&api::AuthSource>,
+) -> Result<ProviderEntry, String> {
+    let resolved = resolve_model_alias(model).clone();
+    let mut client = ProviderClient::from_model_with_anthropic_auth(&resolved, auth.cloned())
+        .map_err(|error| error.to_string())?;
+    if let Some(url) = base_url {
+        if let ProviderClient::Anthropic(ref mut c) = client {
+            *c = c.clone().with_base_url(url.to_string());
+        }
+        // OpenAi/Xai 路径未实现 with_base_url，本期 fallback 到 from_env 的默认 url
+    }
+    Ok(ProviderEntry {
+        model: resolved,
+        client,
+    })
+}
+
+// **2026-07-19 multiprovider 落地**：子 agent 路径的 model 名通过 thread-local 传到工具 dispatch 层。
+//
+// 子 agent 在独立线程跑（`spawn_agent_job`），其 resolved model 名与主 LLM 不同。
+// dispatch 层的 `execute_tool_with_enforcer` 是主 LLM / 子 agent 共用入口，无法从参数拿到 model。
+// 用 thread-local 在 `run_agent_job` 入口设置子 agent 的 model 名，dispatch 层优先读 thread-local，
+// 回退到 `ANTHROPIC_MODEL` env（主 LLM 路径）。对照 `docs/multiprovider.md` 3.4bis 节选项 A。
+thread_local! {
+    static SUBAGENT_MODEL: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// **2026-07-19 multiprovider 落地**：在子 agent 线程入口设置 thread-local model 名。
+/// 由 `run_agent_job` 调用，传入 `ResolvedSubagentProvider.model`。
+pub fn set_subagent_model(model: &str) {
+    SUBAGENT_MODEL.with(|cell| {
+        *cell.borrow_mut() = Some(model.to_string());
+    });
+}
+
+/// **2026-07-19 multiprovider 落地**：测试用——清空 thread-local model 名，防止测试间污染。
+pub fn clear_subagent_model() {
+    SUBAGENT_MODEL.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+}
+
+/// **2026-07-19 multiprovider 落地**：dispatch 层调此函数拿"当前调度的 model 名"算 `compact_receipt`。
+/// 优先读 thread-local（子 agent 路径），回退到 `ANTHROPIC_MODEL` env（主 LLM 路径）。
+fn current_dispatch_model() -> String {
+    SUBAGENT_MODEL
+        .with(|cell| cell.borrow().clone())
+        .unwrap_or_else(|| std::env::var("ANTHROPIC_MODEL").unwrap_or_default())
+}
+
+struct ResolvedSubagentProvider {
+    /// 用于节制回执判定的 model 名（决定 should_use_compact_receipt）
+    model: String,
+    /// 覆盖主 env 的 endpoint；`None` 表示走主 env
+    base_url: Option<String>,
+    /// 覆盖主 env 的 auth；`None` 表示走 `AuthSource::from_env`
+    auth: Option<api::AuthSource>,
+}
+
+/// **2026-07-19 multiprovider 落地**：按 `subagent_type` 路由子 agent 的 provider 配置。
+/// 对照 `docs/multiprovider.md` 3.4 节 `resolve_subagent_provider`，对齐 Reasonix
+/// `parallel_tasks.go:342 resolveSubagentProvider` 的 resolver-then-fallback 形态。
+///
+/// 1. 优先查 `routing.by_type[subagent_type]` —— 显式 per-type 配置
+/// 2. 次查 `routing.default` —— 兜底默认
+/// 3. 都没 → 返回 fallback（`base_url: None` + `auth: None`），调用方走主 env 路径
+///
+/// **2026-07-19 auth 头分支修正**：按 `cfg.auth_kind` 选 `AuthSource` 分支——
+/// `"bearer"` → `AuthSource::BearerToken` → `Authorization: Bearer` 头（GLM 网关要这个）；
+/// `"api_key"` / 空 → `AuthSource::ApiKey` → `x-api-key` 头（Anthropic 原生 + DeepSeek 兼容端）。
+/// multiprovider 落地初版硬绑 ApiKey 分支报 403 `Authentication failed`——GLM 网关只认 Bearer 不认 x-api-key。
+/// 对照 `docs/multiprovider.md` 3.4quinquies 节。
+fn resolve_subagent_provider(
+    subagent_type: &str,
+    input_model: Option<&str>,
+    routing: &runtime::SubagentProviderRouting,
+) -> ResolvedSubagentProvider {
+    // ★ 2026-07-19 model 覆盖修正：routing 配了就用 `cfg.model`，不让 `input_model` 覆盖。
+    // `input_model` 来自 `execute_agent` 的 `resolve_agent_model(input.model.as_deref())`——
+    // 主 LLM 派活时 `AgentInput.model` 字段通常没传，`resolve_agent_model(None)` 返
+    // `DEFAULT_AGENT_MODEL`=`claude-opus-4-6` 兜底值。若让这个兜底值覆盖 `cfg.model`，
+    // 子 agent 拿 `claude-opus-4-6` 调 GLM endpoint，GLM 网关拒识报 403
+    // `当前访问模型不存在或者模型名称错误`。`input_model` 只在 fallback 分支（routing 都没配）才用。
+    // 对照 `docs/multiprovider.md` 3.4sexies 节。
+    if let Some(cfg) = routing.by_type.get(subagent_type) {
+        return ResolvedSubagentProvider {
+            model: cfg.model.clone(),
+            base_url: Some(cfg.base_url.clone()),
+            auth: Some(resolve_auth_source(&cfg)),
+        };
+    }
+    if let Some(cfg) = &routing.default {
+        return ResolvedSubagentProvider {
+            model: cfg.model.clone(),
+            base_url: Some(cfg.base_url.clone()),
+            auth: Some(resolve_auth_source(cfg)),
+        };
+    }
+    // 都没配 → fallback 主 env：从 ANTHROPIC_MODEL 取 model，否则用 input_model / DEFAULT_AGENT_MODEL
+    let model = input_model
+        .map(str::to_string)
+        .or_else(|| std::env::var("ANTHROPIC_MODEL").ok())
+        .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
+    ResolvedSubagentProvider {
+        model,
+        base_url: None,
+        auth: None,
+    }
+}
+
+/// ★ 2026-07-19 新增：按 `cfg.auth_kind` 选 `AuthSource` 分支。
+/// `"bearer"` → `BearerToken` → `Authorization: Bearer` 头（GLM 网关）。
+/// `"api_key"` / 空 / 其他 → `ApiKey` → `x-api-key` 头（Anthropic + DeepSeek 兼容端）。
+fn resolve_auth_source(cfg: &runtime::SubagentProviderConfig) -> api::AuthSource {
+    let api_key = cfg.api_key.clone();
+    match cfg.auth_kind.trim() {
+        "bearer" => api::AuthSource::BearerToken(api_key),
+        _ => api::AuthSource::ApiKey(api_key),
+    }
+}
+
+/// **2026-07-19 multiprovider 落地**：从 cwd 加载 `SubagentProviderRouting`。
+/// 失败时返回 `default()`（空路由 → fallback 主 env），不阻断子 agent 启动。
+fn load_subagent_provider_routing() -> runtime::SubagentProviderRouting {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| ConfigLoader::default_for(cwd).load().ok())
+        .map(|config| config.subagent_provider_routing().clone())
+        .unwrap_or_default()
+}
+
+/// multiprovider 落地后仅 `new` 调用，而 `new` 仅测试 target 调用。
+#[allow(dead_code)]
 fn load_provider_fallback_config() -> ProviderFallbackConfig {
     std::env::current_dir()
         .ok()
@@ -4984,6 +5203,8 @@ fn tool_specs_for_allowed_tools(allowed_tools: Option<&BTreeSet<String>>) -> Vec
         .collect()
 }
 
+/// 无 cache_config 入参的便捷封装。仅测试 target 调用（主路径用 `convert_messages_with_cache`）。
+#[allow(dead_code)]
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
     convert_messages_with_cache(messages, &api::CacheConfig::default())
 }
@@ -6495,15 +6716,17 @@ mod tests {
 
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, build_agent_system_prompt,
-        classify_lane_failure, derive_agent_state, execute_agent_with_spawn, execute_tool,
-        extract_recovery_outcome, final_assistant_text, global_cron_registry,
-        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
-        persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
+        classify_lane_failure, clear_subagent_model, current_dispatch_model, derive_agent_state,
+        execute_agent_with_spawn, execute_tool, extract_recovery_outcome, final_assistant_text,
+        global_cron_registry, maybe_commit_provenance, mvp_tool_specs,
+        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
+        resolve_subagent_provider, run_task_packet, set_subagent_model, AgentInput, AgentJob,
         GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
         SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::ProviderFallbackConfig;
+    use runtime::should_use_compact_receipt;
     use runtime::{
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
         PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
@@ -10572,5 +10795,163 @@ printf 'pwsh:%s' "$1"
             )
             .into_bytes()
         }
+    }
+
+    /// **2026-07-19 multiprovider 落地**：resolver 三分支测试 + compact_receipt model 判定测试。
+    /// 对照 `docs/multiprovider.md` 3.4 / 3.4bis 节。
+
+    fn make_routing(
+        by_type: Vec<(&str, &str, &str, &str)>,
+        default: Option<(&str, &str, &str)>,
+    ) -> runtime::SubagentProviderRouting {
+        use runtime::SubagentProviderConfig;
+        let mut by_type_map = std::collections::BTreeMap::new();
+        for (key, base_url, api_key, model) in by_type {
+            by_type_map.insert(
+                key.to_string(),
+                SubagentProviderConfig {
+                    base_url: base_url.to_string(),
+                    api_key: api_key.to_string(),
+                    model: model.to_string(),
+                    auth_kind: "api_key".to_string(),
+                },
+            );
+        }
+        let default = default.map(|(base_url, api_key, model)| SubagentProviderConfig {
+            base_url: base_url.to_string(),
+            api_key: api_key.to_string(),
+            model: model.to_string(),
+            auth_kind: "api_key".to_string(),
+        });
+        runtime::SubagentProviderRouting {
+            by_type: by_type_map,
+            default,
+        }
+    }
+
+    #[test]
+    fn resolves_per_type_provider_when_configured() {
+        let routing = make_routing(
+            vec![(
+                "review",
+                "https://aigw-gzgy2.cucloud.cn:8443",
+                "sk-glm-plainkey",
+                "glm-5.1",
+            )],
+            None,
+        );
+        let resolved = resolve_subagent_provider("review", None, &routing);
+        assert_eq!(
+            resolved.base_url.as_deref(),
+            Some("https://aigw-gzgy2.cucloud.cn:8443")
+        );
+        assert!(matches!(
+            resolved.auth,
+            Some(api::AuthSource::ApiKey(ref k)) if k == "sk-glm-plainkey"
+        ));
+        assert_eq!(resolved.model, "glm-5.1");
+    }
+
+    #[test]
+    fn falls_back_to_default_when_type_unconfigured() {
+        let routing = make_routing(
+            vec![],
+            Some((
+                "https://api.deepseek.com/anthropic",
+                "sk-deepseek-plainkey",
+                "deepseek-v4-pro[1m]",
+            )),
+        );
+        let resolved = resolve_subagent_provider("review", None, &routing);
+        assert_eq!(
+            resolved.base_url.as_deref(),
+            Some("https://api.deepseek.com/anthropic")
+        );
+        assert_eq!(resolved.model, "deepseek-v4-pro[1m]");
+    }
+
+    #[test]
+    fn falls_back_to_main_env_when_nothing_configured() {
+        std::env::set_var("ANTHROPIC_MODEL", "deepseek-v4-pro[1m]");
+        let routing = runtime::SubagentProviderRouting::default();
+        let resolved = resolve_subagent_provider("review", None, &routing);
+        assert!(resolved.base_url.is_none());
+        assert!(resolved.auth.is_none());
+        assert_eq!(resolved.model, "deepseek-v4-pro[1m]");
+        std::env::remove_var("ANTHROPIC_MODEL");
+    }
+
+    #[test]
+    fn input_model_overrides_routing_model() {
+        let routing = make_routing(
+            vec![(
+                "review",
+                "https://aigw-gzpy2.cucloud.cn:8443",
+                "sk-glm-plainkey",
+                "glm-5.1",
+            )],
+            None,
+        );
+        // ★ 2026-07-19 model 覆盖修正后：routing 配了（by_type 或 default）就用 cfg.model，
+        // **不让 input_model 覆盖**。input_model 来自 execute_agent 的
+        // resolve_agent_model(input.model.as_deref())——主 LLM 派活时 AgentInput.model
+        // 字段通常没传，resolve_agent_model(None) 返 DEFAULT_AGENT_MODEL=claude-opus-4-6 兜底值。
+        // 若让这个兜底值覆盖 cfg.model，子 agent 拿 claude-opus-4-6 调 GLM endpoint，
+        // GLM 网关拒识报 403 `当前访问模型不存在或者模型名称错误`。
+        // 这条测试改名后断言：input_model 在 routing 配了时**不**覆盖 cfg.model。
+        let resolved = resolve_subagent_provider("review", Some("deepseek-v4-pro[1m]"), &routing);
+        assert_eq!(
+            resolved.model, "glm-5.1",
+            "routing 配了 model=glm-5.1 就用这个，input_model 兜底值不覆盖"
+        );
+        // routing 的 base_url + auth 仍生效
+        assert_eq!(
+            resolved.base_url.as_deref(),
+            Some("https://aigw-gzpy2.cucloud.cn:8443")
+        );
+    }
+
+    #[test]
+    fn compact_receipt_reflects_current_dispatch_model() {
+        // deepseek* → true（节制，对齐 Reasonix）
+        assert!(should_use_compact_receipt("deepseek-v4-pro[1m]"));
+        assert!(should_use_compact_receipt("DeepSeek-V4-Pro"));
+        // glm5.1 开头（含中文/数字变体） → false（保持原回执）
+        assert!(!should_use_compact_receipt("glm-5.1"));
+        assert!(!should_use_compact_receipt("GLM-5.1"));
+        // 未设 / 空串 → false
+        assert!(!should_use_compact_receipt(""));
+        assert!(!should_use_compact_receipt("claude-opus-4-6"));
+    }
+
+    #[test]
+    fn set_subagent_model_thread_local_overrides_env() {
+        let _guard = env_guard();
+        clear_subagent_model();
+        // 主 env 是 GLM
+        std::env::set_var("ANTHROPIC_MODEL", "glm-5.1");
+        // 子 agent thread-local 设成 DeepSeek
+        set_subagent_model("deepseek-v4-pro[1m]");
+        let model = current_dispatch_model();
+        assert_eq!(model, "deepseek-v4-pro[1m]");
+        let compact = should_use_compact_receipt(&model);
+        assert!(compact, "子 agent 走 DeepSeek 应该节制回执");
+        // 清理：thread-local + env，防止污染后续测试
+        clear_subagent_model();
+        std::env::remove_var("ANTHROPIC_MODEL");
+    }
+
+    #[test]
+    fn main_llm_path_falls_back_to_env_when_no_thread_local() {
+        let _guard = env_guard();
+        clear_subagent_model();
+        // 清掉 thread-local（默认就是 None）
+        std::env::set_var("ANTHROPIC_MODEL", "glm-5.1");
+        let model = current_dispatch_model();
+        assert_eq!(model, "glm-5.1");
+        let compact = should_use_compact_receipt(&model);
+        assert!(!compact, "主 LLM 走 GLM 不应该节制回执");
+        // 清理
+        std::env::remove_var("ANTHROPIC_MODEL");
     }
 }

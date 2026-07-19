@@ -69,7 +69,8 @@ pub use config::{
     McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
     ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
-    RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
+    RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig,
+    ScopedMcpServerConfig, SubagentProviderConfig, SubagentProviderRouting,
     CLAW_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
@@ -85,8 +86,8 @@ pub use file_ops::{
     edit_file, edit_file_in_workspace, edit_file_in_workspace_with_allowed, glob_search,
     glob_search_in_workspace, glob_search_in_workspace_with_allowed, grep_search,
     grep_search_in_workspace, grep_search_in_workspace_with_allowed, read_file,
-    read_file_in_workspace, read_file_in_workspace_with_allowed, write_file,
-    write_file_in_workspace, write_file_in_workspace_with_allowed, EditFileOutput,
+    read_file_in_workspace, read_file_in_workspace_with_allowed, should_use_compact_receipt,
+    write_file, write_file_in_workspace, write_file_in_workspace_with_allowed, EditFileOutput,
     GlobSearchOutput, GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk,
     TextFilePayload, WriteFileOutput,
 };

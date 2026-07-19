@@ -55,26 +55,41 @@
 
 两种触发方式：
 
-**方式 A：主 agent 自动判断派活**（推荐，最自然）
+**方式 A：你显式点名派活**（**唯一稳定触发路径**）
 
-直接对话：
+```
+> 用 code-review 子 agent 检查 src/auth.rs 的安全问题
+
+主 agent → Agent(subagent_type="code-review", prompt="检查 src/auth.rs 的安全问题")
+```
+
+**方式 B：主 agent 自动判断派活**（⚠️ 实现现状下**不保证触发**——见下"真相"）
+
 ```
 > 帮我 review 一下刚才的改动
 
 主 agent（smart）思考："这活适合 code-review 子 agent"
-  → 派 Task(subagent_type="code-review", prompt="review recent changes")
+  → 派 Agent(subagent_type="code-review", prompt="review recent changes")
     → 子 agent（fast，deepseek-v4-flash）跑工具链：
         read_file 改动文件 → grep_search 相关代码 → 返回 review 结论
 主 agent 收到结论，整理给你
 ```
 
-**方式 B：你显式点名派活**（精确控制）
+#### ★ 2026-07-19 真机验证后修订：主 agent "何时该派"的真相
+
+方式 B 那种"主 agent 看 `description` 判断何时该派"是**官方 claude-code 的语义**，claw 源码**没实现这条**：
+
+- claw 的 `RuntimeConfig` **不解析 `.claw.json` 顶层 `subagents` 段**——扒源码 `grep "subagents"` 命中 0（除 commands 那个无关字串）。你配的 `subagents.code-review.description` 主 LLM **根本看不到**，claw 启动时 schema 校验拒识报 `unknown key "subagents"`（真机触发现场）
+- 主 LLM 的 system prompt 构造点 `build_system_prompt`（`rusty-claude-cli/src/main.rs:8124`）→ `load_system_prompt`（`runtime/src/prompt.rs:458`）→ `SystemPromptBuilder::with_runtime_config(config)`——`config` 里**没 subagent description 字段**，主 LLM system prompt 不注入任何"有哪些 subagent 可用 + 各自 description"
+- 主 LLM 看到的只有 `Agent` 工具 schema（含 `subagent_type`/`description`/`prompt`/`model`/`name` 字段定义），但**不知道有哪些预定义 subagent_type 可派、何时该派给哪个 type**——只能靠自己的推理决定何时派，可能永远不会主动派，甚至把你字面点名的"用 review 子 agent 检查"理解成"我自己去 review"自己干（真机触发现场：主 LLM 输出 `TaskCreate` 死登记器或直接调 read_file/bash 自己干，不输出 `Agent` 工具调用）
+
+**真相**：让主 LLM 主动派活要靠**路径 E 那条新债**——落地 `subagents` 段解析 + 注入 description 到主 LLM system prompt。本期不动这条（multiprovider 落地收尾不混新功能），但真相要讲清楚：**当前只能靠方式 A 显式点名**，且点名时要把"派 `Agent` 工具"明写出来逼主 LLM 输出 `Agent` 工具调用而不是自己干：
 
 ```
-> 用 code-review 子 agent 检查 src/auth.rs 的安全问题
-
-主 agent → Task(subagent_type="code-review", prompt="检查 src/auth.rs 的安全问题")
+> 调 Agent 工具，subagent_type="review"，description="检查 setup.py 的安全问题"，prompt="检查 setup.py 的安全问题"
 ```
+
+详见 `ATOMCODE_MEMORY.md` 第 28 条修订版"主 LLM 没听话根因猜测"段 + `docs/multiprovider.md` 3.4sexies 节。
 
 ---
 
@@ -321,7 +336,15 @@ DeepSeek V4 系列定价（参考）：
 
 ### Q1：子 agent 会自动触发吗？还是都要我手动派？
 
-**会自动触发**——主 agent 看 `description` 判断当前活适不适合某子 agent，适合就自动派。你手动点名也能强制派。
+**★ 2026-07-19 真机验证后修订**：**当前只能手动显式点名派**——方式 B 那种"主 agent 看 `description` 判断何时该派"是官方 claude-code 语义，claw 源码没实现这条（`RuntimeConfig` 不解析 `subagents` 段，主 LLM system prompt 不注入 subagent description，详见第 2 节"真相"段）。主 LLM 只能靠自己的推理决定何时派，可能永远不会主动派，甚至把你字面点名的"用 review 子 agent 检查"理解成"我自己去 review"自己干。
+
+**唯一稳定触发路径**——显式点名且把"派 `Agent` 工具"明写出来逼主 LLM 输出 `Agent` 工具调用：
+
+```
+> 调 Agent 工具，subagent_type="review"，description="检查 setup.py 的安全问题"，prompt="检查 setup.py 的安全问题"
+```
+
+让主 LLM 主动派活要靠**路径 E 那条新债**——落地 `subagents` 段解析 + 注入 description 到主 LLM system prompt（本期不动，详见 `ATOMCODE_MEMORY.md` 第 28 条修订版）。
 
 ### Q2：子 agent 能调子 agent 吗？
 
@@ -386,11 +409,99 @@ DeepSeek V4 系列定价（参考）：
 }
 ```
 
-存成 `.claw.json` 放项目根，`./claw.exe --model smart` 启动，对话中主 agent 会自动调这些子 agent。
+存成 `.claw.json` 放项目根，`./claw.exe --model smart` 启动。
+
+**★ 2026-07-19 真机验证后修订**：上面这份模板里 `subagents` 段 claw 源码**根本不解析**（`RuntimeConfig` 没这条字段，schema 校验拒识报 `unknown key "subagents"`）——配了等于白配，主 LLM 看不到任何 description 提示。**当前唯一稳定触发路径**是对话中显式点名且把"派 `Agent` 工具"明写出来：
+
+```
+> 调 Agent 工具，subagent_type="review"，description="检查 setup.py 的安全问题"，prompt="检查 setup.py 的安全问题"
+```
+
+`aliases` 段是有效的（`runtime/src/config.rs:62/390/777` 真解析）——给长模型名起短名仍可用。`subagents` 段要等**路径 E 那条新债**落地（解析 `subagents` 段 + 注入 description 到主 LLM system prompt）才真生效，本期不动。详见第 2 节"真相"段 + `ATOMCODE_MEMORY.md` 第 28 条修订版。
 
 ---
 
-## 十、源码索引（方便查证）
+## 十一、★ 2026-07-19 multiprovider 落地：子 agent 走与主 LLM 不同云服务商
+
+> 详见 `docs/multiprovider.md`。本节是 SUBAGENT_GUIDE 视角的速查。
+
+### 11.1 配置（在 `.claw.json` 顶层）
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+    "ANTHROPIC_API_KEY": "sk-deepseek-...",
+    "ANTHROPIC_MODEL": "deepseek-v4-pro[1m]"
+  },
+  "subagentProviders": {
+    "review": {
+      "baseUrl": "https://aigw-gzgy2.cucloud.cn:8443",
+      "apiKey": "sk-glm-plainkey 或 ${GLM_API_KEY}",
+      "model": "glm-5.1"
+    }
+  },
+  "subagentProviderDefault": {
+    "baseUrl": "https://aigw-gzgy2.cucloud.cn:8443",
+    "apiKey": "sk-glm-plainkey 或 ${GLM_API_KEY}",
+    "model": "glm-5.1"
+  }
+}
+```
+
+**字段说明**：
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `subagentProviders` | 否 | 按 `subagent_type` 路由的 per-type provider 配置；key 是 `normalize_subagent_type` 输出的标准 type 名 |
+| `subagentProviderDefault` | 否 | 没显式配 type 时的兜底 |
+| `baseUrl` | 是 | 子 agent 走的 endpoint |
+| `apiKey` | 是 | 支持明文或 `${ENV_VAR}` / `${ENV_VAR:-default}` 引用 |
+| `model` | 是 | 子 agent 用的模型名（也用于节制回执判定 + context window 算 auto-compact 阈值） |
+
+都没配 → 子 agent fallback 到主 LLM env（保持向后兼容）。
+
+### 11.2 节制回执按 model 判定（★ 关键）
+
+子 agent 的工具回执（`edit_file` / `write_file`）节制策略改为按**当前调度的 model 名前缀**判定：
+
+- `deepseek*` 开头 → 节制回执（DeepSeek 处理方式，对齐 Reasonix：不塞原文件）
+- `glm5.1*` / `glm*` / 其他 → 保持原回执（GLM 处理方式）
+
+**判定函数**：`runtime::should_use_compact_receipt(model: &str) -> bool`
+
+**model 名传到 dispatch 层的方式**：`run_agent_job` 入口调 `set_subagent_model(&resolved.model)` 设 thread-local；dispatch 层调 `current_dispatch_model()` 优先读 thread-local（子 agent 路径），回退到 `ANTHROPIC_MODEL` env（主 LLM 路径）。
+
+### 11.3 主 agent 与子 agent 的处理方式组合
+
+| 主 LLM model | 子 agent model | 主 LLM 走哪条 | 子 agent 走哪条 |
+|---|---|---|---|
+| `deepseek*` | `deepseek*` | 节制回执（DeepSeek 处理方式） | 节制回执（DeepSeek 处理方式） |
+| `deepseek*` | `glm5.1*` / `glm*` | 节制回执 | **保持原回执**（GLM 处理方式） |
+| `glm5.1*` / `glm*` | `deepseek*` | **保持原回执** | 节制回执 |
+| `glm5.1*` / `glm*` | `glm5.1*` / `glm*` | 保持原回执 | 保持原回执 |
+
+即：**不管作为主 agent 还是子 agent，模型名 `glm5.1` 开头的就全用老的处理方式；模型名 `deepseek` 开头的就全用新的处理方式**。两种 model 混合时各自正确判定，不再破裂。
+
+### 11.4 真机验证
+
+用户重编 `cargo build --release` 替换 `claw.exe` 后真机跑一轮，看 `claw_glm_diag.log`：
+
+- 子 agent 那条 `claw_glm_diag` 事件的 `url` 字段应该是配置的 `baseUrl`（如 GLM 的 `aigw-gzgy2.cucloud.cn`）而非主 LLM 的 endpoint
+- 若子 agent 走 `deepseek*`，看 `claw_request_size` 在 `edit_file` 后是否明显变小（节制回执生效）；若子 agent 走 `glm*`，回执应含 `originalFile`（原回执）
+
+### 11.5 已知未做（二期）
+
+1. **OpenAi / Xai 路径的 `with_base_url` 未实现**——`build_provider_entry_with_override` 仅做 Anthropic 路径。OpenAi 路径补后能支持子 agent 走通义千问/Grok 等。
+2. **`WorkerCreate` / `TaskCreate` 后台任务的多 provider**——本期只做 `Agent` 工具。Worker/Task 那套有独立客户端构造链，二期对照本方案再补。
+   - **★ 2026-07-19 真机验证后修订**：扒源码确认 `run_task_create`/`run_task_packet`/`run_task_get`（`tools/src/lib.rs:1411/1425/1442`）+ `TaskRegistry::create`（`task_registry.rs:129`）+ `WorkerRegistry::create`（`worker_boot.rs:284`）**全是死登记器**——只动 HashMap 存状态，没 spawn 子线程、没真客户端构造、没调 API。`RunTaskPacket` 字面是骗的——它只是 `registry.create_from_packet(input)` 再登记一遍，不真 Run。真子 agent 跑活靠外部 orchestrator（clawhip）轮询 registry 状态机，不在 claw 自己进程内。
+   - **真 spawn 链只有 `Agent` 工具那条**——`execute_agent`（`:3696`）→`execute_agent_with_spawn`（`:3700`）→`spawn_agent_job`（`:3780`）→`std::thread::Builder::new().spawn(move || {...})`（`:3782-3784`）真开子线程 →`run_agent_job`（`:3807`）→`build_agent_runtime`（`:3820`）真客户端构造 →`resolve_subagent_provider`（multiprovider 已覆盖）。`Task` 工具名 dispatch 表里没有，只有 `Agent`。
+   - **路径 D 范围修订**：不是改 `run_task_*` 那批死登记器套路由——套不上没 spawn 点用。真要做的是**让主 LLM 改用 `Agent` 工具派活而非 `TaskCreate`**——multiprovider 落地时已经把 Agent 工具链覆盖了，只是主 LLM 没选这条工具。详见 `ATOMCODE_MEMORY.md` 第 28 条修订版。
+3. **主 LLM 故障转移链扩到子 agent**——`ProviderFallbackConfig` 那条链保持主 LLM 专用。子 agent 要故障转移另立一套（二期）。
+
+---
+
+## 十二、源码索引（方便查证）
 
 | 机制 | 文件 | 行号 |
 |------|------|------|
@@ -404,3 +515,9 @@ DeepSeek V4 系列定价（参考）：
 | `/agents` 命令 | `commands/src/lib.rs` | 240 |
 | `/subagent` 命令 | `commands/src/lib.rs` | 1003 |
 | aliases 配置 | `runtime/src/config.rs` | 62, 390, 777 |
+| **★ multiprovider** `SubagentProviderConfig` / `SubagentProviderRouting` | `runtime/src/config.rs` | 79-108 |
+| **★ multiprovider** `parse_optional_subagent_provider_routing` + `resolve_env_ref` | `runtime/src/config.rs` | 988-1058 |
+| **★ multiprovider** `resolve_subagent_provider` + `ResolvedSubagentProvider` | `tools/src/lib.rs` | 4867-4945 |
+| **★ multiprovider** `ProviderRuntimeClient::new_with_resolved` + `build_provider_entry_with_override` | `tools/src/lib.rs` | 4740-4913 |
+| **★ multiprovider** thread-local `SUBAGENT_MODEL` + `set_subagent_model` / `current_dispatch_model` | `tools/src/lib.rs` | 4867-4886 |
+| **★ multiprovider** `should_use_compact_receipt(model: &str)` | `runtime/src/file_ops.rs` | 211-225 |

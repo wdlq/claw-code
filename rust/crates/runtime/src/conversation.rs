@@ -232,6 +232,32 @@ where
         self
     }
 
+    /// **2026-07-19 multiprovider 落地**：子 agent 专用——按 model 上下文窗口动态算
+    /// auto-compact 阈值，**不读任何 env 覆盖**，强制用 `context_window × 75%`。
+    ///
+    /// 修的破裂点：主 LLM 走 DeepSeek 1M，子 agent 走 GLM 200K 时，若 `.claw.json`
+    /// 的 `env` 段显式设了 `CLAUDE_CODE_AUTO_COMPACT_WINDOW=131000`（针对 GLM 200K 算的 75%），
+    /// 原路径会把这套全局 env 误施加到子 agent 上——主=DeepSeek 时子 agent 阈值被压到 131K
+    /// 频繁 compact 反伤 DeepSeek 缓存；主=GLM 子=DeepSeek 时子 agent 阈值 750K 直接撑爆
+    /// GLM 200K 窗口报 `ContextWindowExceeded` 400。
+    ///
+    /// 子 agent 走 strict 路径后阈值严格按自己的 model 算，与主 LLM 的 env 配置彻底独立。
+    /// 仍保留下限保护：至少给到 `DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD` 55K，
+    /// 避免子 agent 走 128K DeepSeek-flash 等小窗口模型算出 96K 阈值被压到 55K——太小阈值
+    /// 频繁 compact 反伤缓存对子 agent 仍是不良。
+    ///
+    /// 对照 `docs/multiprovider.md` 3.4ter 节。主 LLM 路径仍走 `with_model_context_window`
+    /// （允许用户用 env 显式覆盖主 LLM 阈值），两条路径彻底独立。
+    #[must_use]
+    pub fn with_model_context_window_strict(mut self, context_window_tokens: u32) -> Self {
+        let pct = 75u32; // 对齐官方claude-code的0.75阈值
+        let dynamic_threshold = (context_window_tokens as u64 * pct as u64 / 100) as u32;
+        self.auto_compaction_input_tokens_threshold =
+            dynamic_threshold.max(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD);
+        self
+    }
+
+
     #[must_use]
     pub fn with_hook_abort_signal(mut self, hook_abort_signal: HookAbortSignal) -> Self {
         self.hook_abort_signal = hook_abort_signal;
@@ -1780,6 +1806,118 @@ mod tests {
             inline_parse(Some("not-a-number")),
             DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
         );
+    }
+
+    /// 构造一个最小可用的 ConversationRuntime 实例供 builder 测试用——
+    /// 不跑 turn，只验 builder 设的字段值。对照 `auto_compacts_when_cumulative_input_threshold_is_crossed` 风格。
+    /// ApiClient 用最简的 `SimpleApiForBuilder`（返回空流即可——builder 测试不会真调 stream）。
+    struct SimpleApiForBuilder;
+    impl ApiClient for SimpleApiForBuilder {
+        fn stream(
+            &mut self,
+            _request: ApiRequest,
+        ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            Ok(vec![AssistantEvent::MessageStop])
+        }
+    }
+    fn minimal_runtime() -> ConversationRuntime<SimpleApiForBuilder, StaticToolExecutor> {
+        ConversationRuntime::new(
+            Session::new(),
+            SimpleApiForBuilder,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+    }
+
+    /// ★ 2026-07-19 multiprovider：strict 变体不读任何 env，强制用 `context_window × 75%`。
+    /// 验 DeepSeek V4 Pro 1M 窗口 → 750K 阈值。
+    #[test]
+    fn with_model_context_window_strict_uses_dynamic_threshold_without_env() {
+        let runtime = minimal_runtime()
+            .with_model_context_window_strict(1_000_000);
+        assert_eq!(
+            runtime.auto_compaction_input_tokens_threshold,
+            750_000,
+            "1M 窗口 × 75% = 750K，不读 env"
+        );
+    }
+
+    /// ★ 2026-07-19 multiprovider：strict 变体**不读 env 覆盖**——
+    /// 即使主 LLM 那套全局 env 显式设了阈值，子 agent 路径也不被污染。
+    /// 这是 strict 变体与原 `with_model_context_window` 的核心差异点。
+    #[test]
+    fn with_model_context_window_strict_ignores_env_override() {
+        // 模拟主 LLM 在 .claw.json env 段设的全局阈值——这套是针对主 LLM 算的，
+        // 不该施加到子 agent 上（主=DeepSeek 1M 时这套 env 设 131K 是给 GLM 200K 用的，
+        // 强加到子 agent=DeepSeek 1M 会被压到 131K 频繁 compact 反伤缓存）。
+        std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS", "131000");
+        std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_PCT_OVERRIDE", "75");
+        std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "131000");
+
+        let runtime = minimal_runtime()
+            .with_model_context_window_strict(1_000_000);
+        assert_eq!(
+            runtime.auto_compaction_input_tokens_threshold,
+            750_000,
+            "strict 路径必须忽略 env 覆盖，按 1M × 75% = 750K 算"
+        );
+
+        // 清理 env 防止污染后续测试
+        std::env::remove_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS");
+        std::env::remove_var("CLAUDE_CODE_AUTO_COMPACT_PCT_OVERRIDE");
+        std::env::remove_var("CLAUDE_CODE_AUTO_COMPACT_WINDOW");
+    }
+
+    /// ★ 2026-07-19 multiprovider：strict 变体保留下限保护——
+    /// 子 agent 走小窗口模型（如 DeepSeek-v4-flash 128K）算出 96K 阈值，
+    /// 仍被 `DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD` 55K 下限保护兜底。
+    /// 太小阈值频繁 compact 反伤缓存，对子 agent 仍是不良。
+    #[test]
+    fn with_model_context_window_strict_keeps_floor_protection() {
+        // 128K × 75% = 96K > 55K 下限，直接用 96K
+        let runtime = minimal_runtime()
+            .with_model_context_window_strict(128_000);
+        assert_eq!(
+            runtime.auto_compaction_input_tokens_threshold,
+            96_000,
+            "128K × 75% = 96K > 55K 下限，用 96K"
+        );
+
+        // 50K × 75% = 37.5K < 55K 下限，兜底到 55K
+        let runtime = minimal_runtime()
+            .with_model_context_window_strict(50_000);
+        assert_eq!(
+            runtime.auto_compaction_input_tokens_threshold,
+            DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+            "50K × 75% = 37.5K < 55K 下限，兜底到 55K"
+        );
+    }
+
+    /// ★ 2026-07-19 multiprovider：对照测试——原 `with_model_context_window` **会被 env 覆盖**。
+    /// 同样的 env 设定下，原路径不动态算（保留 `new()` 里 `auto_compaction_threshold_from_env()` 读的 env 值），
+    /// strict 路径强制动态算（用 750K）。这条测试佐证两条路径彻底独立。
+    ///
+    /// **注意**：cargo test 默认并行跑，env 是进程级全局——本测试和 `with_model_context_window_strict_ignores_env_override`
+    /// 都用 `set_var`/`remove_var` 操作同一组 env，交错时会污染。改用**串行模式**跑这条对照测试
+    /// （`cargo test -- --test-threads=1` 或单独 `cargo test with_model_context_window_original`）才能稳定。
+    #[test]
+    fn with_model_context_window_original_path_still_reads_env_override() {
+        // 自设 env——不依赖其他测试的时序
+        std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS", "131000");
+        // 关键：`with_model_context_window` 的逻辑是"两个 env 都没设才动态算"，
+        // 我们设了 INPUT_TOKENS，那它就**不进入**动态算分支，
+        // 字段保持 `ConversationRuntime::new()` 构造时调 `auto_compaction_threshold_from_env()`
+        // 读 INPUT_TOKENS=131000 算出的 131K。
+        let runtime = minimal_runtime()
+            .with_model_context_window(1_000_000);
+        assert_eq!(
+            runtime.auto_compaction_input_tokens_threshold,
+            131_000,
+            "原路径 env 设了 INPUT_TOKENS=131000 就用 131000，不动态算 750K"
+        );
+
+        std::env::remove_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS");
     }
 
     #[test]

@@ -197,6 +197,24 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "trustedRoots",
         expected: FieldType::StringArray,
     },
+    // **2026-07-19 multiprovider 落地**：子 agent 走与主 LLM 不同云服务商的配置段。
+    // 详见 `docs/multiprovider.md`。两个字段都是 JSON 对象——
+    // `subagentProviders` 按 `subagent_type` 路由（key 是归一化 type 名，value 是
+    // `{baseUrl, apiKey, model}`），`subagentProviderDefault` 是兜底（同 struct）。
+    // 子段内字段校验留给 `config.rs::parse_optional_subagent_provider_routing`，
+    // 这里只做顶层 key 白名单 + 类型是大对象的校验。
+    // ★ 命名口径对齐：解析逻辑（config.rs:1012/1024）用 camelCase
+    // （`subagentProviders`/`subagentProviderDefault`），白名单必须同口径——
+    // 否则用户写 camelCase 被白名单拒识报 `unknown key`，写 snake_case 被白名单放行
+    // 但解析逻辑查 camel 拿不到路由不生效。两端口必须一致。
+    FieldSpec {
+        name: "subagentProviders",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "subagentProviderDefault",
+        expected: FieldType::Object,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[

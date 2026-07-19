@@ -65,6 +65,9 @@ pub struct RuntimeFeatureConfig {
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
+    /// **2026-07-19 multiprovider 落地**：按 `subagent_type` 路由的子 agent provider 配置。
+    /// 默认空 → 调用方 fallback 到主 LLM env 路径（保持向后兼容）。
+    subagent_provider_routing: SubagentProviderRouting,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -74,6 +77,43 @@ pub struct RuntimeFeatureConfig {
 pub struct ProviderFallbackConfig {
     primary: Option<String>,
     fallbacks: Vec<String>,
+}
+
+/// 一份独立子 agent provider 配置（base_url + api_key + model）。
+///
+/// **2026-07-19 multiprovider 落地**（对齐 Reasonix `TaskTool.resolveProvider` 接受的
+/// `provider.Config` 形态）。允许子 agent 走与主 LLM **不同的云服务商**（如主=DeepSeek、
+/// 子=联通云 GLM，或反过来）。`api_key` 支持 `${ENV_VAR}` 引用从 env 读，避免明文 key
+/// 写配置文件。详见 `docs/multiprovider.md`。
+///
+/// **2026-07-19 auth 头分支修正**：`auth_kind` 字段决定 `api_key` 走哪个 auth 头分支——
+/// `"api_key"`（默认，对齐 Anthropic 原生 + DeepSeek 兼容端）→ `AuthSource::ApiKey` → `x-api-key` 头；
+/// `"bearer"` → `AuthSource::BearerToken` → `Authorization: Bearer <token>` 头。
+/// **必须显式配 `auth_kind: "bearer"` 才能连 GLM 网关**——GLM 网关 `aigw-gzgy2.cucloud.cn:8443`
+/// 只认 `Authorization: Bearer` 不认 `x-api-key`，旧版用 `ANTHROPIC_AUTH_TOKEN` env 走 Bearer 分支能连，
+/// multiprovider 落地时硬绑 ApiKey 分支报 403 `Authentication failed`。对照 `docs/multiprovider.md` 3.4quinquies 节。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SubagentProviderConfig {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    /// ★ 2026-07-19 新增：决定 `api_key` 走 `x-api-key` 头还是 `Authorization: Bearer` 头。
+    /// 默认空字符串等价 `"api_key"`（保持向后兼容）。
+    pub auth_kind: String,
+}
+
+/// 按 `subagent_type` 路由的 provider 映射 + 默认兜底。
+///
+/// **2026-07-19 multiprovider 落地**（对齐 Reasonix `TaskTool.resolveProvider` 字段，
+/// claw 用配置文件而非代码注入）。
+/// - `by_type` 按归一化 `subagent_type` 路由（key 用 `normalize_subagent_type` 的输出）
+/// - `default` 是没显式配 type 时的兜底；都没配 → 调用方 fallback 到主 LLM env
+/// - 都没配置时返回 `SubagentProviderRouting::default()`（空 `by_type` + `None` default），
+///   调用方据此判断"没配，fallback 主 env"
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SubagentProviderRouting {
+    pub by_type: BTreeMap<String, SubagentProviderConfig>,
+    pub default: Option<SubagentProviderConfig>,
 }
 
 /// Hook command lists grouped by lifecycle stage.
@@ -316,6 +356,7 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            subagent_provider_routing: parse_optional_subagent_provider_routing(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -409,6 +450,13 @@ impl RuntimeConfig {
     #[must_use]
     pub fn provider_fallbacks(&self) -> &ProviderFallbackConfig {
         &self.feature_config.provider_fallbacks
+    }
+
+    /// **2026-07-19 multiprovider 落地**：按 `subagent_type` 路由的子 agent provider 配置。
+    /// 默认空（`SubagentProviderRouting::default()`）→ 调用方 fallback 到主 LLM env 路径。
+    #[must_use]
+    pub fn subagent_provider_routing(&self) -> &SubagentProviderRouting {
+        &self.feature_config.subagent_provider_routing
     }
 
     #[must_use]
@@ -948,6 +996,99 @@ fn parse_optional_trusted_roots(root: &JsonValue) -> Result<Vec<String>, ConfigE
     )
 }
 
+/// **2026-07-19 multiprovider 落地**：解析 `.claw.json` 顶层 `subagent_providers` 段 +
+/// `subagent_provider_default` 兜底。对应 `docs/multiprovider.md` 3.2/3.3 节。
+///
+/// 配置形态：
+/// ```json
+/// {
+///   "subagent_providers": {
+///     "review": { "base_url": "...", "api_key": "sk-... or ${ENV}", "model": "glm-5.1" }
+///   },
+///   "subagent_provider_default": { "base_url": "...", "api_key": "...", "model": "..." }
+/// }
+/// ```
+///
+/// 都没配 → 返回 `SubagentProviderRouting::default()`（空 by_type + None default），
+/// 调用方据此判断"没配，fallback 主 env"。
+fn parse_optional_subagent_provider_routing(
+    root: &JsonValue,
+) -> Result<SubagentProviderRouting, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(SubagentProviderRouting::default());
+    };
+
+    let mut by_type: BTreeMap<String, SubagentProviderConfig> = BTreeMap::new();
+    if let Some(providers_value) = object.get("subagentProviders") {
+        let providers_map = expect_object(providers_value, "merged settings.subagentProviders")?;
+        for (subagent_type, config_value) in providers_map {
+            let cfg = parse_subagent_provider_config(
+                config_value,
+                &format!("merged settings.subagentProviders.{subagent_type}"),
+            )?;
+            by_type.insert(subagent_type.clone(), cfg);
+        }
+    }
+
+    let mut default: Option<SubagentProviderConfig> = None;
+    if let Some(default_value) = object.get("subagentProviderDefault") {
+        default = Some(parse_subagent_provider_config(
+            default_value,
+            "merged settings.subagentProviderDefault",
+        )?);
+    }
+
+    Ok(SubagentProviderRouting { by_type, default })
+}
+
+fn parse_subagent_provider_config(
+    value: &JsonValue,
+    context: &str,
+) -> Result<SubagentProviderConfig, ConfigError> {
+    let object = expect_object(value, context)?;
+    let base_url = expect_string(object, "baseUrl", context)?.to_string();
+    let api_key_raw = expect_string(object, "apiKey", context)?.to_string();
+    let api_key = resolve_env_ref(&api_key_raw);
+    let model = expect_string(object, "model", context)?.to_string();
+    // ★ 2026-07-19 新增：authKind 可选字段，默认空字符串等价 "api_key"。
+    // "bearer" → AuthSource::BearerToken → Authorization: Bearer 头（GLM 网关要这个）。
+    // "api_key" / 空 → AuthSource::ApiKey → x-api-key 头（Anthropic 原生 + DeepSeek 兼容端）。
+    let auth_kind = object
+        .get("authKind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("api_key")
+        .to_string();
+    Ok(SubagentProviderConfig {
+        base_url,
+        api_key,
+        model,
+        auth_kind,
+    })
+}
+
+/// **2026-07-19 multiprovider 落地**：把 `${VAR}` / `${VAR:-default}` 形式的 env 引用
+/// 替换成 `std::env::var(VAR)`。对齐 Reasonix `config.ResolveEnvRef`。
+///
+/// - `${VAR}` → `env::var("VAR")`；未设 → 返回空字符串（调用方检测空字符串报 401）
+/// - 不以 `${` 开头的字符串原样返回
+/// - 本期只支持整串 `${VAR}` 形态（不支持 mid-string 插值），简化实现
+fn resolve_env_ref(value: &str) -> String {
+    let trimmed = value.trim();
+    if !trimmed.starts_with("${") || !trimmed.ends_with('}') {
+        return value.to_string();
+    }
+    let inner = &trimmed[2..trimmed.len() - 1];
+    // 支持 `${VAR:-default}` 形态（本期最小实现，不递归）
+    let (var_name, default_val) = match inner.find(":-") {
+        Some(idx) => (&inner[..idx], Some(&inner[idx + 2..])),
+        None => (inner, None),
+    };
+    match std::env::var(var_name) {
+        Ok(v) if !v.is_empty() => v,
+        _ => default_val.unwrap_or("").to_string(),
+    }
+}
+
 fn parse_filesystem_mode_label(value: &str) -> Result<FilesystemIsolationMode, ConfigError> {
     match value {
         "off" => Ok(FilesystemIsolationMode::Off),
@@ -1278,9 +1419,11 @@ fn push_unique(target: &mut Vec<String>, value: String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        deep_merge_objects, parse_permission_mode_label, ConfigLoader, ConfigSource,
-        McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeFeatureConfig,
-        RuntimeHookConfig, RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
+        deep_merge_objects, parse_optional_subagent_provider_routing,
+        parse_permission_mode_label, resolve_env_ref, ConfigLoader, ConfigSource, McpServerConfig,
+        McpTransport, ResolvedPermissionMode, RuntimeFeatureConfig, RuntimeHookConfig,
+        RuntimePluginConfig, SubagentProviderConfig, SubagentProviderRouting,
+        CLAW_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -2199,5 +2342,116 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    /// **2026-07-19 multiprovider 落地**：routing 解析 + env 引用测试。
+    /// 对照 `docs/multiprovider.md` 3.2/3.3 节。
+
+    #[test]
+    fn parse_subagent_provider_routing_empty_when_unconfigured() {
+        let root = JsonValue::Object(std::collections::BTreeMap::new());
+        let routing = parse_optional_subagent_provider_routing(&root)
+            .expect("empty config should parse to default routing");
+        assert!(routing.by_type.is_empty());
+        assert!(routing.default.is_none());
+    }
+
+    #[test]
+    fn parse_subagent_provider_routing_per_type_overrides() {
+        let mut obj = std::collections::BTreeMap::new();
+        let mut providers = std::collections::BTreeMap::new();
+        let mut review = std::collections::BTreeMap::new();
+        review.insert(
+            "baseUrl".to_string(),
+            JsonValue::String("https://aigw-gzgy2.cucloud.cn:8443".to_string()),
+        );
+        review.insert(
+            "apiKey".to_string(),
+            JsonValue::String("sk-glm-plainkey".to_string()),
+        );
+        review.insert("model".to_string(), JsonValue::String("glm-5.1".to_string()));
+        providers.insert("review".to_string(), JsonValue::Object(review));
+        obj.insert(
+            "subagentProviders".to_string(),
+            JsonValue::Object(providers),
+        );
+
+        let routing = parse_optional_subagent_provider_routing(&JsonValue::Object(obj))
+            .expect("per-type routing should parse");
+        let review_cfg = routing
+            .by_type
+            .get("review")
+            .expect("review entry should exist");
+        assert_eq!(review_cfg.base_url, "https://aigw-gzgy2.cucloud.cn:8443");
+        assert_eq!(review_cfg.api_key, "sk-glm-plainkey");
+        assert_eq!(review_cfg.model, "glm-5.1");
+        assert!(routing.default.is_none());
+    }
+
+    #[test]
+    fn parse_subagent_provider_routing_default_when_no_per_type() {
+        let mut obj = std::collections::BTreeMap::new();
+        let mut default = std::collections::BTreeMap::new();
+        default.insert(
+            "baseUrl".to_string(),
+            JsonValue::String("https://api.deepseek.com/anthropic".to_string()),
+        );
+        default.insert(
+            "apiKey".to_string(),
+            JsonValue::String("sk-deepseek-plainkey".to_string()),
+        );
+        default.insert(
+            "model".to_string(),
+            JsonValue::String("deepseek-v4-pro[1m]".to_string()),
+        );
+        obj.insert(
+            "subagentProviderDefault".to_string(),
+            JsonValue::Object(default),
+        );
+
+        let routing = parse_optional_subagent_provider_routing(&JsonValue::Object(obj))
+            .expect("default routing should parse");
+        assert!(routing.by_type.is_empty());
+        let default_cfg = routing
+            .default
+            .as_ref()
+            .expect("default entry should exist");
+        assert_eq!(default_cfg.model, "deepseek-v4-pro[1m]");
+    }
+
+    #[test]
+    fn resolve_env_ref_substitutes_env_var() {
+        std::env::set_var("CLAW_TEST_GLM_KEY", "sk-glm-from-env");
+        let resolved = resolve_env_ref("${CLAW_TEST_GLM_KEY}");
+        assert_eq!(resolved, "sk-glm-from-env");
+        std::env::remove_var("CLAW_TEST_GLM_KEY");
+    }
+
+    #[test]
+    fn resolve_env_ref_returns_raw_when_not_env_ref() {
+        assert_eq!(resolve_env_ref("sk-plainkey"), "sk-plainkey");
+        assert_eq!(resolve_env_ref(""), "");
+    }
+
+    #[test]
+    fn routing_equality_and_default_construction() {
+        let empty = SubagentProviderRouting::default();
+        assert!(empty.by_type.is_empty());
+        assert!(empty.default.is_none());
+
+        let cfg = SubagentProviderConfig {
+            base_url: "https://example.com".to_string(),
+            api_key: "sk-test".to_string(),
+            model: "test-model".to_string(),
+            auth_kind: "api_key".to_string(),
+        };
+        let mut by_type = std::collections::BTreeMap::new();
+        by_type.insert("review".to_string(), cfg.clone());
+        let populated = SubagentProviderRouting {
+            by_type,
+            default: Some(cfg),
+        };
+        assert_eq!(populated.by_type.len(), 1);
+        assert!(populated.default.is_some());
     }
 }

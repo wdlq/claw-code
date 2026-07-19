@@ -496,7 +496,6 @@ fn prepare_tokio_command(
     // inner quotes in the command survive cmd.exe's `/C` parsing.
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         let rewritten = rewrite_posix_drive_paths_for_windows(command);
 
         let mut prepared = TokioCommand::new("cmd");
