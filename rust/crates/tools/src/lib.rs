@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[allow(unused_imports)] // Arc/Mutex 仅测试代码用，主产物代码走 mpsc::channel 不再需要
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use api::{
@@ -2820,6 +2822,12 @@ struct AgentOutput {
     derived_state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// **2026-07-20 subagent 同步等结果改造**：子 agent 跑完后回填的结论文本。
+    /// 主 LLM 在 tool_result JSON 里通过 `result` 字段直接拿到子 agent 的最终回复，
+    /// 不再只看到 `status:"running"` 占位回执。`None` 表示子 agent 还没跑完（旧 fire-and-forget 路径）
+    /// 或子 agent 跑完但没产出 final_text（例如 max_iterations 超限或异常退出）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3697,6 +3705,18 @@ fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
     execute_agent_with_spawn(input, spawn_agent_job)
 }
 
+/// **2026-07-20 subagent 同步等结果改造**：子 agent 跑完后的终态信息。
+/// 主线程通过 `Arc<(Mutex<Option<AgentRunOutcome>>, Condvar)>` 同步等待子线程 set outcome + notify。
+/// 字段当前没被直接读取（回填走 `read_back_terminal_manifest` 读盘路径），但保留结构体用于
+/// 未来扩展（例如把 outcome 直接序列化到 manifest_file 而非靠反向解析 output_file）。
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct AgentRunOutcome {
+    status: String,
+    final_text: Option<String>,
+    error: Option<String>,
+}
+
 fn execute_agent_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentOutput, String>
 where
     F: FnOnce(AgentJob) -> Result<(), String>,
@@ -3714,15 +3734,37 @@ where
     let output_file = output_dir.join(format!("{agent_id}.md"));
     let manifest_file = output_dir.join(format!("{agent_id}.json"));
     let normalized_subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
-    let model = resolve_agent_model(input.model.as_deref());
+    // ★ 2026-07-19 路径 E 落地：读 RuntimeConfig.subagents[type] 拿预定义配置合并 input。
+    // 配置优先——description/systemPrompt/model 字段配置配了且 input 没传时用配置的；input 显式传了仍优先（让主 LLM 派活时能临时覆盖）。
+    let subagent_cfg = load_subagents_config().get(&normalized_subagent_type).cloned();
+    // 配置优先——input 显式传了 description 就用 input 的，否则 fallback 到配置的 description。
+    // 不用 `.clone().or_else(...)` 链（String 没 `or_else` 法，那是 Option 的）。
+    let description = if input.description.is_empty() {
+        subagent_cfg
+            .as_ref()
+            .map(|c| c.description.clone())
+            .unwrap_or_default()
+    } else {
+        input.description.clone()
+    };
+    let model = resolve_agent_model(
+        input
+            .model
+            .as_deref()
+            .or_else(|| {
+                subagent_cfg
+                    .as_ref()
+                    .and_then(|c| if c.model.is_empty() { None } else { Some(c.model.as_str()) })
+            }),
+    );
     let agent_name = input
         .name
         .as_deref()
         .map(slugify_agent_name)
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| slugify_agent_name(&input.description));
+        .unwrap_or_else(|| slugify_agent_name(&description));
     let created_at = iso8601_now();
-    let system_prompt = build_agent_system_prompt(&normalized_subagent_type, &model)?;
+    let system_prompt = build_agent_system_prompt(&normalized_subagent_type, &model, subagent_cfg.as_ref())?;
     let allowed_tools = allowed_tools_for_subagent(&normalized_subagent_type);
 
     let output_contents = format!(
@@ -3738,14 +3780,14 @@ where
 
 {}
 ",
-        agent_id, agent_name, input.description, normalized_subagent_type, created_at, input.prompt
+        agent_id, agent_name, description, normalized_subagent_type, created_at, input.prompt
     );
     std::fs::write(&output_file, output_contents).map_err(|error| error.to_string())?;
 
     let manifest = AgentOutput {
         agent_id,
         name: agent_name,
-        description: input.description,
+        description,
         subagent_type: Some(normalized_subagent_type),
         model: Some(model),
         status: String::from("running"),
@@ -3758,6 +3800,7 @@ where
         current_blocker: None,
         derived_state: String::from("working"),
         error: None,
+        result: None,
     };
     write_agent_manifest(&manifest)?;
 
@@ -3774,47 +3817,220 @@ where
         return Err(error);
     }
 
-    Ok(manifest)
+    // **2026-07-20 subagent 同步等结果改造**：spawn_fn 跑完时子 agent 已经同步执行完毕
+    //（`spawn_agent_job` 内部 Condvar wait 子线程跑完 `run_agent_job_with_outcome`）。
+    // 此时 manifest_file 已被 `persist_agent_terminal_state` 改写成终态（status=completed/failed、
+    // completed_at、derived_state、lane_events.finished），output_file 末尾也被追加了
+    // `## Result` / `### Final response` 段。这里读回终态 manifest + 从 output_file 反向解析
+    // final_text，回填到返回的 `AgentOutput`，让主 LLM 在 tool_result 里直接看到子 agent 的结论文本。
+    let final_manifest = read_back_terminal_manifest(&manifest.manifest_file).unwrap_or(manifest);
+    Ok(final_manifest)
+}
+
+/// **2026-07-20 subagent 同步等结果改造**：从 `manifest_file` 读回终态 `AgentOutput`，
+/// 再从 `output_file` 末尾反向解析 `### Final response` 段拿到 `final_text`，
+/// 回填到 `AgentOutput.result` 字段。失败时返回 `None`，调用方回退到原 manifest。
+fn read_back_terminal_manifest(manifest_file: &str) -> Option<AgentOutput> {
+    let manifest_text = std::fs::read_to_string(manifest_file).ok()?;
+    let mut terminal: AgentOutput = serde_json::from_str(&manifest_text).ok()?;
+    // 从 output_file 末尾解析 `### Final response\n\n{result}\n` 段。
+    // `format_agent_terminal_output` 用 `"\n### Final response\n\n{}\n"` 格式写入。
+    let output_text = std::fs::read_to_string(&terminal.output_file).ok()?;
+    if let Some(idx) = output_text.rfind("### Final response") {
+        let after = &output_text[idx + "### Final response".len()..];
+        // 跳过 "\n\n" 前缀，截到下一个 "\n## " 段或末尾。
+        let trimmed = after.trim_start_matches(['\n', ' ']);
+        let end = trimmed
+            .find("\n## ")
+            .or_else(|| trimmed.find("\n### "))
+            .unwrap_or(trimmed.len());
+        let final_text = trimmed[..end].trim_end().to_string();
+        if !final_text.is_empty() {
+            terminal.result = Some(final_text);
+        }
+    }
+    Some(terminal)
+}
+
+/// **2026-07-20 subagent 超时兜底**：主线程等子 agent 跑完的最长时间。
+/// 默认 10 分钟（`DEFAULT_SUBAGENT_TIMEOUT_SECS`），用 `CLAW_SUBAGENT_TIMEOUT_SECS` env 覆盖。
+/// 超时后主线程不再阻塞，回填 `status="timeout"` 让主 LLM 知道子 agent 没回结果。
+const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 600;
+
+/// **2026-07-20 subagent 超时兜底**：读 `CLAW_SUBAGENT_TIMEOUT_SECS` env 算超时。
+/// env 没设 / 解析失败 / ≤0 → 用 `DEFAULT_SUBAGENT_TIMEOUT_SECS`（10 分钟）兜底。
+fn subagent_timeout_duration() -> Duration {
+    std::env::var("CLAW_SUBAGENT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(DEFAULT_SUBAGENT_TIMEOUT_SECS))
 }
 
 fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
+    // **2026-07-20 subagent 同步等结果改造**：从 fire-and-forget 改成同步等结果。
+    // 主线程阻塞等子线程跑完 `run_agent_job`，拿到 `AgentRunOutcome` 后回填到 `AgentOutput`，
+    // 让主 LLM 在 tool_result 里直接看到子 agent 的结论文本（而非 `status:"running"` 占位回执）。
+    //
+    // **2026-07-21 Condvar race 修复**：去掉 Condvar + wait_timeout，改用 `mpsc::channel` +
+    // `recv_timeout` 同步等子线程退出。绕开 Windows Condvar wait_timeout 的 notify-before-wait race
+    // （子线程 set outcome + notify_one 在主线程 wait_timeout 之前发生，主线程等不到下一次 notify → 阻塞到超时）。
+    // **保留超时兜底**：用户 Ctrl+C 现场证据证明子 agent 在 auto_compact 后会卡死（Bug ①），若主线程
+    // 用 `handle.join()` 无限等会永久阻塞。`recv_timeout` 在子 agent 卡死时主线程超时 break 回填 timeout 终态。
+    let (outcome_tx, outcome_rx) = std::sync::mpsc::channel::<AgentRunOutcome>();
+    let manifest_for_timeout = job.manifest.clone();
+
     let thread_name = format!("clawd-agent-{}", job.manifest.agent_id);
-    std::thread::Builder::new()
+    let builder_result = std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
-            let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_agent_job(&job)));
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    let _ =
-                        persist_agent_terminal_state(&job.manifest, "failed", None, Some(error));
-                }
-                Err(_) => {
-                    let _ = persist_agent_terminal_state(
-                        &job.manifest,
-                        "failed",
-                        None,
-                        Some(String::from("sub-agent thread panicked")),
-                    );
-                }
+            // **2026-07-20 panic 兜底**：catch_unwind 包 run_agent_job_with_outcome，
+            // panic 时也 send outcome（status="failed", error="sub-agent thread panicked"），
+            // 避免主线程 recv_timeout 超时回错（应正常收到 failed outcome）。
+            let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_agent_job_with_outcome(&job)
+            })) {
+                Ok(outcome) => outcome,
+                Err(_) => AgentRunOutcome {
+                    status: String::from("failed"),
+                    final_text: None,
+                    error: Some(String::from("sub-agent thread panicked")),
+                },
+            };
+            // send 失败仅记日志——主线程可能已 recv_timeout 超时 break 走了，send 报错是正常竞态。
+            let _ = outcome_tx.send(outcome);
+        });
+    let handle = builder_result.map_err(|error| error.to_string())?;
+
+    // **2026-07-21 Condvar race 修复**：主线程 `recv_timeout` 等子线程 send outcome。
+    // - Ok(outcome) → 子 agent 正常跑完（completed/failed），拿 outcome 走后续回填。
+    // - Err(RecvTimeoutError) → 子 agent 卡死（auto_compact 后 / 网关挂了），主线程超时 break，
+    //   落盘 timeout 终态 + 回填 timeout outcome，主 LLM 拿到超时信号自己继续干活。
+    // - Err(RecvError) → 子线程 panic 后 send 也 panic（理论上 catch_unwind 兜底不会到这），兜底 failed。
+    // 超时时间来自 `subagent_timeout_duration()`（env `CLAW_SUBAGENT_TIMEOUT_SECS` 覆盖，默认 10 分钟）。
+    let timeout = subagent_timeout_duration();
+    let _outcome = match outcome_rx.recv_timeout(timeout) {
+        Ok(outcome) => outcome,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // 超时未收到 outcome。主线程不再阻塞，落盘 timeout 终态后回填 timeout outcome。
+            let _ = persist_agent_terminal_state(
+                &manifest_for_timeout,
+                "timeout",
+                None,
+                Some(format!("sub-agent timed out after {}s", timeout.as_secs())),
+            );
+            AgentRunOutcome {
+                status: String::from("timeout"),
+                final_text: None,
+                error: Some(format!("sub-agent timed out after {}s", timeout.as_secs())),
             }
-        })
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            // 子线程 panic 后 channel 也断了（catch_unwind 应兜底 send 不会到这，但兜底兜底）。
+            AgentRunOutcome {
+                status: String::from("failed"),
+                final_text: None,
+                error: Some(String::from("sub-agent thread dropped outcome channel")),
+            }
+        }
+    };
+
+    // 显式 join 子线程，确保子线程退出后再返回（避免子线程残留 panic / handle 被丢 Detached thread race）。
+    // join 失败本身不影响 outcome（outcome 已通过 channel 拿到），但记录日志。
+    // **recv_timeout 超时后子线程可能仍在卡死跑**——join 会阻塞等它跑完。这是 trade-off：
+    // 超时后主线程已回填 timeout 让主 LLM 继续干活，但子线程仍残留直到自己跑完或用户 Ctrl+C abort。
+    // 不调 join 会让子线程变 Detached thread（跑完自动退出），但 join 调了会阻塞主线程——
+    // 这里选 Detached：超时后不 join，让子线程自己跑完退出（catch_unwind 兜底 panic 不会永久残留）。
+    let _ = handle;  // drop handle = Detached thread，子线程跑完自动退出
+
+    // 把 outcome 回填到调用方（execute_agent_with_spawn 的 manifest）。但 spawn_agent_job 签名
+    // 是 `FnOnce(AgentJob) -> Result<(), String>`，无法直接把 outcome 返给调用方。
+    // 真正的回填逻辑放在 `execute_agent` 包装层（见下方 execute_agent_blocking）。
+    // 这里 spawn_agent_job 走"成功 spawn + recv_timeout 拿到 outcome"路径，返回 Ok(())。
+    // outcome 本身已落盘到 manifest_file（由 run_agent_job_with_outcome 内的
+    // persist_agent_terminal_state 完成），主 LLM 路径通过 execute_agent_blocking 读回。
+    Ok(())
 }
 
-fn run_agent_job(job: &AgentJob) -> Result<(), String> {
-    let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
-    // **2026-07-19 multiprovider 落地**：把子 agent 的 resolved model 注入 thread-local，
-    // dispatch 层的 `current_dispatch_model()` 优先读 thread-local 算 `compact_receipt`。
-    // 对照 `docs/multiprovider.md` 3.4bis 节选项 A。
-    set_subagent_model(&job.manifest.model.clone().unwrap_or_default());
-    let summary = runtime
-        .run_turn(job.prompt.clone(), None)
-        .map_err(|error| error.to_string())?;
-    let final_text = final_assistant_text(&summary);
-    persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)
+/// **2026-07-20 subagent 同步等结果改造**：`run_agent_job` 的 outcome 返回版。
+/// 跑完子 agent 的 `run_turn` 后，把终态（completed/failed）封装成 `AgentRunOutcome` 返回，
+/// 不再只返回 `Result<(), String>`。`persist_agent_terminal_state` 仍然落盘 manifest。
+/// **2026-07-21 子 LLM 诊断日志改造**：RAII guard 在子 agent 线程入口设 `CLAW_SUBAGENT_*` env，
+/// 跑完 Drop 时清理，避免 env 残留污染主 LLM 后续调用。
+/// `iteration` 字段不在这里设——子 agent `run_turn` 内部 loop 每轮自增，由 `set_subagent_iteration` 调。
+struct SubagentDiagEnvGuard {
+    agent_id_key: &'static str,
+    type_key: &'static str,
+}
+impl SubagentDiagEnvGuard {
+    fn set(agent_id: &str, subagent_type: &str) -> Self {
+        std::env::set_var("CLAW_SUBAGENT_AGENT_ID", agent_id);
+        std::env::set_var("CLAW_SUBAGENT_TYPE", subagent_type);
+        std::env::set_var("CLAW_SUBAGENT_ITERATION", "0");
+        Self {
+            agent_id_key: "CLAW_SUBAGENT_AGENT_ID",
+            type_key: "CLAW_SUBAGENT_TYPE",
+        }
+    }
+}
+impl Drop for SubagentDiagEnvGuard {
+    fn drop(&mut self) {
+        std::env::remove_var(self.agent_id_key);
+        std::env::remove_var(self.type_key);
+        std::env::remove_var("CLAW_SUBAGENT_ITERATION");
+    }
+}
+
+fn run_agent_job_with_outcome(job: &AgentJob) -> AgentRunOutcome {
+    // **2026-07-21 子 LLM 诊断日志改造**：在子 agent 线程入口设 `CLAW_SUBAGENT_*` env，
+    // api 层 `subagent_diag_context()` 读这三个 env 区分主子流量 + 关联 `.clawd-agents/{id}.json` manifest。
+    // 用 RAII guard 跑完自动清理，避免子 agent 终态后 env 残留污染主 LLM 后续调用。
+    let _env_guard = SubagentDiagEnvGuard::set(
+        &job.manifest.agent_id,
+        job.manifest.subagent_type.as_deref().unwrap_or(""),
+    );
+    let runtime_result = (|| -> Result<String, String> {
+        let mut runtime =
+            build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
+        // **2026-07-19 multiprovider 落地**：把子 agent 的 resolved model 注入 thread-local，
+        // dispatch 层的 `current_dispatch_model()` 优先读 thread-local 算 `compact_receipt`。
+        // 对照 `docs/multiprovider.md` 3.4bis 节选项 A。
+        set_subagent_model(&job.manifest.model.clone().unwrap_or_default());
+        let summary = runtime
+            .run_turn(job.prompt.clone(), None)
+            .map_err(|error| error.to_string())?;
+        Ok(final_assistant_text(&summary))
+    })();
+
+    match runtime_result {
+        Ok(final_text) => {
+            let _ = persist_agent_terminal_state(
+                &job.manifest,
+                "completed",
+                Some(final_text.as_str()),
+                None,
+            );
+            AgentRunOutcome {
+                status: String::from("completed"),
+                final_text: Some(final_text),
+                error: None,
+            }
+        }
+        Err(error) => {
+            let _ = persist_agent_terminal_state(
+                &job.manifest,
+                "failed",
+                None,
+                Some(error.clone()),
+            );
+            AgentRunOutcome {
+                status: String::from("failed"),
+                final_text: None,
+                error: Some(error),
+            }
+        }
+    }
 }
 
 fn build_agent_runtime(
@@ -3866,7 +4082,14 @@ fn build_agent_runtime(
     Ok(runtime)
 }
 
-fn build_agent_system_prompt(subagent_type: &str, model: &str) -> Result<Vec<String>, String> {
+/// ★ 2026-07-19 路径 E 落地：加第三参数 `subagent_cfg`——配置里的 `systemPrompt` 段追加到默认
+/// "You are a background sub-agent..." 后。`None` 走原逻辑（保持向后兼容）。
+/// 对照 `docs/SUBAGENT_GUIDE.md` 第二节 + `docs/multiprovider.md` 3.4septies 节。
+fn build_agent_system_prompt(
+    subagent_type: &str,
+    model: &str,
+    subagent_cfg: Option<&runtime::SubagentConfig>,
+) -> Result<Vec<String>, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     let mut prompt = load_system_prompt(
         cwd,
@@ -3879,6 +4102,13 @@ fn build_agent_system_prompt(subagent_type: &str, model: &str) -> Result<Vec<Str
     prompt.push(format!(
         "You are a background sub-agent of type `{subagent_type}`. Work only on the delegated task, use only the tools available to you, do not ask the user questions, and finish with a concise result."
     ));
+    // ★ 2026-07-19 路径 E 落地：配置里的 `systemPrompt` 段追加到默认 "You are a background sub-agent..." 后。
+    // 没配或空段跳过（保持向后兼容）。对照 `docs/SUBAGENT_GUIDE.md` 第二节 + `docs/multiprovider.md` 3.4septies 节。
+    if let Some(cfg) = subagent_cfg {
+        if !cfg.system_prompt.trim().is_empty() {
+            prompt.push(cfg.system_prompt.clone());
+        }
+    }
     Ok(prompt)
 }
 
@@ -3890,7 +4120,15 @@ fn resolve_agent_model(model: Option<&str>) -> String {
         .to_string()
 }
 
+/// ★ 2026-07-19 路径 E 落地：先查 `RuntimeConfig.subagents[type].tools`（配置显式配了就用配置的工具白名单），
+/// 没配走原预置 match 分支（保持向后兼容）。对照 `docs/SUBAGENT_GUIDE.md` 第二节 + `docs/multiprovider.md` 3.4septies 节。
 fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
+    // 配置优先：`subagents.<type>.tools` 显式配了就用配置的，覆盖预置集
+    if let Some(cfg) = load_subagents_config().get(subagent_type) {
+        if !cfg.tools.is_empty() {
+            return cfg.tools.iter().cloned().collect();
+        }
+    }
     let tools = match subagent_type {
         "Explore" => vec![
             "read_file",
@@ -4985,6 +5223,16 @@ fn load_subagent_provider_routing() -> runtime::SubagentProviderRouting {
         .unwrap_or_default()
 }
 
+/// ★ 2026-07-19 路径 E 落地：读 `.claw.json` 顶层 `subagents` 段拿预定义子 agent 配置。
+/// 没配返回空 `BTreeMap`（保持向后兼容，`execute_agent` / `allowed_tools_for_subagent` 走原预置逻辑）。
+fn load_subagents_config() -> BTreeMap<String, runtime::SubagentConfig> {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| ConfigLoader::default_for(cwd).load().ok())
+        .map(|config| config.subagents().clone())
+        .unwrap_or_default()
+}
+
 /// multiprovider 落地后仅 `new` 调用，而 `new` 仅测试 target 调用。
 #[allow(dead_code)]
 fn load_provider_fallback_config() -> ProviderFallbackConfig {
@@ -5536,10 +5784,19 @@ fn agent_store_dir() -> Result<std::path::PathBuf, String> {
     if let Ok(path) = std::env::var("CLAWD_AGENT_STORE") {
         return Ok(std::path::PathBuf::from(path));
     }
+    // 子 agent 的 manifest/output 落点必须**在主 agent 工作区内**——否则主 LLM
+    // 用 `read_file` 收 outputFile 时会被 `validate_workspace_boundary_impl`
+    // 拒（报 `path ... escapes workspace boundary ...`），只能瞎试 `TaskOutput`
+    // 又拿不到（Agent 工具不进 TaskRegistry 那套后台 task 表）。
+    //
+    // claw 全栈约定 cwd 即工作区根——`file_ops.rs::persist_large_output` 落
+    // `.claw/persisted/`、`session_control.rs` 全套 `current_dir()` 当工作区根
+    // 都靠这条。这里同样 cwd 同级落 `.clawd-agents/`，跟 `.claw/` 那套平级。
+    //
+    // 之前 `ancestors().nth(2)` 往上级猜工作区是错的——cwd 是 `E:\NW工程\资料库\html`
+    // 时往上级两级落到 `E:\NW工程\.clawd-agents\`，跑出了工作区 `E:\NW工程\资料库\html`
+    // 边界，触发上面那条 `escapes workspace boundary` 报错（2026-07-19 真机现场）。
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    if let Some(workspace_root) = cwd.ancestors().nth(2) {
-        return Ok(workspace_root.join(".clawd-agents"));
-    }
     Ok(cwd.join(".clawd-agents"))
 }
 
@@ -6715,14 +6972,14 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, build_agent_system_prompt,
-        classify_lane_failure, clear_subagent_model, current_dispatch_model, derive_agent_state,
-        execute_agent_with_spawn, execute_tool, extract_recovery_outcome, final_assistant_text,
-        global_cron_registry, maybe_commit_provenance, mvp_tool_specs,
-        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
-        resolve_subagent_provider, run_task_packet, set_subagent_model, AgentInput, AgentJob,
-        GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
-        SubagentToolExecutor,
+        agent_permission_policy, agent_store_dir, allowed_tools_for_subagent,
+        build_agent_system_prompt, classify_lane_failure, clear_subagent_model,
+        current_dispatch_model, derive_agent_state, execute_agent_with_spawn, execute_tool,
+        extract_recovery_outcome, final_assistant_text, global_cron_registry,
+        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
+        persist_agent_terminal_state, push_output_block, resolve_subagent_provider, run_task_packet,
+        set_subagent_model, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName,
+        LaneFailureClass, ProviderRuntimeClient, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::ProviderFallbackConfig;
@@ -8603,6 +8860,31 @@ mod tests {
         assert_eq!(selected_with_alias_output["matches"][1], "Skill");
     }
 
+    /// ★ 2026-07-19 落点回归覆盖：`agent_store_dir()` 不往上级猜工作区，
+    /// 直接 cwd 同级落 `.clawd-agents/`——确保 outputFile 在主 agent 工作区内，
+    /// 主 LLM 用 `read_file` 收活不被 `validate_workspace_boundary_impl` 拒。
+    /// 之前 `ancestors().nth(2)` 往上级猜会把 outputFile 落出工作区边界，
+    /// 真机现场 cwd 是 `E:\NW工程\资料库\html` 时落到 `E:\NW工程\.clawd-agents\`
+    /// 触发 `escapes workspace boundary` 报错。
+    #[test]
+    fn agent_store_dir_falls_back_to_cwd_sibling_in_workspace() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // 不 set `CLAWD_AGENT_STORE`——走 cwd fallback 那条才是本次改的逻辑。
+        std::env::remove_var("CLAWD_AGENT_STORE");
+        let cwd = std::env::current_dir().expect("cwd should be set in test");
+        let resolved = agent_store_dir().expect("agent_store_dir should resolve");
+        // 落点必须等于 cwd.join(".clawd-agents")——不能往上级跑。
+        assert_eq!(
+            resolved,
+            cwd.join(".clawd-agents"),
+            "agent_store_dir should fall back to cwd.join(\".clawd-agents\") so the output file \
+             stays inside the main agent workspace; the old `ancestors().nth(2)` guess escaped \
+             the workspace boundary and broke read_file retrieval",
+        );
+    }
+
     #[test]
     fn agent_persists_handoff_metadata() {
         let _guard = env_lock()
@@ -9284,7 +9566,7 @@ mod tests {
         std::env::set_current_dir(&root).expect("enter temp workspace");
 
         // when: building the subagent system prompt
-        let prompt = build_agent_system_prompt("Explore", "openai/gpt-4.1-mini")
+        let prompt = build_agent_system_prompt("Explore", "openai/gpt-4.1-mini", None)
             .expect("subagent system prompt should build")
             .join("\n");
         std::env::set_current_dir(previous).expect("restore current dir");

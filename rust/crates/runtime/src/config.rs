@@ -68,6 +68,10 @@ pub struct RuntimeFeatureConfig {
     /// **2026-07-19 multiprovider 落地**：按 `subagent_type` 路由的子 agent provider 配置。
     /// 默认空 → 调用方 fallback 到主 LLM env 路径（保持向后兼容）。
     subagent_provider_routing: SubagentProviderRouting,
+    /// ★ 2026-07-19 路径 E 落地：预定义子 agent 配置段（`.claw.json` 顶层 `subagents`）。
+    /// 默认空 → 主 LLM system prompt 不注入"Available subagents:"段，主 LLM 靠自己推理决定何时派。
+    /// 配了 → `SystemPromptBuilder::with_runtime_config` 注入 description 列表，主 LLM 能看 description 判断何时该派、派给哪个 type。
+    subagents: BTreeMap<String, SubagentConfig>,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -114,6 +118,29 @@ pub struct SubagentProviderConfig {
 pub struct SubagentProviderRouting {
     pub by_type: BTreeMap<String, SubagentProviderConfig>,
     pub default: Option<SubagentProviderConfig>,
+}
+
+/// ★ 2026-07-19 路径 E 落地：一份预定义子 agent 配置（`.claw.json` 顶层 `subagents` 段每条）。
+///
+/// 让主 LLM 能看 description 判断"何时该派、派给哪个 type"——`SystemPromptBuilder::with_runtime_config`
+/// 注入"Available subagents:"段列各 subagent 的 type + description。`execute_agent` / `allowed_tools_for_subagent`
+/// 读本配置拿 description/tools/systemPrompt，合并主 LLM 派活时 `AgentInput` 里传的字段。
+///
+/// 对照 `docs/SUBAGENT_GUIDE.md` 第二节"方式 B 真相"段 + `docs/multiprovider.md` 3.4septies 节。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SubagentConfig {
+    /// 子 agent 职责描述——主 LLM 派活时靠它判断"这活该不该派给这子 agent"。
+    /// 注入主 LLM system prompt 的"Available subagents:"段。
+    pub description: String,
+    /// 子 agent 可用的工具白名单。**覆盖默认集**（`allowed_tools_for_subagent` 按 `subagent_type` 给的）。
+    /// 空 → 走默认集（保持向后兼容）。
+    pub tools: Vec<String>,
+    /// 子 agent 的额外系统提示，追加到默认 "You are a background sub-agent..." 后。
+    pub system_prompt: String,
+    /// 子 agent 用的模型名（也支持 `aliases` 短名）。空 → 走 `DEFAULT_AGENT_MODEL`。
+    /// **注意**：multiprovider 路由（`subagentProviderDefault` 那套）配了时覆盖本字段——
+    /// `resolve_subagent_provider` 用 `cfg.model.clone()` 不让 `input_model` 覆盖（见 `docs/multiprovider.md` 3.4sexies 节）。
+    pub model: String,
 }
 
 /// Hook command lists grouped by lifecycle stage.
@@ -357,6 +384,7 @@ impl ConfigLoader {
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
             subagent_provider_routing: parse_optional_subagent_provider_routing(&merged_value)?,
+            subagents: parse_optional_subagents(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -457,6 +485,14 @@ impl RuntimeConfig {
     #[must_use]
     pub fn subagent_provider_routing(&self) -> &SubagentProviderRouting {
         &self.feature_config.subagent_provider_routing
+    }
+
+    /// ★ 2026-07-19 路径 E 落地：预定义子 agent 配置段（`.claw.json` 顶层 `subagents`）。
+    /// 默认空 → 主 LLM system prompt 不注入"Available subagents:"段。
+    /// 配了 → `SystemPromptBuilder::with_runtime_config` 注入 description 列表 + `execute_agent` / `allowed_tools_for_subagent` 读本配置。
+    #[must_use]
+    pub fn subagents(&self) -> &BTreeMap<String, SubagentConfig> {
+        &self.feature_config.subagents
     }
 
     #[must_use]
@@ -1041,6 +1077,54 @@ fn parse_optional_subagent_provider_routing(
     Ok(SubagentProviderRouting { by_type, default })
 }
 
+/// ★ 2026-07-19 路径 E 落地：解析 `.claw.json` 顶层 `subagents` 段。
+///
+/// 形态：`{ "subagents": { "<type>": { "description": "...", "tools": [...], "systemPrompt": "...", "model": "..." }, ... } }`
+/// 都没配 → 返回空 `BTreeMap`（保持向后兼容，主 LLM system prompt 不注入"Available subagents:"段）。
+/// 对照 `docs/SUBAGENT_GUIDE.md` 第二节 + `docs/multiprovider.md` 3.4septies 节。
+fn parse_optional_subagents(root: &JsonValue) -> Result<BTreeMap<String, SubagentConfig>, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(subagents_value) = object.get("subagents") else {
+        return Ok(BTreeMap::new());
+    };
+    let subagents_map = expect_object(subagents_value, "merged settings.subagents")?;
+    let mut subagents: BTreeMap<String, SubagentConfig> = BTreeMap::new();
+    for (subagent_type, config_value) in subagents_map {
+        let cfg = parse_subagent_config(
+            config_value,
+            &format!("merged settings.subagents.{subagent_type}"),
+        )?;
+        subagents.insert(subagent_type.clone(), cfg);
+    }
+    Ok(subagents)
+}
+
+fn parse_subagent_config(
+    value: &JsonValue,
+    context: &str,
+) -> Result<SubagentConfig, ConfigError> {
+    let object = expect_object(value, context)?;
+    let description = optional_string(object, "description", context)?
+        .unwrap_or("")
+        .to_string();
+    let tools = optional_string_array(object, "tools", context)?
+        .unwrap_or_default();
+    let system_prompt = optional_string(object, "systemPrompt", context)?
+        .unwrap_or("")
+        .to_string();
+    let model = optional_string(object, "model", context)?
+        .unwrap_or("")
+        .to_string();
+    Ok(SubagentConfig {
+        description,
+        tools,
+        system_prompt,
+        model,
+    })
+}
+
 fn parse_subagent_provider_config(
     value: &JsonValue,
     context: &str,
@@ -1419,7 +1503,7 @@ fn push_unique(target: &mut Vec<String>, value: String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        deep_merge_objects, parse_optional_subagent_provider_routing,
+        deep_merge_objects, parse_optional_subagent_provider_routing, parse_optional_subagents,
         parse_permission_mode_label, resolve_env_ref, ConfigLoader, ConfigSource, McpServerConfig,
         McpTransport, ResolvedPermissionMode, RuntimeFeatureConfig, RuntimeHookConfig,
         RuntimePluginConfig, SubagentProviderConfig, SubagentProviderRouting,
@@ -2453,5 +2537,62 @@ mod tests {
         };
         assert_eq!(populated.by_type.len(), 1);
         assert!(populated.default.is_some());
+    }
+
+    /// ★ 2026-07-19 路径 E 落地：`parse_optional_subagents` 解析 `.claw.json` 顶层 `subagents` 段。
+    #[test]
+    fn parse_optional_subagents_empty_when_unconfigured() {
+        let root = JsonValue::Object(std::collections::BTreeMap::new());
+        let subagents = parse_optional_subagents(&root)
+            .expect("empty config should parse to empty subagents map");
+        assert!(subagents.is_empty());
+    }
+
+    #[test]
+    fn parse_optional_subagents_populated() {
+        let mut root_map = std::collections::BTreeMap::new();
+        let mut review_cfg = std::collections::BTreeMap::new();
+        review_cfg.insert("description".to_string(), JsonValue::String("Review code for bugs".to_string()));
+        review_cfg.insert(
+            "tools".to_string(),
+            JsonValue::Array(vec![
+                JsonValue::String("read_file".to_string()),
+                JsonValue::String("grep_search".to_string()),
+            ]),
+        );
+        review_cfg.insert("systemPrompt".to_string(), JsonValue::String("Be thorough.".to_string()));
+        review_cfg.insert("model".to_string(), JsonValue::String("glm-5.1".to_string()));
+        let mut subagents_map = std::collections::BTreeMap::new();
+        subagents_map.insert("review".to_string(), JsonValue::Object(review_cfg));
+        root_map.insert("subagents".to_string(), JsonValue::Object(subagents_map));
+        let root = JsonValue::Object(root_map);
+
+        let subagents = parse_optional_subagents(&root)
+            .expect("populated subagents段 should parse");
+        assert_eq!(subagents.len(), 1);
+        let review = subagents.get("review").expect("review entry should exist");
+        assert_eq!(review.description, "Review code for bugs");
+        assert_eq!(review.tools, vec!["read_file".to_string(), "grep_search".to_string()]);
+        assert_eq!(review.system_prompt, "Be thorough.");
+        assert_eq!(review.model, "glm-5.1");
+    }
+
+    #[test]
+    fn parse_optional_subagents_defaults_empty_optional_fields() {
+        let mut root_map = std::collections::BTreeMap::new();
+        let mut subagents_map = std::collections::BTreeMap::new();
+        // 只配 description，其他字段缺省
+        let mut cfg = std::collections::BTreeMap::new();
+        cfg.insert("description".to_string(), JsonValue::String("Bare config".to_string()));
+        subagents_map.insert("bare".to_string(), JsonValue::Object(cfg));
+        root_map.insert("subagents".to_string(), JsonValue::Object(subagents_map));
+        let root = JsonValue::Object(root_map);
+
+        let subagents = parse_optional_subagents(&root).expect("bare config should parse");
+        let bare = subagents.get("bare").expect("bare entry should exist");
+        assert_eq!(bare.description, "Bare config");
+        assert!(bare.tools.is_empty());
+        assert!(bare.system_prompt.is_empty());
+        assert!(bare.model.is_empty());
     }
 }

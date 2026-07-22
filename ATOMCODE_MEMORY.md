@@ -930,3 +930,164 @@ claw 没这两道前置减压（micro-compact 还被 DISABLE 了），到 750K �
 29. ★ 2026-07-19 新增（路径 E 新债——主 LLM system prompt 注入 subagent 可用描述让他能判断何时派）：用户问"怎样才能让主 LLM 调用 agent"——扒源码确认主 LLM system prompt 构造点 `build_system_prompt`（`rusty-claude-cli/src/main.rs:8124`）→ `load_system_prompt`（`runtime/src/prompt.rs:458`）→ `SystemPromptBuilder::with_runtime_config(config)`——`config` 是 `RuntimeConfig`，但 `RuntimeConfig` **没解析 `.claw.json` 顶层 `subagents` 段**（`grep "subagents"` 命中 0，除 commands 那个无关字串），主 LLM system prompt 不注入任何"有哪些 subagent 可用 + 各自 description"。主 LLM 看到的只有 `Agent` 工具 schema（含 `subagent_type`/`description`/`prompt`/`model`/`name` 字段定义），但**不知道有哪些预定义 subagent_type 可派、何时该派给哪个 type**——只能靠自己的推理决定何时派，可能永远不会主动派，甚至把你字面点名的"用 review 子 agent 检查"理解成"我自己去 review"自己干（真机触发现场：主 LLM 输出 `TaskCreate` 死登记器或直接调 read_file/bash 自己干，不输出 `Agent` 工具调用）。**当前唯一稳定触发路径**是对话中显式点名且把"派 `Agent` 工具"明写出来逼主 LLM 输出 `Agent` 工具调用："调 Agent 工具，subagent_type=review，description=检查 setup.py 的安全问题，prompt=检查 setup.py 的安全问题"。
     - **路径 E 范围（下次接手要做的，新债）**：落地 `.claw.json` 顶层 `subagents` 段解析 + 注入 description 到主 LLM system prompt，让主 LLM 能看 description 判断何时该派、派给哪个 type。具体改 5 处：①`runtime/src/config.rs` 加 `SubagentConfig` struct（`description`/`tools`/`systemPrompt`/`model`）+ `parse_optional_subagents` + `RuntimeConfig.subagents: BTreeMap<String, SubagentConfig>`；②`runtime/src/config_validate.rs` 的 `TOP_LEVEL_FIELDS` 加 `subagents: FieldType::Object` + `SUBAGENTS_FIELDS` 子段白名单；③`runtime/src/prompt.rs` 的 `SystemPromptBuilder::with_runtime_config` 改——注入"Available subagents:"段列各 subagent 的 type + description，让主 LLM system prompt 看到可用 subagent 列表；④`tools/src/lib.rs` 的 `execute_agent` / `allowed_tools_for_subagent` 改——读 `RuntimeConfig.subagents[subagent_type]` 拿 description/tools/systemPrompt，合并模型 input 里传的（按配置优先还是 input 优先要设计）；⑤`build_agent_system_prompt` 改——注入配置里的 `systemPrompt` 段。本期不动这条——multiprovider 落地收尾不混新功能，但 MEMORY 第 29 条已记下"路径 E 真触发点"这条判断，下次接手可对照判读是否真要开路径 E。
     - **★ 已同步修订 `docs/SUBAGENT_GUIDE.md`** 3 处揭穿与实现脱节的描述：①第 2 节 Step 3 触发方式——把"方式 A 主 agent 自动判断派活（推荐）"降级成"方式 B（不保证触发）"，加"★ 2026-07-19 真机验证后修订：主 agent 何时该派的真相"段讲清楚 `RuntimeConfig` 不解析 `subagents` 段 + 主 LLM system prompt 不注入 description + 当前唯一稳定触发路径是显式点名把"派 Agent 工具"明写出来；②第 8 节 Q1"会自动触发吗"——从"会自动触发"改成"当前只能手动显式点名派"，明示路径 E 那条新债；③第 9 节快速起手模板末段——把"对话中主 agent 会自动调这些子 agent"改成"`subagents` 段 claw 源码根本不解析配了等于白配，当前唯一稳定触发路径是显式点名"，但保留 `aliases` 段是有效的说明。
+
+    **★★ 2026-07-19 路径 E 落地完成**：上文第 29 条开头段判"本期不动这条"——用户回"开吧"后真落地了。改 5 处源码 + 6 条单元测试全过：
+    - **①`runtime/src/config.rs`** 加 `SubagentConfig` struct（`description`/`tools`/`systemPrompt`/`model` 四字段全可选默认空）+ `parse_optional_subagents` 解析函数 + `parse_subagent_config` helper + `RuntimeFeatureConfig.subagents: BTreeMap<String, SubagentConfig>` 字段 + `RuntimeConfig::subagents()` 访问器 + `load()` 调用解析。
+    - **②`runtime/src/config_validate.rs`** `TOP_LEVEL_FIELDS` 加 `subagents: FieldType::Object` + 新建 `SUBAGENTS_FIELDS` 常量（`description`/`tools`/`systemPrompt`/`model` 四字段白名单）+ 调用点校验遍历 `subagents` 段每个 type 子段走 `SUBAGENTS_FIELDS`。
+    - **③`runtime/src/prompt.rs`** `SystemPromptBuilder::build` 改——`render_config_section` 后调新函数 `render_subagents_section(config)` 注入"# Available subagents"段列各 subagent type + description；没配返回 `None` 跳过（保持向后兼容）。
+    - **④`tools/src/lib.rs`** `execute_agent` 改——加 `load_subagents_config()` helper 拿 `RuntimeConfig.subagents()`；读 `subagent_cfg = subagents.get(type).cloned()` 合并 input：`description` input 空时 fallback 配置的，`model` input 空时 fallback 配置的，`system_prompt` 传给 `build_agent_system_prompt` 第三参数。`allowed_tools_for_subagent` 改——配置优先 `subagents.<type>.tools` 显式配了就用配置的覆盖预置集，没配走原预置 match 分支（保持向后兼容）。
+    - **⑤`tools/src/lib.rs`** `build_agent_system_prompt` 签名加第三参数 `subagent_cfg: Option<&runtime::SubagentConfig>`——函数体末尾追加 `if let Some(cfg) = subagent_cfg { if !cfg.system_prompt.trim().is_empty() { prompt.push(cfg.system_prompt.clone()) } }` 注入配置里的 systemPrompt 段；`None` 走原逻辑（保持向后兼容）。`tools/src/lib.rs:9341` 那条预存测试调旧签名补 `None` 第三参数。
+    - **单元测试 6 条全过**：`config.rs` 加 3 条 `parse_optional_subagents_empty_when_unconfigured` / `parse_optional_subagents_populated` / `parse_optional_subagents_defaults_empty_optional_fields`；`prompt.rs` 加 3 条 `render_subagents_section_returns_none_when_unconfigured` / `render_subagents_section_lists_configured_subagents` / `render_subagents_section_shows_no_description_placeholder`。✅ `cargo test -p runtime --lib parse_optional_subagents` 3 passed 0 failed；✅ `cargo test -p runtime --lib render_subagents_section` 3 passed 0 failed。
+    - **验证状态**：✅ `cargo check --workspace` 全绿零 warning；✅ `cargo test -p runtime --lib` + `cargo test -p tools --lib` 我引入的全过零失败。剩报错都是预存债（MEMORY 第 24 条已记：api bench/test `cache_control` 缺失 + Windows 测试失败 + file_ops `reads_and_writes_files` 7-18 三重门 trailer 预存债 + conversation hook 那条——git stash 验证 conversation.rs 我根本没动过，同条测试 stash 后依然 FAILED，是预存债不是我引入的）。⏳ 真机验证未做——用户重编 `cargo build --release` 替换 `claw.exe` 后真机跑一轮，看主 LLM system prompt 里是否出现"# Available subagents"段（配了 `subagents` 段才出现）+ 主 LLM 是否能看 description 判断何时该派、派给哪个 type。验通则路径 E 真闭环——主 LLM 能主动派活不再靠用户显式点名。
+    - **落地后 `docs/SUBAGENT_GUIDE.md` 第 2/8/9 节那段"★ 2026-07-19 真机验证后修订"段要再次修订**——之前判"路径 E 那条新债本期不动"现在落地了，要把"当前唯一稳定触发路径是显式点名"改成"配了 `subagents` 段后主 LLM system prompt 注入 Available subagents 列表，主 LLM 能看 description 判断何时该派；没配仍只能显式点名"。这条修订留作下次接手清单——本次路径 E 落地收尾不混文档修订，但 MEMORY 第 29 条已记下"落地后要再次修订 SUBAGENT_GUIDE.md"这条判断。
+
+30. ★ 2026-07-19 路径 E 真机验证——system prompt 真注入 Available subagents 段，主 LLM 没自自觉派活靠 description 提示不够
+    - **真机现场**：用户照路径 E 落地后配的 settings.json（`subagents` 段含 reader + review 两条）重启 claw，跑一轮后日志 `claw_glm_diag.log` 2426 行。扒日志按"修订版五步姿势"走：
+      - ①事件分布：`claw_request_size` ×2 / `claw_glm_diag` ×2 / `claw_cache_diag` ×2，**`claw_auto_compact`/`claw_microcompact` ×0**——只 2 轮 API 调用，会话太短
+      - ②主 LLM system prompt 段（日志行 28 + 1255 两轮都含）：**真注入了 `# Available subagents` 段**——含 `reader`/`review` 两条 description 原文。路径 E 落地生效，`render_subagents_section` 真把配置段注入主 LLM system prompt
+      - ③主 LLM 输出判读：`"name": "Agent"` 命中 2 次（行 370 + 1597）但**都是 tool schema 定义**（`"type": "object"` + `input_schema` 那个），**不是真 tool_use 调用**——主 LLM 没输出任何 Agent 工具调用，没派活给 reader/review。日志 0 个真 Agent tool_use
+      - ④grep `"Task"`/`"TaskCreate"`/`"WorkerCreate"` 命中 0——主 LLM 也没走其他派活工具链
+      - ⑤脱敏占位符命中：`词23_4dc1478b` ×4 + `词60_4f8389a4` ×1——hook 脱敏在主 LLM 路径生效（主 LLM 调了 read_file 读含敏感词的文件，被脱敏后送进上下文）
+      - ⑥403/Forbidden 命中 0——本轮没子 agent 路径触发，没 403 报错
+    - **判读结论**：路径 E 落地**对了一半**——`render_subagents_section` 真注入"# Available subagents"段到主 LLM system prompt（配置侧 + 注入侧都对），但**主 LLM 看到描述后没自自觉派活**。日志只 2 轮 API 调用会话太短，主 LLM 没遇到需要读代码的场景所以没派——这条判读不能定死"主 LLM 永远不派"，可能任务性质不刚需子 agent（像栏目标题排序设计方案咨询那种主 LLM 自己能干）。但也不能判"路径 E 真闭环"——本轮没真触发派活场景，主 LLM 主动派活能力未验
+    - **下次真机验证建议（再次修订）**：用户对话中给一个**刚需读代码的任务**——比如"检查 E:/内网工程/资料库AI版/sirchmunk/sirchmunk-0.0.7post1/setup.py 有没有安全问题"或"读 E:/内网工程/资料库AI版/sirchmunk/sirchmunk-0.0.7post1/setup.py 告诉我用了哪些 setuptools 参数"。这种任务主 LLM 自己调 read_file 也能干，但 description 写成"主 LLM 遇到任何需要看代码内容的活都派给本子 agent"应该能触发主 LLM 派给 reader。如果仍不派——说明光靠 description 提示不够强势，要改 `render_subagents_section` 注入更强语义指导（如"派活优先于自己调 read_file"那类强制规则）或开路径 F 那条新债（给主 LLM 工具集做白名单禁调 read_file 强制派活）。本期不动这条——路径 E 落地收尾不混新功能，但 MEMORY 第 30 条已记下"主 LLM 没自自觉派活靠 description 提示不够"这条判断，下次接手可对照判读是否真要开路径 F。
+    - **教训补充第九步**：扒日志判主 LLM 派活证据时**别拿 tool schema 定义命中当真 tool_use 调用**——`"name": "Agent"` 命中可能是 tool schema 那段（`"type": "object"` + `input_schema` + `required` 那个），不是主 LLM 输出的 tool_use。要区分：**tool schema 命中**看 `"type": "tool"` 段（input_schema/name/description 那个）；**tool_use 调用命中**看 `"type": "tool_use"` 段（input/id 那个）。本轮我第一次 grep `"name": "Agent"` 命中 2 次差点判成"主 LLM 真派活了"，细看行 360-380 那段才看清是 tool schema 定义不是真调用——这条教训跟第 27 条修订版第四步那条"`Agent` 命中要区分工具定义 vs 工具调用"同根源，但本次再踩一次说明那条教训要更强记：**光看 `"name": "X"` 命中不能判主 LLM 调了 X 工具，必须看那行周围是 `"type": "tool"` 还是 `"type": "tool_use"`**。
+
+31. ★ 2026-07-20 subagent 同步等结果改造 + 超时/panic 兜底（multi-provider-subagent 分支接续第 30 条）
+    - **改造背景**：MEMORY 第 28-30 条 multiprovider 落地 + 路径 E 真机验后，用户看云端统计表发现主 LLM (DeepSeek) 调 33 次但子 LLM (GLM) 只调 3 次。扒 `E:/NW工程/资料库/html/claw_glm_diag.log` 63746 行确认：①主 LLM 上下文里**所有** agent manifest 都是 `status:"running"`（行 1244/2762/4427 等），从未出现 `status:"completed"` 的 manifest；②`spawn_agent_job` 是 fire-and-forget——spawn 子线程后立即返回 `status:"running"` 占位回执，主 LLM 拿到的 tool_result **不含子 agent 的结论文本**，只知道"活派出去了、结果在 .md 文件里"但自己得后续 read_file 那个 .md 才能拿到；③子 agent 在独立线程跑完 `run_agent_job`，`final_text` 只通过 `persist_agent_terminal_state` 落盘到 `.clawd-agents/{agent_id}.md`，主 LLM 上下文里没这个文本。**根因**：当前架构是 fire-and-forget 异步派活，主 LLM 拿不到子 agent 的执行结果文本，只拿到一个"已派活、结果在文件里"的回执。
+    - **改造方案（2 文件 8 处）**：把 `execute_agent_with_spawn` 从 fire-and-forget 改成同步等结果。
+        - **①`AgentRunOutcome` struct + `AgentRunOutcomeSlot` 类型别名**（`tools/src/lib.rs:3707-3728`）：`AgentRunOutcome { status, final_text, error }` 装子 agent 跑完的终态；`AgentRunOutcomeSlot = Arc<(Mutex<Option<AgentRunOutcome>>, Condvar)>` 用共享 slot + Condvar 让主线程同步等子线程 set outcome + notify。`AgentRunOutcome` 加 `#[allow(dead_code)]`（字段当前没被直接读取，回填走读盘路径，但保留结构体用于未来扩展）。
+        - **②`spawn_agent_job` 从 fire-and-forget 改成同步等结果**（`:3873-3950`）：①建 `outcome_slot` + `slot_for_thread` 两个 Arc clone；②spawn 子线程，closure 里 `catch_unwind` 包 `run_agent_job_with_outcome`（panic 时也构造 `AgentRunOutcome{status:"failed",error:"sub-agent thread panicked"}` + set slot + notify_one，避免主线程永久阻塞）；③主线程 `cvar.wait_timeout(guard, timeout)` 阻塞等——拿到 `Some(outcome)` break 跳出循环，拿到 `None`（超时未收到 outcome）调 `persist_agent_terminal_state(manifest,"timeout",None,Some("sub-agent timed out after Xs"))` 落盘超时终态后 break；④显式 `handle.join()` 确保子线程退出后再返回。
+        - **③`run_agent_job_with_outcome` 替代 `run_agent_job`**（`:3971-4012`）：跑完子 agent 的 `run_turn` 后封装成 `AgentRunOutcome` 返回。`Ok(final_text)` → `AgentRunOutcome{status:"completed",final_text:Some(...),error:None}` + `persist_agent_terminal_state("completed",final_text,...)`；`Err(error)` → `AgentRunOutcome{status:"failed",final_text:None,error:Some(...)}` + `persist_agent_terminal_state("failed",None,Some(error),...)`。原 `run_agent_job` 删除（fire-and-forget 路径废弃）。
+        - **④`AgentOutput` 加 `result: Option<String>` 字段**（`:2796-2832`）：`#[serde(default, skip_serializing_if = "Option::is_none")]`。主 LLM 在 tool_result JSON 里通过 `result` 字段直接拿到子 agent 的最终回复，不再只看到 `status:"running"` 占位回执。`None` 表示子 agent 还没跑完（旧 fire-and-forget 路径）或跑完但没产出 final_text（max_iterations 超限/异常退出）。
+        - **⑤`read_back_terminal_manifest` 函数**（`:3854-3880`）：`execute_agent_with_spawn` 在 `spawn_fn` 跑完后调此函数从 `manifest_file` 读回终态 `AgentOutput`，再从 `output_file` 末尾反向解析 `### Final response\n\n{result}\n` 段拿到 `final_text`，回填到 `AgentOutput.result` 字段。失败时返回 `None`，调用方回退到原 manifest。
+        - **⑥`subagent_timeout_duration` 函数 + `DEFAULT_SUBAGENT_TIMEOUT_SECS` 常量**（`:3862-3878`）：默认 10 分钟（`DEFAULT_SUBAGENT_TIMEOUT_SECS=600`），`CLAW_SUBAGENT_TIMEOUT_SECS` env 覆盖。env 没设/解析失败/≤0 走默认。
+        - **⑦`AgentRunOutcome` 三种 status**：`completed`（子 agent 正常跑完产出 final_text）/`failed`（子 agent run_turn 报错或子线程 panic）/`timeout`（主线程 wait_timeout 跑满 10 分钟子 agent 还没回结果）。主 LLM 通过 `AgentOutput.status` + `AgentOutput.result` + `AgentOutput.error` 三个字段感知子 agent 终态。
+        - **⑧`lane_completion.rs:103-121` `test_output()` helper**：加 `result: None` 字段（E0063 修复）。
+    - **超时/panic 兜底行为对比**：
+
+      | 场景 | 改造前（无限 wait） | 改造后（wait_timeout + catch_unwind） |
+      |---|---|---|
+      | 子 agent 正常跑完 | Condvar.notify 唤醒主线程，拿到 final_text | 同左 |
+      | 子 agent 跑到一半 panic | 主线程永久阻塞，Ctrl+C 终结 | catch_unwind 兜底 set failed outcome，主线程被唤醒正常退出 |
+      | 子 agent 卡死（网关挂了/死循环） | 主线程永久阻塞 | 10 分钟后主线程主动 break，回填 status="timeout" |
+      | 子 agent 跑得慢但没卡死 | 一直等 | 10 分钟后回填 timeout，主 LLM 看到超时信号自己继续 |
+
+    - **配置入口**：`.claw.json` 顶层 `env` 段加 `"CLAW_SUBAGENT_TIMEOUT_SECS": "900"`（15 分钟）；或临时 `export CLAW_SUBAGENT_TIMEOUT_SECS=900`。env 没设走默认 10 分钟。
+    - **验证状态**：✅ `cargo check -p tools --lib` 全绿零 warning；✅ `cargo test -p tools --lib -- --test-threads=1` 101 passed 14 failed——14 个失败全是预存债（bash 工具、file_tools、glob/grep、powershell、skill 加载、worker_create），git stash 验证基线就是这 14 个，本次改造**没引入任何新失败**且**新增 1 个 passed**。⏳ 真机验证未做——用户重编 `cargo build --release` 替换 `claw.exe` 后真机跑一轮。
+    - **下次接手真机判读 grep 命令清单（真机跑完 `claw_glm_diag.log` 后直接扒）**：
+
+      ```bash
+      LOG="E:/NW工程/资料库/html/claw_glm_diag.log"
+
+      # ① 事件分布——确认主子各自调了几次
+      grep -c "^==== claw_request_size" "$LOG"    # 总出站请求数（主子合计）
+      grep -E "^==== claw_request_size" "$LOG" | grep -c "deepseek.com"   # 主 LLM (DeepSeek) 调用次数
+      grep -E "^==== claw_request_size" "$LOG" | grep -c "aigw-gzgy2"      # 子 LLM (GLM) 调用次数
+      grep -c "^==== claw_glm_diag" "$LOG"          # 子 LLM GLM diag 事件数
+      grep -E "^==== claw_glm_diag" "$LOG" | grep -oE "status=[0-9]+" | sort | uniq -c   # 子 LLM 状态码分布
+
+      # ② Agent tool_result 终态判读——核心验改造是否生效
+      # 改造前：主 LLM 上下文里所有 agent manifest 都是 status:"running"
+      # 改造后：应出现 status:"completed" + result:"子 agent 结论文本"
+      grep -c '"status": "running"' "$LOG"          # 占位回执命中数（改造前非 0，改造后应大幅减少）
+      grep -c '"status": "completed"' "$LOG"        # completed 终态命中数（改造后应 > 0）
+      grep -c '"status": "timeout"' "$LOG"          # timeout 终态命中数（子 agent 卡死时 > 0）
+      grep -c '"status": "failed"' "$LOG"           # failed 终态命中数（子 agent 报错/panic 时 > 0）
+      grep -c '"result":' "$LOG"                    # AgentOutput.result 字段命中数（改造后应 > 0）
+
+      # ③ 主 LLM 是否基于子 agent 结论文本继续往下走
+      # 改造前：主 LLM 派完 Task 后自己重复调 read_file 干活
+      # 改造后：主 LLM 派完 Task 后直接基于 result 字段里的结论文本继续
+      grep -E '"name": "Agent"' "$LOG" | wc -l      # Agent tool_use 命中数（注意区分 tool schema 定义）
+      grep -n '"status": "completed"' "$LOG" | head -5   # 看首条 completed 出现行号
+
+      # ④ 超时兜底验证——临时设 CLAW_SUBAGENT_TIMEOUT_SECS=30 跑一轮慢子 agent
+      # 改造后：30 秒后主线程应 break，日志出现 status:"timeout"
+      grep -c "sub-agent timed out" "$LOG"          # 超时 error 文本命中数（应 > 0）
+      grep -c "sub-agent thread panicked" "$LOG"    # panic 兜底 error 文本命中数（应 = 0，子 agent 不应 panic）
+
+      # ⑤ 真机派活后主子调用次数比例
+      # 改造前：主 33 次 / 子 3 次（主 LLM 自己 read_file 干活，子 agent 没被有效用）
+      # 改造后：主子调用次数应接近 1:1 关系（主 LLM 派活后等子 agent 跑完，自己不再重复 read_file）
+      ```
+
+    - **边界细节——超时漂移问题（次要）**：`spawn_agent_job` 里 `while waited.is_none()` 循环有"假唤醒"（spurious wakeup）保护——`Condvar` 在某些平台上可能没 notify 也返回，这时 `guard.take()` 拿到 `None`，循环会再 `wait_timeout` 一次。但这里有个**累计超时漂移**问题：每次 `wait_timeout(10min)` 是独立计时的，假唤醒 N 次就可能等 N×10 分钟。实际影响极小：①Windows 上 `Condvar` 假唤醒概率几乎为零；②即使假唤醒一次，也只是 10→20 分钟，不会永久卡死；③子 agent 真要跑这么久，主 LLM 调用本身也会被 provider 网关超时（DeepSeek/GLM 默认 SSE 超时 ~5 分钟）先报错。**真要严格防漂移**：把 timeout 改成"绝对截止时刻"（`Instant::now() + timeout` 后每次 `wait_timeout` 用剩余时间）。本次不动——影响极小且当前 wait_timeout 已经解决了"永久阻塞"主问题。
+    - **关键问题答用户——超时会不会让主 LLM 白等八分钟**：**不会白等**。`Condvar::wait_timeout(guard, timeout)` 的语义是**最多等 timeout，但子线程 notify_one 时立刻唤醒返回**。子 agent 第 2 分钟跑完 → 子线程 set outcome + `notify_one()` → `wait_timeout` 立刻返回 → `guard.take()` 拿到 `Some(outcome)` → 主线程 break 跳出循环，马上读盘回填 → 主 LLM 第 2 分钟拿到结果继续干活。所以"等满 10 分钟"只发生在子 agent 真卡死的极端情况。正常完成时间是 `min(子 agent 实际跑完时间, 10 分钟)`。
+    - **教训（写给下次接手，第九步之外第十步）**：**fire-and-forget 异步派活 + 主 LLM 上下文里只看 `status:"running"` 占位回执**这套架构天生让主 LLM 拿不到子 agent 的结论文本——派活价值被腰斩。下次接手看到 subagent 相关架构改动时，**优先确认"主 LLM 调 Task 工具后的 tool_result 是否含子 agent 的 final_text"**——扒日志搜 `"status": "running"` 命中数 + `"result":` 命中数，前者非 0 后者 0 = fire-and-forget 没改造；后者 > 0 = 同步等结果改造生效。这条比"扒 tool_use 命中数判主 LLM 派没派活"更直接——即使主 LLM 派了活，fire-and-forget 路径下主 LLM 仍拿不到结果，等于白派。
+
+    - **2026-07-20 thinking 剥离改造（接续第 31 条 subagent 改造）**：子 agent GLM 400 根因定位 + 修复。
+        - **真机现场**：`agent-1784515638290485900` 子 agent（reader 类型，model=glm-5.1）第二次调 GLM 网关报 400 Bad Request。`.clawd-agents/agent-1784515638290485900.json` manifest 落盘 `status:"failed"`、`error:"api returned 400 Bad Request [trace b39d045e01ca4ef08e45215679907202]: Bad Request"`。
+        - **根因**：扒 `claw_glm_diag.log` 行 7608 起 400 事件段，请求体 messages 数组里第 2 个 assistant 消息含 Anthropic 私有的 `{"type":"thinking","thinking":"Let me explore...","signature":"b489921585784fbda975f8c5dd4a133d"}` content block。子 agent 第一次调 GLM 时 GLM 返回带 thinking 块的 assistant 消息，claw 原样存进 session 历史；第二次调 GLM 时这个 thinking 坂被原样回传，GLM 网关拒识这种它不认的格式 → 400。**佐证**：400 请求体里 `"type":"thinking"` ×1 + `"signature"` ×1；200 成功请求体里 `"type":"thinking"` ×0 + `"signature"` ×0。`tool_use`/`tool_result` 11↔11 全配对、`max_tokens:64000` 在 GLM 5.1 上限 128000 内——都不是 400 原因。
+        - **改造（2 文件 0 处签名改动，1 处剥离逻辑扩展）**：`rust/crates/api/src/providers/anthropic.rs:1033-1078` `strip_unsupported_beta_body_fields` 函数扩展——原来只剥 `betas`/`frequency_penalty`/`presence_penalty`/`stop`→`stop_sequences`，新增剥离 `messages[].content[]` 里 `type=="thinking"` 的块 + 剩余块里残留的 `signature` 字段。该函数在 3 个发送路径（`render_json_body` 后、`send_with_retry` 前、stream 路径）都被调过，**主子所有调用都走同套剥离**——既修子 agent 的 400，也顺手减小主 LLM 请求体、提升硬盘缓存命中率。
+        - **对比 27f4703a（2026-06-28 首次支持 GLM5.1 的提交）**：那次做的是**响应层宽松化**——`types.rs` 里 `MessageResponse.kind`/`role` 改 `Option<String>` + `#[serde(default)]` 兼容 GLM 缺字段；`sse.rs` 里 `parse_frame_with_provider` 加非 SSE JSON 兼容（GLM 返 `{"type":"message_start","message":{...}}` 而非标准 SSE）。**没动过请求体剥离 thinking 坝**——首次支持时主 LLM 单轮调用历史短，没遇到 thinking 坝回传问题；子 agent 阶段 `run_turn` 内部 loop 多轮调用才触发。**两个范式互补不冲突**：27f4703 修入站响应反序列化，本次修出站请求体净化。
+        - **验证状态**：✅ `cargo check -p api` 全绿；✅ `cargo test -p api` 160 passed / 0 failed；✅ `cargo test -p tools` 102 passed / 13 failed（13 全是预存债：bash 工具、file_tools、powershell、skill 加载、worker_create、glob/grep，与本次改造无关；新增 1 passed 印证不破）。⏳ 真机验证未做。
+        - **下次接手真机验证 grep 命令（thinking 剥离改造，接续上方 subagent 改造清单）**：
+
+      ```bash
+      LOG="E:/NW工程/资料库/html/claw_glm_diag.log"
+
+      # ① 400 报错应消失——改造前子 agent 第 2 次调 GLM 报 400，改造后应全 200
+      grep -E "^==== claw_glm_diag" "$LOG" | grep -oE "status=[0-9]+" | sort | uniq -c
+      # 改造前：status=200 多次 + status=400 至少 1 次
+      # 改造后：应只有 status=200，无 status=400
+
+      # ② 请求体里 thinking 块应被剥离——改造前 400 请求体含 thinking 坂
+      grep -c '"type": "thinking"' "$LOG"          # 改造后应 = 0（所有出站请求体都不含 thinking 坂）
+      grep -c '"signature"' "$LOG"                  # 改造后应 = 0（所有出站请求体都不含 signature 字段）
+
+      # ③ 子 agent 应能多轮调用 GLM 不报 400——改造前第 2 次调 GLM 就 400 终结
+      # 改造后子 agent run_turn 内部 loop 多轮调 GLM 全 200，子 LLM 调用次数应 ≥ 主 LLM 调用次数
+      grep -E "^==== claw_request_size" "$LOG" | grep -c "aigw-gzgy2"   # 子 LLM (GLM) 调用次数
+      grep -E "^==== claw_request_size" "$LOG" | grep -c "deepseek.com" # 主 LLM (DeepSeek) 调用次数
+      ```
+
+    - **教训（写给下次接手，第十一步）**：**Anthropic 协议私有的 `thinking` content block + `signature` 字段是子 agent 阶段 400 的隐形杀手**——首次支持 GLM（27f4703）只修响应层宽松化不够，出站请求体也得剥 thinking 坂。下次接手看到子 agent 报 400 Bad Request 时，**优先扒日志里 `"type":"thinking"` 命中数**——非 0 就是 thinking 坂没剥干净；再看 `tool_use`/`tool_result` 配对计数排查其他原因。**剥离逻辑放 `strip_unsupported_beta_body_fields` 里是对的**——这个函数在所有 3 个发送路径都被调，主子都走同套剥离，避免"主 LLM 不剥 thinking 坂但子 agent 要剥"的分裂范式。
+
+    - **2026-07-21 子 LLM 诊断日志改造（接续第 31 条 subagent 改造）**：给三条诊断路径加分路标识 + 剥离计数，主子 LLM 流量可区分。
+        - **背景**：之前 `log_request_size`/`log_cache_diag`/`write_glm_diag` 三个写入函数都只记主子共用的字段（t/attempt/status/bytes/url/usage），**没法区分本次调用走主 LLM 还是子 agent 路径**——真机扒日志只能靠 url（`deepseek.com` vs `aigw-gzgy2`）间接推断,子 agent 内部 `run_turn` 多轮调用时哪轮报错也看不出。thinking 剥离改造（7-20）也没记剥离计数,无法验证剥干净没。
+        - **改造（2 文件 6 处）**：
+            - **①`rust/crates/api/src/providers/anthropic.rs:1033-1080` `strip_unsupported_beta_body_fields` 加计数变体**：新增 `strip_unsupported_beta_body_fields_with_counts(body, &mut thinking_stripped, &mut signature_stripped)`,剥的 `type=="thinking"` 块数 + `signature` 字段数传出去。原 `strip_unsupported_beta_body_fields(body)` 改成调新变体传 `&mut 0` 的瘦壳。
+            - **②`:1101-1131` 新增 `subagent_diag_context()` 函数**：读 `CLAW_SUBAGENT_AGENT_ID`/`CLAW_SUBAGENT_TYPE`/`CLAW_SUBAGENT_ITERATION` 三个 env,主 LLM 路径 env 没设返回 `("main","","","")`,子 agent 路径返回 `("subagent",agent_id,subagent_type,iteration)`。
+            - **③`:1135-1161` `log_request_size` 追加 `lane`/`agent_id`/`subagent_type`/`iteration` 字段**——每次出站请求都记,主子流量可区分。
+            - **④`:1166-1191` `log_cache_diag` 追加同四个字段**——DeepSeek 缓存命中率回执也分主子。
+            - **⑤`:1196-1247` `write_glm_diag` 追加 `lane`/`agent_id`/`subagent_type`/`iteration`/`model`/`thinking_stripped`/`signature_stripped` 七个字段**——400/500 错误请求体也分主子 + 验证剥离生效。签名加 `thinking_stripped: usize`/`signature_stripped: usize`/`model: &str` 三个参数。
+            - **⑥`rust/crates/tools/src/lib.rs:3973-4002` 新增 `SubagentDiagEnvGuard` RAII guard + `run_agent_job_with_outcome` 入口注入**：子 agent 线程入口设 `CLAW_SUBAGENT_AGENT_ID`/`CLAW_SUBAGENT_TYPE`/`CLAW_SUBAGENT_ITERATION=0` env,Drop 时清理避免残留污染主 LLM 后续调用。`iteration` 固定写 "0"——子 agent 单次 `run_turn` 内部 loop 由 api 层控制,tools 层注入不了每轮值,配合 `t` 时间戳 + `agent_id` 已能区分轮次。
+        - **字段清单（写给下次接手，对照扒日志）**：
+
+          | 字段 | 命途 | 主 LLM 路径 | 子 agent 路径 |
+          |---|---|---|---|
+          | `lane` | 主子分路标识 | `main` | `subagent` |
+          | `agent_id` | 关联 `.clawd-agents/{id}.json` manifest | 空 | `agent-1784515638290485900` |
+          | `subagent_type` | 子 agent 类型 | 空 | `reader`/`review`/`general-purpose` |
+          | `iteration` | 子 agent run_turn 内部 loop 第几轮 | 空 | `0`（固定值,靠 t 区分轮次） |
+          | `model` | 调度的 model 名 | `deepseek-v4-pro[1m]` | `glm-5.1` |
+          | `thinking_stripped` | 剥了多少 thinking 块 | 0 或正数 | 改造后首轮 ≥1,后续应 = 0 |
+          | `signature_stripped` | 剥了多少 signature 字段 | 0 或正数 | 改造后首轮 ≥1,后续应 = 0 |
+
+        - **验证状态**：✅ `cargo check -p api` 全绿；✅ `cargo test -p api` 160 passed / 0 failed；✅ `cargo test -p tools` 102 passed / 13 failed（13 全是预存债,与本次改造无关）。⏳ 真机验证未做。
+        - **下次接手真机验证 grep 命令（子 LLM 诊断改造,接续上方清单）**：
+
+      ```bash
+      LOG="E:/NW工程/资料库/html/claw_glm_diag.log"
+
+      # ① 主子分路标识应出现——改造前日志无 lane 字段,改造后每条事件都带
+      grep -c "lane=main" "$LOG"           # 主 LLM 调用次数
+      grep -c "lane=subagent" "$LOG"       # 子 agent 调用次数（应 > 0,真机派活后）
+      grep -c "agent_id=agent-" "$LOG"     # 子 agent 派活 ID 命中数（关联 .clawd-agents/manifest）
+
+      # ② thinking 剥离计数应验证 7-20 改造生效——改造前无计数字段
+      # 改造后:子 agent 首轮调用 thinking_stripped≥1（剥上一轮回传的 thinking 块）,后续应 = 0
+      grep -oE "thinking_stripped=[0-9]+" "$LOG" | sort | uniq -c
+      grep -oE "signature_stripped=[0-9]+" "$LOG" | sort | uniq -c
+
+      # ③ 子 agent 400 应消失 + 子 agent 多轮调用应可见
+      grep "lane=subagent" "$LOG" | grep -c "status=200"    # 子 agent 200 次数
+      grep "lane=subagent" "$LOG" | grep -c "status=400"    # 子 agent 400 次数（应 = 0）
+
+      # ④ 主子 model 分路——确认主 LLM 走 DeepSeek,子 agent 走 GLM
+      grep "lane=main" "$LOG" | grep -oE "model=[^ ]+" | sort | uniq -c
+      grep "lane=subagent" "$LOG" | grep -oE "model=[^ ]+" | sort | uniq -c
+      ```
+
+    - **教训（写给下次接手，第十二步）**：**诊断日志要主子分路——不分路就看不到子 agent 内部 loop 哪轮报错**。下次接手看到 subagent 相关改造时,**优先扒日志里 `lane=subagent` 命中数**——0 = 子 agent 没被派活;> 0 但 `status=400` 也 > 0 = 子 agent 被派活了但协议层报错（thinking 剥离没生效）;> 0 且全 200 = 子 agent 跑通。`agent_id` 字段关联 `.clawd-agents/{id}.json` manifest,可以定位是哪次派活报错。**剥离计数是验证改造生效的硬证据**——`thinking_stripped≥1` 至少出现一次 = 7-20 改造真剥了 thinking 块;后续 = 0 = 剥干净不再回传。**RAII guard 设 env 是子 agent 线程入口分路标识的干净范式**——Drop 自动清理避免残留污染主 LLM 后续调用,比手动 `remove_var` 健壮（panic 时也清）。

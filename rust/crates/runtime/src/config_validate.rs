@@ -215,6 +215,12 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "subagentProviderDefault",
         expected: FieldType::Object,
     },
+    // ★ 2026-07-19 路径 E 落地：预定义子 agent 配置段。详见 `docs/SUBAGENT_GUIDE.md` 第二节。
+    // 子段校验走 `SUBAGENTS_FIELDS`（每个 subagent type 段内字段白名单）。
+    FieldSpec {
+        name: "subagents",
+        expected: FieldType::Object,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
@@ -275,6 +281,27 @@ const PLUGINS_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "maxOutputTokens",
         expected: FieldType::Number,
+    },
+];
+
+/// ★ 2026-07-19 路径 E 落地：`subagents` 段每个 type 子段字段白名单。
+/// 对照 `config.rs::parse_subagent_config` 解析逻辑——四字段全可选，默认空。
+const SUBAGENTS_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "description",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "tools",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "systemPrompt",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "model",
+        expected: FieldType::String,
     },
 ];
 
@@ -518,6 +545,21 @@ pub fn validate_config_file(
             source,
             &path_display,
         ));
+    }
+    // ★ 2026-07-19 路径 E 落地：`subagents` 段每个 type 子段走 SUBAGENTS_FIELDS 校验。
+    // 形态 `{ "<type>": { "description": ..., "tools": [...], "systemPrompt": ..., "model": ... }, ... }`。
+    if let Some(subagents) = object.get("subagents").and_then(JsonValue::as_object) {
+        for (subagent_type, cfg) in subagents {
+            if let Some(cfg_obj) = cfg.as_object() {
+                result.merge(validate_object_keys(
+                    cfg_obj,
+                    SUBAGENTS_FIELDS,
+                    &format!("subagents.{subagent_type}"),
+                    source,
+                    &path_display,
+                ));
+            }
+        }
     }
 
     result

@@ -776,3 +776,111 @@ GLM 网关拒识 claude-opus-4-6 报 403 当前访问模型不存在或者模型
 multiprovider 落地时**别让 `input_model.unwrap_or(&cfg.model)` 这种"input 优先 cfg 兜底"逻辑出现在 routing 配了的分支**——`input_model` 来自 `execute_agent` 的 `resolve_agent_model(input.model.as_deref())`，主 LLM 派活时 `AgentInput.model` 字段通常没传，`resolve_agent_model(None)` 返 `DEFAULT_AGENT_MODEL` 兜底值（不是 None）。这个兜底值会覆盖 cfg.model 导致子 agent 拿错 model 名调错网关报 403。
 
 **正解是 routing 配了就用 cfg.model，input_model 只在 fallback 分支（routing 都没配）才用**——`cfg.model.clone()` 直接用，不走 `unwrap_or`。下次接手加新 routing 字段时也要注意这条——别让主 LLM 那套兜底值污染子 agent 的配置。
+
+---
+
+## 3.4septies ★ 2026-07-19 路径 E 落地——`subagents` 段解析 + 注入 Available subagents 列表让主 LLM 能主动派活
+
+### 背景
+
+3.4sexies 节定路径 E 那条新债——主 LLM 没主动派活是因为 `RuntimeConfig` 不解析 `.claw.json` 顶层 `subagents` 段，主 LLM system prompt 不注入 subagent description，主 LLM 看不到任何"有哪些 subagent 可用 + 各自 description"。本期落地这条债。
+
+### 落地改动（5 处源码 + 6 条单元测试）
+
+| 步 | 文件 | 改动 |
+|---|---|---|
+| ① | `runtime/src/config.rs` | 加 `SubagentConfig` struct（`description`/`tools`/`systemPrompt`/`model` 四字段全可选默认空）+ `parse_optional_subagents` 解析函数 + `parse_subagent_config` helper + `RuntimeFeatureConfig.subagents: BTreeMap<String, SubagentConfig>` 字段 + `RuntimeConfig::subagents()` 访问器 + `load()` 调用解析 |
+| ② | `runtime/src/config_validate.rs` | `TOP_LEVEL_FIELDS` 加 `subagents: FieldType::Object` + 新建 `SUBAGENTS_FIELDS` 常量（四字段白名单）+ 调用点校验遍历 `subagents` 段每个 type 子段走 `SUBAGENTS_FIELDS` |
+| ③ | `runtime/src/prompt.rs` | `SystemPromptBuilder::build` 改——`render_config_section` 后调新函数 `render_subagents_section(config)` 注入"# Available subagents"段列各 subagent type + description；没配返回 `None` 跳过（保持向后兼容）|
+| ④ | `tools/src/lib.rs` | `execute_agent` 改——加 `load_subagents_config()` helper 拿 `RuntimeConfig.subagents()`；读 `subagent_cfg = subagents.get(type).cloned()` 合并 input：`description` input 空时 fallback 配置的，`model` input 空时 fallback 配置的，`system_prompt` 传给 `build_agent_system_prompt` 第三参数。`allowed_tools_for_subagent` 改——配置优先 `subagents.<type>.tools` 显式配了就用配置的覆盖预置集，没配走原预置 match 分支（保持向后兼容）|
+| ⑤ | `tools/src/lib.rs` | `build_agent_system_prompt` 签名加第三参数 `subagent_cfg: Option<&runtime::SubagentConfig>`——函数体末尾追加 `if let Some(cfg) = subagent_cfg { if !cfg.system_prompt.trim().is_empty() { prompt.push(cfg.system_prompt.clone()) } }` 注入配置里的 systemPrompt 段；`None` 走原逻辑（保持向后兼容）。`tools/src/lib.rs:9341` 那条预存测试调旧签名补 `None` 第三参数 |
+| 测试 | `runtime/src/config.rs` + `runtime/src/prompt.rs` | 6 条单元测试全过：3 条 `parse_optional_subagents_*`（empty/populated/defaults）+ 3 条 `render_subagents_section_*`（returns_none/lists_configured/shows_no_description_placeholder）|
+
+### 配置形态速查
+
+```json
+{
+  "subagents": {
+    "review": {
+      "description": "Review code for bugs and security issues",
+      "tools": ["read_file", "grep_search", "glob_search"],
+      "systemPrompt": "Be thorough. Return findings with file:line references.",
+      "model": "glm-5.1"
+    },
+    "bare": {
+      "description": "Bare config without tools override"
+    }
+  }
+}
+```
+
+| 字段 | 作用 | 默认 | 优先级 |
+|---|---|---|---|
+| `description` | 注入主 LLM system prompt 的"# Available subagents"段，让主 LLM 看 description 判断何时该派、派给哪个 type | 空 | input 显式传了用 input，否则用配置的 |
+| `tools` | 子 agent 工具白名单，**覆盖**预置集（`allowed_tools_for_subagent` 按 `subagent_type` 给的）| 空→走预置集 | 配置显式配了就用配置的，没配走预置 |
+| `systemPrompt` | 追加到默认 "You are a background sub-agent..." 后 | 空→跳过 | 配置配了就注入 |
+| `model` | 子 agent 用的模型名（也支持 `aliases` 短名）| 空→`DEFAULT_AGENT_MODEL` | input 显式传了用 input，否则用配置的；**注意 multiprovider 路由（`subagentProviderDefault`）配了时覆盖本字段**（见 3.4sexies 节）|
+
+### 验证状态
+
+- ✅ `cargo check --workspace` 全绿零 warning
+- ✅ `cargo test -p runtime --lib parse_optional_subagents` 3 passed 0 failed
+- ✅ `cargo test -p runtime --lib render_subagents_section` 3 passed 0 failed
+- ✅ `cargo test -p runtime --lib` + `cargo test -p tools --lib` 我引入的全过零失败（剩报错都是 MEMORY 第 24 条已记的预存债）
+- ⏳ 真机验证未做——用户重编 `cargo build --release` 替换 `claw.exe` 后真机跑一轮，看主 LLM system prompt 里是否出现"# Available subagents"段（配了 `subagents` 段才出现）+ 主 LLM 是否能看 description 判断何时该派、派给哪个 type
+
+### 落地后路径真相（修订 3.4sexies 节末段）
+
+配了 `subagents` 段后主 LLM system prompt 注入"# Available subagents"段——**主 LLM 能看 description 判断何时该派、派给哪个 type**，不再靠用户显式点名。没配仍只能显式点名（保持向后兼容）。对照 `docs/SUBAGENT_GUIDE.md` 第 2/8/9 节那段"★ 2026-07-19 真机验证后修订"段要再次修订——本次路径 E 落地收尾不混文档修订，留作下次接手清单。
+
+---
+
+## 3.4octies ★ 2026-07-19 路径 E 真机验证——system prompt 真注入 Available subagents 段，主 LLM 没自自觉派活
+
+### 真机现场
+
+用户照路径 E 落地后配的 settings.json（`subagents` 段含 reader + review 两条）重启 claw，跑一轮后日志 `claw_glm_diag.log` 2426 行。扒日志按"修订版五步姿势"走：
+
+| 步 | 验证点 | 实际值 | 判 |
+|---|---|---|---|
+| ① | 事件分布 | `claw_request_size` ×2 / `claw_glm_diag` ×2 / `claw_cache_diag` ×2，**`claw_auto_compact`/`claw_microcompact` ×0** | 只 2 轮 API 调用，会话太短 |
+| ② | 主 LLM system prompt 段含 `# Available subagents` | ✅ 行 28 + 1255 两轮都含——`reader`/`review` 两条 description 原文 | **路径 E 落地生效**，`render_subagents_section` 真把配置段注入主 LLM system prompt |
+| ③ | 主 LLM 输出 Agent tool_use | `"name": "Agent"` 命中 2 次（行 370 + 1597）但**都是 tool schema 定义**（`"type": "object"` + `input_schema` 那个），**不是真 tool_use 调用** | ❌ 主 LLM 没输出任何 Agent 工具调用，没派活给 reader/review |
+| ④ | `"Task"`/`"TaskCreate"`/`"WorkerCreate"` 命中 | 全 0 | 主 LLM 也没走其他派活工具链 |
+| ⑤ | 脱敏占位符命中 | `词23_4dc1478b` ×4 + `词60_4f8389a4` ×1 | hook 脱敏在主 LLM 路径生效（主 LLM 调了 read_file 读含敏感词的文件）|
+| ⑥ | 403/Forbidden 命中 | 0 | 本轮没子 agent 路径触发，没 403 报错 |
+
+### 判读结论
+
+路径 E 落地**对了一半**——`render_subagents_section` 真注入"# Available subagents"段到主 LLM system prompt（配置侧 + 注入侧都对），但**主 LLM 看到描述后没自自觉派活**。
+
+日志只 2 轮 API 调用会话太短，主 LLM 没遇到需要读代码的场景所以没派——这条判读不能定死"主 LLM 永远不派"，可能任务性质不刚需子 agent（像栏目标题排序设计方案咨询那种主 LLM 自己能干）。但也不能判"路径 E 真闭环"——本轮没真触发派活场景，主 LLM 主动派活能力未验。
+
+### 下次真机验证建议（再次修订）
+
+用户对话中给一个**刚需读代码的任务**——比如：
+
+```
+> 检查 E:/内网工程/资料库AI版/sirchmunk/sirchmunk-0.0.7post1/setup.py 有没有安全问题
+```
+
+或：
+
+```
+> 读 E:/内网工程/资料库AI版/sirchmunk/sirchmunk-0.0.7post1/setup.py 告诉我用了哪些 setuptools 参数
+```
+
+这种任务主 LLM 自己调 read_file 也能干，但 description 写成"主 LLM 遇到任何需要看代码内容的活都派给本子 agent"应该能触发主 LLM 派给 reader。
+
+**如果仍不派**——说明光靠 description 提示不够强势，要改 `render_subagents_section` 注入更强语义指导（如"派活优先于自己调 read_file"那类强制规则）或开路径 F 那条新债（给主 LLM 工具集做白名单禁调 read_file 强制派活）。本期不动这条——路径 E 落地收尾不混新功能，但 MEMORY 第 30 条已记下"主 LLM 没自自觉派活靠 description 提示不够"这条判断，下次接手可对照判读是否真要开路径 F。
+
+### 教训补充第九步
+
+扒日志判主 LLM 派活证据时**别拿 tool schema 定义命中当真 tool_use 调用**——`"name": "Agent"` 命中可能是 tool schema 那段（`"type": "object"` + `input_schema` + `required` 那个），不是主 LLM 输出的 tool_use。要区分：
+
+| 命中类型 | 看哪段 | 含义 |
+|---|---|---|
+| tool schema 定义命中 | `"type": "tool"` 段（input_schema/name/description 那个）| 工具定义，不算派活 |
+| tool_use 调用命中 | `"type": "tool_use"` 段（input/id 那个）| 主 LLM 真输出工具调用，算派活 |
+
+本轮我第一次 grep `"name": "Agent"` 命中 2 次差点判成"主 LLM 真派活了"，细看行 360-380 那段才看清是 tool schema 定义不是真调用——这条教训跟第 27 条修订版第四步那条"`Agent` 命中要区分工具定义 vs 工具调用"同根源，但本次再踩一次说明那条教训要更强记：**光看 `"name": "X"` 命中不能判主 LLM 调了 X 工具，必须看那行周围是 `"type": "tool"` 还是 `"type": "tool_use"`**。

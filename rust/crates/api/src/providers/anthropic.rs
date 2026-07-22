@@ -407,12 +407,20 @@ impl AnthropicClient {
         let mut last_error: Option<ApiError>;
 
         // Diagnostic snapshot of the request body for GLM debugging.
+        // **2026-07-21 子 LLM 诊断日志改造**：用带计数的 strip 变体拿剥离计数，
+        // 后续 `log_subagent_diag` 写日志验证 thinking 剥离生效。
+        let mut thinking_stripped = 0usize;
+        let mut signature_stripped = 0usize;
         let diag_request_body = self
             .request_profile
             .render_json_body(request)
             .ok()
             .map(|mut v| {
-                strip_unsupported_beta_body_fields(&mut v);
+                strip_unsupported_beta_body_fields_with_counts(
+                    &mut v,
+                    &mut thinking_stripped,
+                    &mut signature_stripped,
+                );
                 v
             });
 
@@ -446,6 +454,9 @@ impl AnthropicClient {
                             response.status().as_u16(),
                             None,
                             &diag_request_body,
+                            thinking_stripped,
+                            signature_stripped,
+                            &request.model,
                         );
                         if let Some(session_tracer) = &self.session_tracer {
                             session_tracer.record_http_request_succeeded(
@@ -465,6 +476,9 @@ impl AnthropicClient {
                             error_status(&error),
                             Some(&error),
                             &diag_request_body,
+                            thinking_stripped,
+                            signature_stripped,
+                            &request.model,
                         );
                         self.record_request_failure(attempts, &error);
                         last_error = Some(error);
@@ -476,6 +490,9 @@ impl AnthropicClient {
                             error_status(&error),
                             Some(&error),
                             &diag_request_body,
+                            thinking_stripped,
+                            signature_stripped,
+                            &request.model,
                         );
                         self.record_request_failure(attempts, &error);
                         return Err(error);
@@ -1031,6 +1048,18 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
 /// permitted`. The `betas` opt-in is communicated via the `anthropic-beta`
 /// HTTP header on these endpoints, never as a JSON body field.
 fn strip_unsupported_beta_body_fields(body: &mut Value) {
+    strip_unsupported_beta_body_fields_with_counts(body, &mut 0, &mut 0);
+}
+
+/// **2026-07-21 子 LLM 诊断日志改造**：带剥离计数的变体。
+/// `thinking_stripped` = 删掉的 `type=="thinking"` content block 数；
+/// `signature_stripped` = 剩余块里删掉的 `signature` 字段数。
+/// 诊断日志写这两个计数验证 2026-07-20 改造生效——改造后真机日志应 `thinking_stripped>0` 至少出现一次（子 agent 第二轮起），后续轮次应 = 0（剥干净不再回传）。
+fn strip_unsupported_beta_body_fields_with_counts(
+    body: &mut Value,
+    thinking_stripped: &mut usize,
+    signature_stripped: &mut usize,
+) {
     if let Some(object) = body.as_object_mut() {
         object.remove("betas");
         // These fields are OpenAI-compatible only; Anthropic rejects them.
@@ -1042,7 +1071,63 @@ fn strip_unsupported_beta_body_fields(body: &mut Value) {
                 object.insert("stop_sequences".to_string(), stop_val);
             }
         }
+        // **2026-07-20 subagent GLM 400 修复**：GLM 网关拒识 Anthropic 私有的
+        // `thinking` content block + `signature` 字段（对照 7c95f2b 提交前的真机日志，
+        // `agent-1784515638290485900` 子 agent 第二次调 GLM 时上一轮 assistant 消息含
+        // `{"type":"thinking","thinking":"...","signature":"..."}` 块，GLM 网关报 400 Bad Request）。
+        // 剥离策略：遍历 messages 数组里每个消息的 content 数组，删掉 `type=="thinking"` 的块，
+        // 并删掉剩余块里残留的 `signature` 字段。主 LLM 路径（DeepSeek）也走同套剥离——
+        // DeepSeek 不报错但也不需要 thinking 坌，剥离后减小请求体、提升硬盘缓存命中率。
+        if let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) {
+            for message in messages.iter_mut() {
+                if let Some(content) = message
+                    .get_mut("content")
+                    .and_then(Value::as_array_mut)
+                {
+                    // 删掉 type=="thinking" 的 content block，计数。
+                    let before = content.len();
+                    content.retain(|block| {
+                        block
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .is_some_and(|t| t != "thinking")
+                    });
+                    *thinking_stripped += before - content.len();
+                    // 剩余块里删掉残留的 signature 字段，计数。
+                    for block in content.iter_mut() {
+                        if let Some(obj) = block.as_object_mut() {
+                            if obj.remove("signature").is_some() {
+                                *signature_stripped += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
+}
+
+/// **2026-07-21 子 LLM 诊断日志改造**：读 env 拿"当前调用走主 LLM 还是子 agent 路径"分路标识。
+/// `run_agent_job_with_outcome` 入口设 `CLAW_SUBAGENT_AGENT_ID`/`CLAW_SUBAGENT_TYPE`/`CLAW_SUBAGENT_ITERATION` env，
+/// api 层读这三个 env 区分主子流量。主 LLM 路径 env 没设，返回 `lane="main"` + 其余字段空。
+fn subagent_diag_context() -> (String, String, String, String) {
+    let agent_id = std::env::var("CLAW_SUBAGENT_AGENT_ID").unwrap_or_default();
+    let subagent_type = std::env::var("CLAW_SUBAGENT_TYPE").unwrap_or_default();
+    let iteration = std::env::var("CLAW_SUBAGENT_ITERATION").unwrap_or_default();
+    if agent_id.is_empty() && subagent_type.is_empty() {
+        return (
+            "main".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+        );
+    }
+    (
+        "subagent".to_string(),
+        agent_id,
+        subagent_type,
+        iteration,
+    )
 }
 
 /// Append a request-size record to `claw_glm_diag.log` so we can correlate
@@ -1050,6 +1135,8 @@ fn strip_unsupported_beta_body_fields(body: &mut Value) {
 /// payloads to the console.  Format matches `write_glm_diag` so all diagnostic
 /// events share one chronological log.  Writes every request — independent of
 /// whether micro-compact cleared anything — so we always have a size baseline.
+/// **2026-07-21 子 LLM 诊断日志改造**：追加 `lane`/`agent_id`/`subagent_type`/`iteration` 字段，
+/// 主子 LLM 分路标识 + 子 agent run_turn 内部 loop 第几轮。
 fn log_request_size(body_bytes: usize, base_url: &str) {
     use std::io::Write;
     let timestamp = SystemTime::now()
@@ -1058,8 +1145,9 @@ fn log_request_size(body_bytes: usize, base_url: &str) {
         .unwrap_or(0);
     // Rough token estimate (~4 chars/token) for quick eyeballing.
     let est_tokens = body_bytes / 4;
+    let (lane, agent_id, subagent_type, iteration) = subagent_diag_context();
     let record = format!(
-        "\n==== claw_request_size t={timestamp} bytes={body_bytes} est_tokens={est_tokens} url={base_url} ====\n"
+        "\n==== claw_request_size t={timestamp} bytes={body_bytes} est_tokens={est_tokens} url={base_url} lane={lane} agent_id={agent_id} subagent_type={subagent_type} iteration={iteration} ====\n"
     );
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -1074,14 +1162,17 @@ fn log_request_size(body_bytes: usize, base_url: &str) {
 /// 字段名是DeepSeek回执的`prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`，
 /// 不是Anthropic的`cache_read_input_tokens`/`cache_creation_input_tokens`。
 /// 只在DeepSeek（或兼容该字段的后端）回执非零时写，Anthropic后端default 0不写。
+/// **2026-07-21 子 LLM 诊断日志改造**：追加 `lane`/`agent_id`/`subagent_type`/`iteration` 字段，
+/// 主子 LLM 分路标识 + 子 agent run_turn 内部 loop 第几轮。
 fn log_cache_diag(usage: &Usage) {
     use std::io::Write;
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let (lane, agent_id, subagent_type, iteration) = subagent_diag_context();
     let record = format!(
-        "\n==== claw_cache_diag t={timestamp} hit={hit} miss={miss} input={input} output={output} cache_read={cache_read} cache_creation={cache_creation} ====\n",
+        "\n==== claw_cache_diag t={timestamp} hit={hit} miss={miss} input={input} output={output} cache_read={cache_read} cache_creation={cache_creation} lane={lane} agent_id={agent_id} subagent_type={subagent_type} iteration={iteration} ====\n",
         hit = usage.prompt_cache_hit_tokens,
         miss = usage.prompt_cache_miss_tokens,
         input = usage.input_tokens,
@@ -1110,11 +1201,15 @@ fn error_status(error: &ApiError) -> u16 {
 /// can inspect the exact request body and error response that accompany a
 /// multi-turn 400/403 failure. The log path is fixed; claw is launched from
 /// the user's project directory so the file lands in that cwd.
+/// **2026-07-21 子 LLM 诊断日志改造**：追加 `lane`/`agent_id`/`subagent_type`/`iteration`/`model`/`thinking_stripped`/`signature_stripped` 字段，主子 LLM 分路标识 + 剥离计数验证。
 fn write_glm_diag(
     attempt: u32,
     status: u16,
     error: Option<&ApiError>,
     request_body: &Option<Value>,
+    thinking_stripped: usize,
+    signature_stripped: usize,
+    model: &str,
 ) {
     use std::io::Write;
     let path = "claw_glm_diag.log";
@@ -1140,8 +1235,9 @@ fn write_glm_diag(
         Some(other) => (other.to_string(), String::new(), String::new()),
         None => (String::new(), String::new(), String::new()),
     };
+    let (lane, agent_id, subagent_type, iteration) = subagent_diag_context();
     let record = format!(
-        "\n==== claw_glm_diag t={timestamp} attempt={attempt} status={status} ====\n\
+        "\n==== claw_glm_diag t={timestamp} attempt={attempt} status={status} lane={lane} agent_id={agent_id} subagent_type={subagent_type} iteration={iteration} model={model} thinking_stripped={thinking_stripped} signature_stripped={signature_stripped} ====\n\
          [error_type] {err_type}\n\
          [error_message] {err_msg}\n\
          [error_body] {err_body}\n\

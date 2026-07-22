@@ -185,6 +185,11 @@ impl SystemPromptBuilder {
         }
         if let Some(config) = &self.config {
             sections.push(render_config_section(config));
+            // ★ 2026-07-19 路径 E 落地：注入"Available subagents:"段——列各 subagent 的 type + description，
+            // 让主 LLM 看 description 判断"何时该派、派给哪个 type"。配了才注入，没配跳过（保持向后兼容）。
+            if let Some(subagents_section) = render_subagents_section(config) {
+                sections.push(subagents_section);
+            }
         }
         sections.extend(self.append_sections.iter().cloned());
         sections
@@ -494,6 +499,30 @@ fn render_config_section(config: &RuntimeConfig) -> String {
     lines.join("\n")
 }
 
+/// ★ 2026-07-19 路径 E 落地：渲染"Available subagents:"段——列各 subagent 的 type + description，
+/// 让主 LLM 看 description 判断"何时该派、派给哪个 type"。没配返回 `None`（保持向后兼容，不注入空段）。
+/// 对照 `docs/SUBAGENT_GUIDE.md` 第二节"方式 B 真相"段 + `docs/multiprovider.md` 3.4septies 节。
+fn render_subagents_section(config: &RuntimeConfig) -> Option<String> {
+    let subagents = config.subagents();
+    if subagents.is_empty() {
+        return None;
+    }
+    let mut lines = vec![
+        "# Available subagents".to_string(),
+        "派活时调 Agent 工具，subagent_type 填下面某个 type，prompt 填任务描述。".to_string(),
+        String::new(),
+    ];
+    for (subagent_type, cfg) in subagents {
+        let desc = if cfg.description.is_empty() {
+            "(no description)"
+        } else {
+            &cfg.description
+        };
+        lines.push(format!("- `{subagent_type}`: {desc}"));
+    }
+    Some(lines.join("\n"))
+}
+
 fn get_simple_intro_section(has_output_style: bool) -> String {
     format!(
         "You are an interactive agent that helps users {} Use the instructions below and the tools available to you to assist the user.\n\nIMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.",
@@ -549,9 +578,9 @@ fn get_actions_section() -> String {
 mod tests {
     use super::{
         collapse_blank_lines, display_context_path, normalize_instruction_content,
-        render_instruction_content, render_instruction_files, truncate_instruction_content,
-        ContextFile, ModelFamilyIdentity, ProjectContext, SystemPromptBuilder,
-        SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        render_instruction_content, render_instruction_files, render_subagents_section,
+        truncate_instruction_content, ContextFile, ModelFamilyIdentity, ProjectContext,
+        SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::config::ConfigLoader;
     use std::fs;
@@ -980,5 +1009,82 @@ mod tests {
         assert!(rendered.contains("# Claude instructions"));
         assert!(rendered.contains("scope: /tmp/project"));
         assert!(rendered.contains("Project rules"));
+    }
+
+    /// ★ 2026-07-19 路径 E 落地：`render_subagents_section` 注入"Available subagents:"段。
+    /// 没配返回 `None`（保持向后兼容）；配了返回各 subagent type + description 列表。
+    #[test]
+    fn render_subagents_section_returns_none_when_unconfigured() {
+        // RuntimeConfig 不易在单测里构造——用 ConfigLoader 从空 temp dir 加载拿 default config。
+        let root = temp_dir();
+        let cwd = root.join("empty");
+        fs::create_dir_all(&cwd).expect("create cwd");
+        let config = ConfigLoader::default_for(&cwd)
+            .load()
+            .expect("empty config should load");
+        assert!(render_subagents_section(&config).is_none());
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn render_subagents_section_lists_configured_subagents() {
+        let root = temp_dir();
+        let cwd = root.join("configured");
+        fs::create_dir_all(cwd.join(".claw")).expect("create .claw dir");
+        // 写一份含 subagents 段的 settings.json
+        let settings = serde_json::json!({
+            "subagents": {
+                "review": {
+                    "description": "Review code for bugs and security issues",
+                    "tools": ["read_file", "grep_search"],
+                    "systemPrompt": "Be thorough.",
+                    "model": "glm-5.1"
+                },
+                "bare": {
+                    "description": "Bare config without tools"
+                }
+            }
+        });
+        fs::write(
+            cwd.join(".claw").join("settings.json"),
+            serde_json::to_string_pretty(&settings).expect("serialize settings"),
+        )
+        .expect("write settings.json");
+        let config = ConfigLoader::default_for(&cwd)
+            .load()
+            .expect("configured settings should load");
+        let section = render_subagents_section(&config)
+            .expect("populated subagents should render a section");
+        assert!(section.contains("# Available subagents"));
+        assert!(section.contains("`review`: Review code for bugs and security issues"));
+        assert!(section.contains("`bare`: Bare config without tools"));
+        // 没配 description 的 subagent 不该出现 "(no description)"——这条测试里都配了 description
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn render_subagents_section_shows_no_description_placeholder() {
+        let root = temp_dir();
+        let cwd = root.join("nodesc");
+        fs::create_dir_all(cwd.join(".claw")).expect("create .claw dir");
+        let settings = serde_json::json!({
+            "subagents": {
+                "nodesc": {
+                    "model": "glm-5.1"
+                }
+            }
+        });
+        fs::write(
+            cwd.join(".claw").join("settings.json"),
+            serde_json::to_string_pretty(&settings).expect("serialize settings"),
+        )
+        .expect("write settings.json");
+        let config = ConfigLoader::default_for(&cwd)
+            .load()
+            .expect("nodesc settings should load");
+        let section = render_subagents_section(&config)
+            .expect("populated subagents should render a section");
+        assert!(section.contains("`nodesc`: (no description)"));
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 }
