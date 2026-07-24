@@ -326,6 +326,43 @@ impl LineEditor {
 
         match self.editor.readline(&self.prompt) {
             Ok(line) => {
+                // **2026-07-23 Windows 右键粘贴修复**：旧版控制台不发送 bracketed paste，
+                // 多行粘贴被逐行注入缓冲区。readline() 返回第一行后，用
+                // PeekConsoleInputW 检查缓冲区是否还有剩余行——有则连续读取累积为一次粘贴。
+                // 阈值 >= 3 个可打印字符按键才触发（排除 Enter 键释放、终端转义序列等噪声）。
+                if console_pending_char_key_count() >= 3 {
+                    let mut accumulated = vec![line];
+                    // 持续读取剩余行，直到缓冲区无待处理输入。
+                    loop {
+                        if console_pending_char_key_count() < 3 {
+                            break;
+                        }
+                        if let Some(helper) = self.editor.helper_mut() {
+                            helper.reset_current_line();
+                        }
+                        match self.editor.readline("") {
+                            Ok(next_line) => accumulated.push(next_line),
+                            Err(_) => break,
+                        }
+                    }
+                    if accumulated.len() > PASTE_LINE_THRESHOLD {
+                        let full_content = accumulated.join("\n");
+                        if let Some(label) = self.paste_manager.register_paste(&full_content) {
+                            let mut stdout = io::stdout();
+                            writeln!(stdout)?;
+                            writeln!(stdout, "{}", label)?;
+                            stdout.flush()?;
+                            return Ok(ReadOutcome::Submit(label));
+                        }
+                        // 未超阈值但仍是多行——直接合并为一条消息提交。
+                        return Ok(ReadOutcome::Submit(full_content));
+                    }
+                    // 只有 1-2 行，返回第一行（保持原行为）。
+                    return Ok(ReadOutcome::Submit(
+                        accumulated.into_iter().next().unwrap_or_default(),
+                    ));
+                }
+
                 // Read clipboard AFTER readline returns
                 let clipboard_after = clipboard_win::get_clipboard_string().unwrap_or_default();
 
@@ -444,6 +481,75 @@ fn normalize_completions(completions: Vec<String>) -> Vec<String> {
         .filter(|candidate| candidate.starts_with('/'))
         .filter(|candidate| seen.insert(candidate.clone()))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Windows 粘贴检测：用 PeekConsoleInputW 检查控制台输入缓冲区是否有待处理行。
+// 旧版 Windows 控制台（conhost）右键粘贴不发送 bracketed paste 转义序列，
+// 多行内容被当作逐行键入——每个 \r\n 触发 rustyline 的 AcceptLine。
+// 修复思路：readline() 返回第一行后，立即 peek 控制台缓冲区——
+// 如果还有更多 KEY_EVENT（粘贴的剩余行），连续读取并累积为一次粘贴。
+// ---------------------------------------------------------------------------
+
+/// 检测 Windows 控制台输入缓冲区是否有待处理的“字符按键”事件。
+/// 只计数 KEY_DOWN + 非零字符的事件（排除 Enter 键释放、修饰键、终端转义序列等噪声）。
+/// 返回符合条件的按键数量——调用方用 >= 3 判定为粘贴。
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn console_pending_char_key_count() -> usize {
+    use std::os::windows::io::AsRawHandle;
+
+    /// 匹配 Windows INPUT_RECORD 布局（20 字节）。
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct InputRecord {
+        event_type: u16,   // offset 0: EventType
+        _align: [u8; 2],   // offset 2: padding to 4-byte align
+        key_down: i32,     // offset 4: KEY_EVENT_RECORD.bKeyDown (BOOL)
+        _repeat: u16,      // offset 8: wRepeatCount
+        _vk: u16,          // offset 10: wVirtualKeyCode
+        _scan: u16,        // offset 12: wVirtualScanCode
+        char_code: u16,    // offset 14: uChar.UnicodeChar
+        _ctrl: u32,        // offset 16: dwControlKeyState
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn PeekConsoleInputW(
+            handle: *mut std::ffi::c_void,
+            buffer: *mut InputRecord,
+            length: u32,
+            events_read: *mut u32,
+        ) -> i32;
+    }
+
+    const KEY_EVENT: u16 = 0x0001;
+
+    let handle = io::stdin().as_raw_handle();
+    let mut records = [InputRecord {
+        event_type: 0, _align: [0; 2], key_down: 0,
+        _repeat: 0, _vk: 0, _scan: 0, char_code: 0, _ctrl: 0,
+    }; 256];
+    let mut count: u32 = 0;
+    let ok = unsafe { PeekConsoleInputW(handle.cast(), records.as_mut_ptr(), 256, &mut count) };
+    if ok == 0 {
+        return 0;
+    }
+    // 只计数“真正的字符按键”：KEY_DOWN + 非零字符。
+    // 排除：Enter 键释放(key_down=0)、修饰键(char=0)、终端转义序列(\x1b 只算 1 个)。
+    records[..count as usize]
+        .iter()
+        .filter(|r| {
+            r.event_type == KEY_EVENT
+                && r.key_down != 0
+                && r.char_code >= 0x20 // 可打印字符（排除 \x1b、\r、\n 等控制字符）
+        })
+        .count()
+}
+
+#[cfg(not(windows))]
+fn console_pending_char_key_count() -> usize {
+    0
 }
 
 #[cfg(test)]

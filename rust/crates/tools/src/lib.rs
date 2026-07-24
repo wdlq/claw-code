@@ -3697,9 +3697,38 @@ fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
     None
 }
 
+// **2026-07-23 子 agent Ctrl+C 中断修复**：进程级 abort signal，由 CLI 层设置。
+// `spawn_agent_job` 轮询此 signal，检测到 abort 时提前结束等待并通知子 agent 线程停止。
+static PROCESS_ABORT_SIGNAL: std::sync::OnceLock<runtime::HookAbortSignal> =
+    std::sync::OnceLock::new();
+
+/// CLI 层调用：把主 conversation runtime 的 abort signal 注册到进程级静态，
+/// 让 `spawn_agent_job` 能在 Ctrl+C 时提前中断子 agent 等待。
+pub fn register_process_abort_signal(signal: runtime::HookAbortSignal) {
+    let _ = PROCESS_ABORT_SIGNAL.set(signal);
+}
+
+fn process_abort_signal() -> Option<&'static runtime::HookAbortSignal> {
+    PROCESS_ABORT_SIGNAL.get()
+}
+
 const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
-const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
+/// **2026-07-23 提升子 agent 迭代上限**：32 对 reader 子 agent 太低——
+/// 每次 read_file/grep_search 都消耗一轮，探索 5–6 个文件就耗尽。
+/// 提升到 64 给 GLM 5.1 足够空间完成复杂读取任务。
+/// 可用 env `CLAW_SUBAGENT_MAX_ITERATIONS` 覆盖。
+const DEFAULT_AGENT_MAX_ITERATIONS: usize = 64;
+
+/// 读 env `CLAW_SUBAGENT_MAX_ITERATIONS` 算子 agent 迭代上限。
+/// env 没设 / 解析失败 / 为 0 → 用 `DEFAULT_AGENT_MAX_ITERATIONS`(64) 兖底。
+fn subagent_max_iterations() -> usize {
+    std::env::var("CLAW_SUBAGENT_MAX_ITERATIONS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_AGENT_MAX_ITERATIONS)
+}
 
 fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
     execute_agent_with_spawn(input, spawn_agent_job)
@@ -3903,35 +3932,52 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
         });
     let handle = builder_result.map_err(|error| error.to_string())?;
 
-    // **2026-07-21 Condvar race 修复**：主线程 `recv_timeout` 等子线程 send outcome。
-    // - Ok(outcome) → 子 agent 正常跑完（completed/failed），拿 outcome 走后续回填。
-    // - Err(RecvTimeoutError) → 子 agent 卡死（auto_compact 后 / 网关挂了），主线程超时 break，
-    //   落盘 timeout 终态 + 回填 timeout outcome，主 LLM 拿到超时信号自己继续干活。
-    // - Err(RecvError) → 子线程 panic 后 send 也 panic（理论上 catch_unwind 兜底不会到这），兜底 failed。
-    // 超时时间来自 `subagent_timeout_duration()`（env `CLAW_SUBAGENT_TIMEOUT_SECS` 覆盖，默认 10 分钟）。
+    // **2026-07-23 Ctrl+C 中断修复**：把单次 recv_timeout(600s) 改成每秒轮询循环，
+    // 每次 recv_timeout(1s) 后检查进程级 abort signal。Ctrl+C 时主线程最多 1s 内响应，
+    // 落盘 "aborted" 终态后返回，不再卡死 600s。
     let timeout = subagent_timeout_duration();
-    let _outcome = match outcome_rx.recv_timeout(timeout) {
-        Ok(outcome) => outcome,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            // 超时未收到 outcome。主线程不再阻塞，落盘 timeout 终态后回填 timeout outcome。
-            let _ = persist_agent_terminal_state(
-                &manifest_for_timeout,
-                "timeout",
-                None,
-                Some(format!("sub-agent timed out after {}s", timeout.as_secs())),
-            );
-            AgentRunOutcome {
-                status: String::from("timeout"),
-                final_text: None,
-                error: Some(format!("sub-agent timed out after {}s", timeout.as_secs())),
+    let poll_interval = Duration::from_secs(1);
+    let deadline = std::time::Instant::now() + timeout;
+    let _outcome = loop {
+        match outcome_rx.recv_timeout(poll_interval) {
+            Ok(outcome) => break outcome,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break AgentRunOutcome {
+                    status: String::from("failed"),
+                    final_text: None,
+                    error: Some(String::from("sub-agent thread dropped outcome channel")),
+                };
             }
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            // 子线程 panic 后 channel 也断了（catch_unwind 应兜底 send 不会到这，但兜底兜底）。
-            AgentRunOutcome {
-                status: String::from("failed"),
-                final_text: None,
-                error: Some(String::from("sub-agent thread dropped outcome channel")),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // 检查 Ctrl+C abort signal。
+                if process_abort_signal().is_some_and(|s| s.is_aborted()) {
+                    let _ = persist_agent_terminal_state(
+                        &manifest_for_timeout,
+                        "aborted",
+                        None,
+                        Some(String::from("sub-agent aborted by user (Ctrl+C)")),
+                    );
+                    break AgentRunOutcome {
+                        status: String::from("aborted"),
+                        final_text: None,
+                        error: Some(String::from("sub-agent aborted by user (Ctrl+C)")),
+                    };
+                }
+                // 检查总超时。
+                if std::time::Instant::now() >= deadline {
+                    let _ = persist_agent_terminal_state(
+                        &manifest_for_timeout,
+                        "timeout",
+                        None,
+                        Some(format!("sub-agent timed out after {}s", timeout.as_secs())),
+                    );
+                    break AgentRunOutcome {
+                        status: String::from("timeout"),
+                        final_text: None,
+                        error: Some(format!("sub-agent timed out after {}s", timeout.as_secs())),
+                    };
+                }
+                // 继续轮询。
             }
         }
     };
@@ -3992,7 +4038,7 @@ fn run_agent_job_with_outcome(job: &AgentJob) -> AgentRunOutcome {
     );
     let runtime_result = (|| -> Result<String, String> {
         let mut runtime =
-            build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
+            build_agent_runtime(job)?.with_max_iterations(subagent_max_iterations());
         // **2026-07-19 multiprovider 落地**：把子 agent 的 resolved model 注入 thread-local，
         // dispatch 层的 `current_dispatch_model()` 优先读 thread-local 算 `compact_receipt`。
         // 对照 `docs/multiprovider.md` 3.4bis 节选项 A。
@@ -4077,7 +4123,13 @@ fn build_agent_runtime(
     // 反过来主=GLM + 子=DeepSeek 1M，子 agent 拿 131K 阈值撑爆 200K GLM 报 ContextWindowExceeded。
     // 对照 `docs/multiprovider.md` 3.4ter 节。
     if let Some(limit) = api::model_token_limit(resolved_model) {
-        runtime = runtime.with_model_context_window_strict(limit.context_window_tokens);
+        // 用实际请求中的 max_tokens（`max_tokens_for_model` 经 heuristic min 截断后的值）
+        // 而非 `limit.max_output_tokens`（模型理论上限）——确保阈值与实际请求体匹配。
+        let effective_max_tokens = api::max_tokens_for_model(resolved_model);
+        runtime = runtime.with_model_context_window_strict(
+            limit.context_window_tokens,
+            effective_max_tokens,
+        );
     }
     Ok(runtime)
 }
@@ -4210,10 +4262,26 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
 }
 
 fn agent_permission_policy() -> PermissionPolicy {
-    mvp_tool_specs().into_iter().fold(
+    // **2026-07-23 子 agent 工作区边界修复**：之前此处创建裸的 DangerFullAccess 策略，
+    // 不加载用户 settings.json 的 `permissions.allow` 规则。导致 `allowed_path_prefixes`
+    // 返回空，子 agent 读工作区外目录（用户已显式允许）时被 `validate_workspace_boundary`
+    // 硬性拦截报 "path escapes workspace boundary"。
+    // 修复：从 cwd 加载 `.claw/settings.json` 的 permission_rules 注入策略，
+    // 让子 agent 继承用户配置的外部路径允许规则。
+    let base = mvp_tool_specs().into_iter().fold(
         PermissionPolicy::new(PermissionMode::DangerFullAccess),
         |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
-    )
+    );
+    // 加载用户配置的 allow/deny/ask 规则（含外部路径前缀）。
+    let rules = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| ConfigLoader::default_for(cwd).load().ok())
+        .map(|config| config.permission_rules().clone());
+    if let Some(rules) = rules {
+        base.with_permission_rules(&rules)
+    } else {
+        base
+    }
 }
 
 fn write_agent_manifest(manifest: &AgentOutput) -> Result<(), String> {
@@ -5291,14 +5359,33 @@ impl ApiClient for ProviderRuntimeClient {
                     );
                     last_error = Some(error);
                 }
-                Err(error) => return Err(RuntimeError::new(error.to_string())),
+                Err(error) => {
+                    // **2026-07-22 子 agent 撝爆 GLM 修复**：透传 `over_size_400` 语义到
+                    // `RuntimeError::with_kind`——让 `run_turn` 据此 auto-compact 后重试而非直接退出。
+                    let kind = if error.is_over_size_400() {
+                        runtime::ErrorKind::OverSize400
+                    } else {
+                        runtime::ErrorKind::Generic
+                    };
+                    return Err(RuntimeError::with_kind(error.to_string(), kind));
+                }
             }
         }
 
-        Err(RuntimeError::new(last_error.map_or_else(
-            || String::from("provider chain exhausted with no attempts"),
-            |error| error.to_string(),
-        )))
+        // **2026-07-22 子 agent 撝爆 GLM 修复**：透传 `over_size_400` 语义——
+        // chain �耗尽时用 `last_error.is_over_size_400()` 据实标 kind，让 run_turn 仍能降级重试。
+        let kind = last_error
+            .as_ref()
+            .map_or(false, |e| e.is_over_size_400())
+            .then_some(runtime::ErrorKind::OverSize400)
+            .unwrap_or(runtime::ErrorKind::Generic);
+        Err(RuntimeError::with_kind(
+            last_error.map_or_else(
+                || String::from("provider chain exhausted with no attempts"),
+                |error| error.to_string(),
+            ),
+            kind,
+        ))
     }
 }
 
@@ -5313,7 +5400,29 @@ async fn stream_with_provider(
     let mut pending_thinking: BTreeMap<u32, (String, Option<String>)> = BTreeMap::new();
     let mut saw_stop = false;
 
-    while let Some(event) = stream.next_event().await? {
+    // **2026-07-23 子 agent 防挂死**：SSE 事件间超时。
+    // GLM 网关在生成过程中偶尔“卡住”——TCP 连接存活但不再发 SSE 事件。
+    // 无此超时 `next_event().await` 会无限阻塞，导致主线程 recv_timeout(10min) 才能回收。
+    // 360s 内无新事件→视为流已死，提前 break 走下方 fallback 路径。
+    // （GLM 5.1 生成大段内容时单事件间隔可达 4–5 分钟，3min 太短会误杀。）
+    const SSE_EVENT_TIMEOUT: Duration = Duration::from_secs(360);
+
+    loop {
+        let event_result = tokio::time::timeout(SSE_EVENT_TIMEOUT, stream.next_event()).await;
+        let event = match event_result {
+            Ok(Ok(Some(event))) => event,
+            Ok(Ok(None)) => break, // 流正常结束
+            Ok(Err(error)) => return Err(error),
+            Err(_elapsed) => {
+                // SSE 流卡死——180s 无新事件。记录日志并 break，
+                // 下方 fallback 逻辑会判断已有 events 是否足够返回。
+                eprintln!(
+                    "[stream_with_provider: SSE 流超时 180s 无新事件，model={}]",
+                    message_request.model
+                );
+                break;
+            }
+        };
         match event {
             ApiStreamEvent::MessageStart(start) => {
                 for block in start.message.content {
@@ -5397,7 +5506,23 @@ async fn stream_with_provider(
         .iter()
         .any(|event| matches!(event, AssistantEvent::MessageStop))
     {
-        return Ok(events);
+        // **2026-07-23 空响应 fallback 修复**：DeepSeek 偶尔返回“空响应”——
+        // SSE 流只有 message_start + message_stop，无任何 content block。
+        // 之前此处看到 MessageStop 就直接 return，导致非流式 fallback 永远不触发，
+        // 下游 `build_assistant_message` 报 "assistant stream produced no content" 致命错误。
+        // 修复：有 MessageStop 且有实际内容才 return；否则走下方非流式 fallback 重试。
+        let has_content = events.iter().any(|event| {
+            matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
+                || matches!(event, AssistantEvent::ToolUse { .. })
+        });
+        if has_content {
+            return Ok(events);
+        }
+        // 空响应——记录日志并走非流式 fallback。
+        eprintln!(
+            "[stream_with_provider: SSE 流完成但无内容，model={}，尝试非流式 fallback]",
+            message_request.model
+        );
     }
 
     let response = client

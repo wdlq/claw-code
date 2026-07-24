@@ -207,6 +207,7 @@ impl OpenAiCompatClient {
                         reqwest::StatusCode::from_u16(code.unwrap_or(400))
                             .unwrap_or(reqwest::StatusCode::BAD_REQUEST),
                     ),
+                    over_size_400: false,
                 });
             }
         }
@@ -1539,6 +1540,7 @@ fn parse_sse_frame(
                 body: payload.clone(),
                 retryable: false,
                 suggested_action: suggested_action_for_status(status),
+                over_size_400: false,
             });
         }
     }
@@ -1598,6 +1600,12 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
 
     let suggested_action = suggested_action_for_status(status);
 
+    // **2026-07-22 子 agent 撝爆 GLM 修复**：GLM 网关因请求体过大回 400 Bad Request 时，
+    // body 是裸 "Bad Request" 文本且无结构化 error_type/message（区别于格式错误的 400）。
+    // 标 `over_size_400=true` 透传到 `run_turn`，让它 auto-compact 后重试而非直接退出。
+    // 其他 400（有结构化 error_type 或非裸 Bad Request）仍走 `over_size_400=false` 直接退出路径。
+    let over_size_400 = is_over_size_400(status, &body, parsed_error.as_ref());
+
     Err(ApiError::Api {
         status,
         error_type: parsed_error
@@ -1610,11 +1618,39 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         body,
         retryable,
         suggested_action,
+        over_size_400,
     })
 }
 
+/// 判定 400 是否为"请求体过大"的降级可重试语义。
+///
+/// GLM 网关撝请求体过大时回 400 + 裸 "Bad Request" body（无 error_type/message 结构），
+/// 区别于 kimi 等格式错误 400（带结构化 error envelope）。后者不可降级——重试也是 400。
+fn is_over_size_400(
+    status: reqwest::StatusCode,
+    body: &str,
+    parsed_error: Option<&ErrorEnvelope>,
+) -> bool {
+    if status.as_u16() != 400 {
+        return false;
+    }
+    // 有结构化 error envelope 的 400 是请求格式错误，不可降级重试。
+    if parsed_error.is_some() {
+        return false;
+    }
+    // 裸 "Bad Request" body —— GLM 网关请求体过大撝拒的特征。
+    body.trim() == "Bad Request"
+}
+
 const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
-    matches!(status.as_u16(), 408 | 409 | 429 | 500 | 502 | 503 | 504)
+    // **2026-07-22 子 agent 撝爆 GLM 修复**：400 Bad Request 纳入 retryable——
+    // 但仅限 `over_size_400=true` 的降级路径（`send_with_retry` 重试 + `run_turn` auto-compact）。
+    // 其他 400（格式错误）由 `expect_success` 标 `over_size_400=false`，`run_turn` 据此直接退出不重试。
+    // 原 retryable 列表保留不变，400 由 over_size_400 路径单独处理。
+    matches!(
+        status.as_u16(),
+        400 | 408 | 409 | 429 | 500 | 502 | 503 | 504
+    )
 }
 
 /// Generate a suggested user action based on the HTTP status code and error context.

@@ -1,8 +1,14 @@
+use std::time::Duration;
+
 use crate::error::ApiError;
 
 const HTTP_PROXY_KEYS: [&str; 2] = ["HTTP_PROXY", "http_proxy"];
 const HTTPS_PROXY_KEYS: [&str; 2] = ["HTTPS_PROXY", "https_proxy"];
 const NO_PROXY_KEYS: [&str; 2] = ["NO_PROXY", "no_proxy"];
+
+/// **2026-07-23 子 agent 防挂死**：TCP 连接建立超时。
+/// GLM 网关偶尔 SYN 无响应（防火墙丢包），无此超时 reqwest 默认无限等。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Snapshot of the proxy-related environment variables that influence the
 /// outbound HTTP client. Captured up front so callers can inspect, log, and
@@ -81,7 +87,9 @@ pub fn build_http_client_or_default() -> reqwest::Client {
 /// and `https_proxy` fields and is registered as both an HTTP and HTTPS
 /// proxy so a single value can route every outbound request.
 pub fn build_http_client_with(config: &ProxyConfig) -> Result<reqwest::Client, ApiError> {
-    let mut builder = reqwest::Client::builder().no_proxy();
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(CONNECT_TIMEOUT);
 
     let no_proxy = config
         .no_proxy

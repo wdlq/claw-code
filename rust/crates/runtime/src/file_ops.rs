@@ -20,6 +20,12 @@ const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
 /// thrash DeepSeek's byte-level cache (MEMORY 第 21 条门 1).
 const READ_FILE_DEFAULT_LIMIT: usize = 2000;
 
+/// **2026-07-23 字符级硬上限**：单次 read_file 返回的最大字符数。
+/// 2000 行限制对“长行文件”（PDF/minified JS/单行 JSON）无效，
+/// 一行可以是 MB 级。此上限确保任何单次 read_file 不会向上下文注入超过 50K 字符，
+/// 与 grep_search 的落盘阈值一致。超出时截断并提示模型用 offset 分段读。
+const READ_FILE_MAX_CHARS: usize = 50_000;
+
 /// Maximum file size that can be written (10 MB).
 const MAX_WRITE_SIZE: usize = 10 * 1024 * 1024;
 
@@ -392,6 +398,22 @@ pub fn read_file(
         )
     } else {
         collected.join("\n")
+    };
+
+    // **2026-07-23 字符级硬上限**：超过 READ_FILE_MAX_CHARS 时截断并提示。
+    // 防止单行长文件（PDF/minified JS）一次注入 MB 级内容擑爆上下文。
+    let selected = if selected.len() > READ_FILE_MAX_CHARS {
+        let mut truncated = selected[..READ_FILE_MAX_CHARS].to_string();
+        // 避免截半多字节字符（UTF-8 中文 3 bytes）——向前回退到字符边界。
+        while !selected.is_char_boundary(truncated.len()) && !truncated.is_empty() {
+            truncated.pop();
+        }
+        let next_offset = start_index.saturating_add(collected.len());
+        format!(
+            "{truncated}\n\n[content truncated at {READ_FILE_MAX_CHARS} chars (file has very long lines); pass offset={next_offset} to continue reading]",
+        )
+    } else {
+        selected
     };
 
     Ok(ReadFileOutput {

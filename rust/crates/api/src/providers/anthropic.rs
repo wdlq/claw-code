@@ -939,6 +939,15 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     let parsed_error = serde_json::from_str::<AnthropicErrorEnvelope>(&body).ok();
     let retryable = is_retryable_status(status);
 
+    // **2026-07-22 子 agent 撝爆 GLM 修复（anthropic 路径补全）**：
+    // GLM 网关因请求体过大回 400 时，body 是裸 "Bad Request"（无结构化 JSON envelope）。
+    // 之前此处硬编码 `over_size_400: false`，导致 conversation.rs 的 OverSize400 降级
+    // 重试机制（auto-compact 后重试）对 GLM 子 agent 路径完全不生效。
+    // 对照 openai_compat.rs:1629 的同名检测逻辑。
+    let over_size_400 = status.as_u16() == 400
+        && parsed_error.is_none()
+        && body.trim() == "Bad Request";
+
     Err(ApiError::Api {
         status,
         error_type: parsed_error
@@ -951,6 +960,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         body,
         retryable,
         suggested_action: None,
+        over_size_400,
     })
 }
 
@@ -976,6 +986,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
         body,
         retryable,
         suggested_action,
+        over_size_400,
     } = error
     else {
         return error;
@@ -989,6 +1000,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
             body,
             retryable,
             suggested_action,
+            over_size_400,
         };
     }
     let Some(bearer_token) = auth.bearer_token() else {
@@ -1000,6 +1012,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
             body,
             retryable,
             suggested_action,
+            over_size_400,
         };
     };
     if !bearer_token.starts_with("sk-ant-") {
@@ -1011,6 +1024,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
             body,
             retryable,
             suggested_action,
+            over_size_400,
         };
     }
     // Only append the hint when the AuthSource is pure BearerToken. If both
@@ -1026,6 +1040,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
             body,
             retryable,
             suggested_action,
+            over_size_400,
         };
     }
     let enriched_message = match message {
@@ -1040,6 +1055,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
         body,
         retryable,
         suggested_action,
+        over_size_400,
     }
 }
 
@@ -1818,6 +1834,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+        over_size_400: false,
         };
 
         // when
@@ -1859,6 +1876,7 @@ mod tests {
             body: String::new(),
             retryable: true,
             suggested_action: None,
+        over_size_400: false,
         };
 
         // when
@@ -1888,6 +1906,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+        over_size_400: false,
         };
 
         // when
@@ -1916,6 +1935,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+        over_size_400: false,
         };
 
         // when
@@ -1941,6 +1961,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+        over_size_400: false,
         };
 
         // when

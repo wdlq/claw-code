@@ -152,10 +152,26 @@ const COMPACTABLE_TOOLS: &[&str] = &[
 /// **根因**（2026-07-15 实机发现）：不能调 `auto_compaction_threshold_from_env()`——
 /// 那读 env 失败后 fallback 到默认 55_000，绕过了 `with_model_context_window` 设的
 /// 动态阈值（1M 窗口→750K）。改成收参，由调用方传入 runtime 的最终阈值。
+///
+/// **2026-07-22 子 agent 撑爆 GLM 修复**：实机现场——子 agent 跑 `run_turn` loop 到第 3 轮时
+/// 请求体膨胀到 244KB（est_tokens=60998），GLM 网关报 400。根因不是 auto_compact 阈值留得太晚
+///（同套 150K 阈值在 A=7c95f2b 版主 LLM 跑 GLM 200K 稳定数百轮），而是这个函数把 snip 闸门
+/// 按阈值/4 算——子 agent 阈值 150K 时闸门抬到 37.5K 字符，第 2 轮 14 个 grep_search 结果
+/// 单个才几 KB 全部 < 37.5K → 全跳过不 snip → 第 3 轮请求体膨胀到 244KB 撑爆 GLM。
+/// A 版稳定跑时这个闸门是固定常量 5000 字符（MIN_OUTPUT_LENGTH_FOR_CLEAR）。
+///
+/// 修复：给算值兜底上限 `min(算值, 5000)`，让子 agent 路径的 snip 闸门最多 5K 字符，
+/// 跟 A 版主 LLM 跑 GLM 200K 稳定数百轮时一致。主 LLM 跑 DeepSeek 1M 阈值 750K 时算值 187.5K
+/// 会被兜到 5K——但这不伤主 LLM：DeepSeek 1M 窗口下 microcompact 省的 input token 被 cache hit
+/// 抹消，且清空换占位符会击穿 DeepSeek 硬盘缓存（字节级完整匹配规则），主 LLM 路径本来也靠
+/// `CLAW_MICROCOMPACT_DISABLE=1` 全关 microcompact 走纯重传+缓存命中策略。
 fn min_output_length_for_clear(auto_compaction_threshold: u32) -> usize {
     // 除以 4 是字符级近似（auto_compaction_threshold 是 token 数，~4 char/token，
     // 与现有 output.len() 字符级比较的误差可接受——只是阈值）。
-    (auto_compaction_threshold / 4) as usize
+    let scaled = (auto_compaction_threshold / 4) as usize;
+    // 兜底上限 5000 字符——对齐 A=7c95f2b 版主 LLM 跑 GLM 200K 稳定数百轮时的固定闸门。
+    // 不让闸门随阈值洿涨船高，子 agent 路径（阈值 150K）会被抬到 37.5K 字符导致小 tool_result 全跳过。
+    scaled.min(5_000)
 }
 
 /// Emergency threshold: tool results larger than this are ALWAYS cleared,

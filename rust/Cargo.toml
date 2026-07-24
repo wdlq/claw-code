@@ -12,7 +12,8 @@ publish = false
 serde_json = "1"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# deny 而非 forbid：允许特定函数用 #[allow(unsafe_code)] 豁免（如 Windows Console FFI）。
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

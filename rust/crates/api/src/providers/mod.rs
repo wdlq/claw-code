@@ -694,7 +694,35 @@ fn estimate_message_request_input_tokens(request: &MessageRequest) -> u32 {
 fn estimate_serialized_tokens<T: Serialize>(value: &T) -> u32 {
     serde_json::to_vec(value)
         .ok()
-        .map_or(0, |bytes| (bytes.len() / 4 + 1) as u32)
+        .map_or(0, |bytes| estimate_tokens_from_bytes(&bytes))
+}
+
+/// **2026-07-22 CJK 适配**：纯 `bytes/4` 对中文内容严重低估 token 数——
+/// CJK 字符 UTF-8 编码 3 字节，token 化约 1 token/字，即 3 bytes/token；
+/// 而 bytes/4 算出 0.75 token/字，低估 33%。
+///
+/// 改进算法：统计 UTF-8 续延字节（0x80-0xBF）占比推算多字节字符比例，
+/// 对 CJK 重内容用更保守的除数（2.5 而非 4）。
+/// - 纯 ASCII：bytes/4（不变）
+/// - 纯 CJK：bytes×0.4（≈ 1.2 token/char，略保守确保不超限）
+/// - 混合：线性插值
+fn estimate_tokens_from_bytes(bytes: &[u8]) -> u32 {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let total = bytes.len();
+    // UTF-8 续延字节（10xxxxxx）计数——每个多字节字符贡献 (n-1) 个续延字节。
+    // CJK 字符（3 字节）贡献 2 个续延字节。
+    let continuation_bytes = bytes.iter().filter(|&&b| (0x80..0xC0).contains(&b)).count();
+    // 用续延字节占比作为多字节字符密度的代理指标。
+    // 纯 CJK (3-byte UTF-8): cont/total ≈ 0.67，cjk_density = min(2*0.67, 1.0) = 1.0
+    // 纯 ASCII: cont=0，cjk_density = 0
+    // 混合：线性插值
+    let cjk_density = ((continuation_bytes * 2) as f64 / total as f64).min(1.0);
+    // 纯 ASCII: cjk_density=0 → divisor=4.0 → bytes/4
+    // 纯 CJK:  cjk_density=1.0 → divisor=2.5 → bytes/2.5 ≈ bytes×0.4
+    let divisor = 4.0 - 1.5 * cjk_density;
+    ((total as f64 / divisor).ceil() as u32).max(1)
 }
 
 /// Env var names used by other provider backends. When Anthropic auth

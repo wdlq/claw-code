@@ -520,6 +520,19 @@ fn render_subagents_section(config: &RuntimeConfig) -> Option<String> {
         };
         lines.push(format!("- `{subagent_type}`: {desc}"));
     }
+    // **2026-07-22 推式指导段**：告诉主 LLM 优先派子 agent 做"读/搜/查"类工作，自己专注写代码和决策。
+    // 改自真机观察——主 LLM 拿到子 agent 结果后自己连续调 DeepSeek 跑 88 次后续工作，没再派活。
+    // 推式指导比描述性说明更有效：主 LLM 需要明确"什么时候该派、什么时候自己做"的边界。
+    // **2026-07-22 修订**：①子 agent 之间上下文必须独立——即便连续两次调用同一类型子 agent，也不把
+    //   上一次的上下文传给他，每次派活都是全新实例（Session::new()）；②主 LLM 优先派活到底，
+    //   即便等子 agent 跑完也不要自己干苦力——子 agent 走 GLM 廉价、主 LLM 走 DeepSeek 贵。
+    lines.push(String::new());
+    lines.push("## 子 agent 使用原则".to_string());
+    lines.push("".to_string());
+    lines.push("- 读文件、搜代码、查函数定位、查调用链 → 派对应的子 agent 做。".to_string());
+    lines.push("- 一个子 agent 跑完后，下一步仍是读/搜/查范畴 → 继续派子 agent，等它跑完拿结论再做后续决策，不要自己调 read_file/grep 替代。".to_string());
+    lines.push("- 子 agent 之间上下文完全独立：即便连续两次调同一类型子 agent，第二次也看不到第一次的会话——每次派活都是全新实例，prompt 里要写清楚本次任务的范围。".to_string());
+    lines.push("- 只有写代码、改文件、做决策、综合多源信息时才自己做。".to_string());
     Some(lines.join("\n"))
 }
 

@@ -5014,6 +5014,9 @@ impl LiveCli {
             prompt_history: Vec::new(),
             shared_abort_signal: runtime::HookAbortSignal::new(),
         };
+        // **2026-07-23 子 agent Ctrl+C 中断修复**：把 abort signal 注册到进程级静态，
+        // 让 tools crate 的 `spawn_agent_job` 能在 Ctrl+C 时提前中断子 agent 等待。
+        tools::register_process_abort_signal(cli.shared_abort_signal.clone());
         cli.persist_session()?;
         Ok(cli)
     }
@@ -8973,7 +8976,16 @@ impl AnthropicRuntimeClient {
                 _ = abort.wait() => return Err(RuntimeError::new("Turn aborted by user")),
                 result = self.client.stream_message(message_request) => result
                     .map_err(|error| {
-                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                        // **2026-07-22 子 agent 撝爆 GLM 修复**：透传 over_size_400 语义到 run_turn。
+                        let kind = if error.is_over_size_400() {
+                            runtime::ErrorKind::OverSize400
+                        } else {
+                            runtime::ErrorKind::Generic
+                        };
+                        RuntimeError::with_kind(
+                            format_user_visible_api_error(&self.session_id, &error),
+                            kind,
+                        )
                     })?,
             }
         } else {
@@ -8981,7 +8993,16 @@ impl AnthropicRuntimeClient {
                 .stream_message(message_request)
                 .await
                 .map_err(|error| {
-                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                    // **2026-07-22 子 agent 撝爆 GLM 修复**：透传 over_size_400 语义到 run_turn。
+                    let kind = if error.is_over_size_400() {
+                        runtime::ErrorKind::OverSize400
+                    } else {
+                        runtime::ErrorKind::Generic
+                    };
+                    RuntimeError::with_kind(
+                        format_user_visible_api_error(&self.session_id, &error),
+                        kind,
+                    )
                 })?
         };
         let mut stdout = io::stdout();
@@ -10603,6 +10624,7 @@ mod tests {
             body: String::new(),
             retryable: true,
             suggested_action: None,
+        over_size_400: false,
         };
 
         let rendered = format_user_visible_api_error("session-issue-22", &error);
@@ -10626,6 +10648,7 @@ mod tests {
                 body: String::new(),
                 retryable: true,
                 suggested_action: None,
+        over_size_400: false,
             }),
         };
 
@@ -10690,6 +10713,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+        over_size_400: false,
         };
 
         let rendered = format_user_visible_api_error("session-issue-32", &error);
@@ -10723,6 +10747,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+        over_size_400: false,
         };
 
         let rendered = format_user_visible_api_error("session-issue-32", &error);
@@ -10757,6 +10782,7 @@ mod tests {
                 body: String::new(),
                 retryable: false,
                 suggested_action: None,
+        over_size_400: false,
             }),
         };
 

@@ -91,9 +91,31 @@ impl Display for ToolError {
 impl std::error::Error for ToolError {}
 
 /// Error returned when a conversation turn cannot be completed.
+///
+/// `kind` carries structured error semantics (e.g. `OverSize400` for GLM 网关
+/// 撝请求体过大的 400 Bad Request）透传到 `run_turn`，让它能据此降级处理
+/// （auto-compact 后重试）而非直接退出。对应 `ApiError::Api.retryable` +
+/// `suggested_action` 语义，但 `RuntimeError` 从 `ApiError::to_string()` 构造时
+/// 原本的 retryable/kind 标记会丢失，所以这里独立保留。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeError {
     message: String,
+    kind: ErrorKind,
+}
+
+/// Structured error kind for `RuntimeError`.
+///
+/// `OverSize400` 标记 GLM 网关因请求体过大回 400 Bad Request 的语义——
+/// 这种 400 不是请求格式错误而是上下文累积超网关硬上限，`run_turn` 捕获后
+/// 应 auto-compact 再重试而非直接退出。其他 400（请求体格式错误）仍走
+/// `Generic` 直接退出路径。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// 默认——不可降级的普通错误。
+    #[default]
+    Generic,
+    /// GLM 网关因请求体过大回 400 Bad Request——可降级 auto-compact 后重试。
+    OverSize400,
 }
 
 impl RuntimeError {
@@ -101,7 +123,29 @@ impl RuntimeError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            kind: ErrorKind::Generic,
         }
+    }
+
+    /// 构造带 `kind` 标记的 `RuntimeError`——透传 400 over_size 等结构化语义。
+    #[must_use]
+    pub fn with_kind(message: impl Into<String>, kind: ErrorKind) -> Self {
+        Self {
+            message: message.into(),
+            kind,
+        }
+    }
+
+    /// 返回结构化错误语义——`run_turn` 据此判定是否降级重试。
+    #[must_use]
+    pub fn kind(&self) -> ErrorKind {
+        self.kind
+    }
+
+    /// 返回是否为可降级的 GLM 400 over_size 错误。
+    #[must_use]
+    pub fn is_over_size_400(&self) -> bool {
+        self.kind == ErrorKind::OverSize400
     }
 }
 
@@ -233,7 +277,7 @@ where
     }
 
     /// **2026-07-19 multiprovider 落地**：子 agent 专用——按 model 上下文窗口动态算
-    /// auto-compact 阈值，**不读任何 env 覆盖**，强制用 `context_window × 75%`。
+    /// auto-compact 阈值，**不读任何 env 覆盖**，强制用 `(context_window - max_output) × 75%`。
     ///
     /// 修的破裂点：主 LLM 走 DeepSeek 1M，子 agent 走 GLM 200K 时，若 `.claw.json`
     /// 的 `env` 段显式设了 `CLAUDE_CODE_AUTO_COMPACT_WINDOW=131000`（针对 GLM 200K 算的 75%），
@@ -241,17 +285,27 @@ where
     /// 频繁 compact 反伤 DeepSeek 缓存；主=GLM 子=DeepSeek 时子 agent 阈值 750K 直接撑爆
     /// GLM 200K 窗口报 `ContextWindowExceeded` 400。
     ///
+    /// **2026-07-22 改进**：阈值基于“输入预算”（context_window - max_output_tokens）而非
+    /// 总窗口。之前用 `context_window × 75%` 算出 150K，但 GLM-5.1 的 max_output=64K，
+    /// 实际输入预算只有 136K——阈值 150K > 输入预算 136K，导致 auto-compact 触发前
+    /// 请求已经超出 GLM 的输入上限报 400。改为 `(200K-64K)×75% = 102K` 后安全。
+    ///
     /// 子 agent 走 strict 路径后阈值严格按自己的 model 算，与主 LLM 的 env 配置彻底独立。
     /// 仍保留下限保护：至少给到 `DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD` 55K，
-    /// 避免子 agent 走 128K DeepSeek-flash 等小窗口模型算出 96K 阈值被压到 55K——太小阈值
-    /// 频繁 compact 反伤缓存对子 agent 仍是不良。
+    /// 避免子 agent 走 128K DeepSeek-flash 等小窗口模型算出太小阈值频繁 compact 反伤缓存。
     ///
     /// 对照 `docs/multiprovider.md` 3.4ter 节。主 LLM 路径仍走 `with_model_context_window`
     /// （允许用户用 env 显式覆盖主 LLM 阈值），两条路径彻底独立。
     #[must_use]
-    pub fn with_model_context_window_strict(mut self, context_window_tokens: u32) -> Self {
+    pub fn with_model_context_window_strict(
+        mut self,
+        context_window_tokens: u32,
+        max_output_tokens: u32,
+    ) -> Self {
         let pct = 75u32; // 对齐官方claude-code的0.75阈值
-        let dynamic_threshold = (context_window_tokens as u64 * pct as u64 / 100) as u32;
+        // 基于输入预算（总窗口 - 输出预留）算阈值，确保触发 compact 时 input 仍在窗口内。
+        let input_budget = context_window_tokens.saturating_sub(max_output_tokens);
+        let dynamic_threshold = (input_budget as u64 * pct as u64 / 100) as u32;
         self.auto_compaction_input_tokens_threshold =
             dynamic_threshold.max(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD);
         self
@@ -396,15 +450,24 @@ where
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
+        // **2026-07-22 子 agent 撝爆 GLM 修复**：over_size 400 降级重试计数——
+        // 每次降级 auto-compact 后重试本轮，但最多 3 次避免无限循环（compact 后仍撝 400 说明压不动）。
+        let mut over_size_400_retries: u32 = 0;
+        const OVER_SIZE_400_MAX_RETRIES: u32 = 3;
 
         loop {
             iterations += 1;
             if iterations > self.max_iterations {
-                let error = RuntimeError::new(
-                    "conversation loop exceeded the maximum number of iterations",
+                // **2026-07-23 子 agent 超限 graceful 退出**：
+                // 之前此处直接 return Err，导致子 agent 已收集的所有文本全丢失，
+                // 主 LLM 只看到 "conversation loop exceeded..." 错误字符串。
+                // 现在改为 break——带着已累积的 assistant_messages 走下方正常返回路径，
+                // 让主 LLM 能看到子 agent 已完成的部分工作。
+                eprintln!(
+                    "[conversation: 达到最大迭代数 {}，带已有结果退出]",
+                    self.max_iterations
                 );
-                self.record_turn_failed(iterations, &error);
-                return Err(error);
+                break;
             }
 
             // Check if the user requested an abort (e.g. via CTRL+C).
@@ -453,6 +516,54 @@ where
             let events = match self.api_client.stream(request) {
                 Ok(events) => events,
                 Err(error) => {
+                    // **2026-07-22 子 agent 撝爆 GLM 修复**：GLM 网关因请求体过大回 400 Bad Request 时，
+                    // 降级 auto-compact 后重试本轮而非直接退出。`over_size_400` 语义由 `ProviderRuntimeClient::stream`
+                    // 从 `ApiError::is_over_size_400()` 透传到 `RuntimeError::with_kind(..., OverSize400)`。
+                    // 其他错误（含格式错误的 400）仍走原 `return Err` 直接退出路径。
+                    if error.is_over_size_400() {
+                        if over_size_400_retries >= OVER_SIZE_400_MAX_RETRIES {
+                            // compact 后仍撝 400 说明压不动——放弃降级，上抛让调用方知道。
+                            eprintln!(
+                                "[over_size_400: exhausted {} 降级重试，放弃]",
+                                OVER_SIZE_400_MAX_RETRIES
+                            );
+                            self.record_turn_failed(iterations, &error);
+                            return Err(error);
+                        }
+                        over_size_400_retries += 1;
+                        eprintln!(
+                            "[over_size_400: GLM 网关撝请求体过大回 400，降级 auto-compact 后重试 ({}/{})]",
+                            over_size_400_retries,
+                            OVER_SIZE_400_MAX_RETRIES
+                        );
+                        // 强制 auto-compact：用 `compact_session` 压到尽量小（max_estimated_tokens=0）
+                        // 再 `continue` 重试本轮。`maybe_auto_compact` 轻量路径阈值不够低时撝不住，
+                        // 这里直接调 `compact_session` 强压。
+                        let compact_result = compact_session(
+                            &self.session,
+                            CompactionConfig {
+                                max_estimated_tokens: 0,
+                                ..CompactionConfig::default()
+                            },
+                        );
+                        if compact_result.removed_message_count > 0 {
+                            self.session = compact_result.compacted_session;
+                            eprintln!(
+                                "[over_size_400: auto-compact 移除 {} 条消息]",
+                                compact_result.removed_message_count
+                            );
+                        } else {
+                            // compact 压不动（消息全保留或全空）——再试也是 400，提前放弃避免空转。
+                            eprintln!(
+                                "[over_size_400: auto-compact 压不动，放弃降级重试]"
+                            );
+                            self.record_turn_failed(iterations, &error);
+                            return Err(error);
+                        }
+                        // 本轮迭代不计入 max_iterations——降级重试不应被错误地算成"超额迭代"。
+                        iterations -= 1;
+                        continue;
+                    }
                     self.record_turn_failed(iterations, &error);
                     return Err(error);
                 }
@@ -667,8 +778,9 @@ where
         // auto-compact still triggers when the context grows large.
         let input_tokens = self.usage_tracker.cumulative_usage().input_tokens;
         let estimated_tokens = if input_tokens == 0 {
-            // Rough estimate: ~4 chars per token across all message content
-            let char_count: usize = self
+            // **2026-07-23 CJK 感知估算**：bytes/4 对中文严重偏低（UTF-8 中文 3 bytes ≈ 1 token，
+            // 但 bytes/4 只算 0.75 token）。用 `estimate_tokens_mixed` 按 ASCII/非 ASCII 分开算。
+            let byte_count: usize = self
                 .session
                 .messages
                 .iter()
@@ -684,7 +796,7 @@ where
                         .sum::<usize>()
                 })
                 .sum::<usize>();
-            (char_count / 4) as u32
+            estimate_tokens_mixed(byte_count)
         } else {
             input_tokens
         };
@@ -714,8 +826,11 @@ where
     /// provider-side rejection (e.g. GLM's 400 Bad Request) and should
     /// be compacted BEFORE the next API call.
     fn session_needs_pre_flight_compact(&self) -> bool {
-        // Estimate token count from message content (~4 chars/token).
-        let char_count: usize = self
+        // **2026-07-23 CJK 感知 + 系统开销估算**：
+        // 之前用 bytes/4 对中文内容严重偏低（实际≈ bytes/3），导致 pre-flight
+        // 放行了实际已超 GLM 输入预算的请求。现改用 `estimate_tokens_mixed`，
+        // 并加上系统提示词+工具定义的开销估算（~15K tokens）。
+        let byte_count: usize = self
             .session
             .messages
             .iter()
@@ -731,8 +846,12 @@ where
                     .sum::<usize>()
             })
             .sum::<usize>();
-        let estimated_tokens = (char_count / 4) as u32;
-        estimated_tokens >= self.auto_compaction_input_tokens_threshold
+        let estimated_tokens = estimate_tokens_mixed(byte_count);
+        // 加上系统提示词 + 工具定义的开销（子 agent 约 10-15K tokens）。
+        // 主 LLM 路径也适用——系统提示词始终随请求发送但不计入 session messages。
+        const SYSTEM_OVERHEAD_TOKENS: u32 = 15_000;
+        let total_estimate = estimated_tokens.saturating_add(SYSTEM_OVERHEAD_TOKENS);
+        total_estimate >= self.auto_compaction_input_tokens_threshold
     }
 
     fn record_turn_started(&self, user_input: &str) {
@@ -841,6 +960,22 @@ where
         attributes.insert("error".to_string(), Value::String(error.to_string()));
         session_tracer.record("turn_failed", attributes);
     }
+}
+
+/// **2026-07-23 CJK 感知 token 估算**：替代原来的 `bytes / 4` 硬编码。
+///
+/// 原理：
+/// - 纯英文/代码：UTF-8 1 byte/char，tokenizer ~4 chars/token → bytes/4
+/// - 纯中文：UTF-8 3 bytes/char，tokenizer ~1 token/char → bytes/3
+/// - 混合内容：取两者中间值 bytes/3 作为保守估算（宁可早 compact 也不撑爆 400）
+///
+/// 用 bytes/3 而非精确统计非 ASCII 字节数，因为：
+/// 1. 子 agent 读的文件多为中文注释+英文代码混合，bytes/3 是安全上界
+/// 2. 早触发 compact 的代价（丢失部分上下文）远小于 400 错误的代价（整个任务失败）
+/// 3. 避免遍历内容统计字节分布的性能开销
+#[must_use]
+fn estimate_tokens_mixed(byte_count: usize) -> u32 {
+    (byte_count as u64 / 3) as u32
 }
 
 /// Reads the automatic compaction threshold from the environment.
@@ -1830,16 +1965,30 @@ mod tests {
         )
     }
 
-    /// ★ 2026-07-19 multiprovider：strict 变体不读任何 env，强制用 `context_window × 75%`。
-    /// 验 DeepSeek V4 Pro 1M 窗口 → 750K 阈值。
+    /// ★ 2026-07-19 multiprovider：strict 变体不读任何 env，强制用 `(context_window - max_output) × 75%`。
+    /// 验 DeepSeek V4 Pro 1M 窗口 + max_output=0 → 750K 阈值。
     #[test]
     fn with_model_context_window_strict_uses_dynamic_threshold_without_env() {
         let runtime = minimal_runtime()
-            .with_model_context_window_strict(1_000_000);
+            .with_model_context_window_strict(1_000_000, 0);
         assert_eq!(
             runtime.auto_compaction_input_tokens_threshold,
             750_000,
             "1M 窗口 × 75% = 750K，不读 env"
+        );
+    }
+
+    /// ★ 2026-07-22：strict 变体验 GLM-5.1 场景——200K 窗口 - 64K max_output = 136K 输入预算，
+    /// 136K × 75% = 102K 阈值。确保 auto-compact 在输入超出实际上限前触发。
+    #[test]
+    fn with_model_context_window_strict_glm51_scenario() {
+        // GLM-5.1: context=200K, effective max_tokens=64K
+        let runtime = minimal_runtime()
+            .with_model_context_window_strict(200_000, 64_000);
+        assert_eq!(
+            runtime.auto_compaction_input_tokens_threshold,
+            102_000,
+            "(200K - 64K) × 75% = 102K，安全低于 136K 输入上限"
         );
     }
 
@@ -1856,11 +2005,11 @@ mod tests {
         std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "131000");
 
         let runtime = minimal_runtime()
-            .with_model_context_window_strict(1_000_000);
+            .with_model_context_window_strict(1_000_000, 0);
         assert_eq!(
             runtime.auto_compaction_input_tokens_threshold,
             750_000,
-            "strict 路径必须忽略 env 覆盖，按 1M × 75% = 750K 算"
+            "strict 路径必须忽略 env 覆盖，按 (1M - 0) × 75% = 750K 算"
         );
 
         // 清理 env 防止污染后续测试
@@ -1875,22 +2024,22 @@ mod tests {
     /// 太小阈值频繁 compact 反伤缓存，对子 agent 仍是不良。
     #[test]
     fn with_model_context_window_strict_keeps_floor_protection() {
-        // 128K × 75% = 96K > 55K 下限，直接用 96K
+        // (128K - 0) × 75% = 96K > 55K 下限，直接用 96K
         let runtime = minimal_runtime()
-            .with_model_context_window_strict(128_000);
+            .with_model_context_window_strict(128_000, 0);
         assert_eq!(
             runtime.auto_compaction_input_tokens_threshold,
             96_000,
-            "128K × 75% = 96K > 55K 下限，用 96K"
+            "(128K - 0) × 75% = 96K > 55K 下限，用 96K"
         );
-
-        // 50K × 75% = 37.5K < 55K 下限，兜底到 55K
+    
+        // (50K - 0) × 75% = 37.5K < 55K 下限，兖底到 55K
         let runtime = minimal_runtime()
-            .with_model_context_window_strict(50_000);
+            .with_model_context_window_strict(50_000, 0);
         assert_eq!(
             runtime.auto_compaction_input_tokens_threshold,
             DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
-            "50K × 75% = 37.5K < 55K 下限，兜底到 55K"
+            "(50K - 0) × 75% = 37.5K < 55K 下限，兖底到 55K"
         );
     }
 
@@ -2088,7 +2237,7 @@ mod tests {
     }
 
     #[test]
-    fn run_turn_errors_when_max_iterations_is_exceeded() {
+    fn run_turn_graceful_exit_when_max_iterations_is_exceeded() {
         struct LoopingApi;
 
         impl ApiClient for LoopingApi {
@@ -2117,15 +2266,14 @@ mod tests {
         )
         .with_max_iterations(1);
 
-        // when
-        let error = runtime
+        // when — **2026-07-23 改为 graceful break**：超限不再报错，而是带已有结果正常返回。
+        let summary = runtime
             .run_turn("loop", None)
-            .expect_err("conversation loop should stop after the configured limit");
+            .expect("max iterations should gracefully break, not error");
 
-        // then
-        assert!(error
-            .to_string()
-            .contains("conversation loop exceeded the maximum number of iterations"));
+        // then — 选代数不超过 max_iterations+1，且有已执行的 assistant 消息。
+        assert_eq!(summary.iterations, 2); // iteration 1 执行了，iteration 2 触发 break
+        assert!(!summary.assistant_messages.is_empty());
     }
 
     #[test]

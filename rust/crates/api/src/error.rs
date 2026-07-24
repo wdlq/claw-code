@@ -60,6 +60,10 @@ pub enum ApiError {
         retryable: bool,
         /// Suggested user action based on error type (e.g., "Reduce prompt size" for 413)
         suggested_action: Option<String>,
+        /// **2026-07-22 子 agent 撝爆 GLM 修复**：标记 GLM 网关因请求体过大回 400 Bad Request 的语义。
+        /// 区别于格式错误的 400——这种 400 是上下文累积超网关硬上限，可降级 auto-compact 后重试。
+        /// `expect_success` 据响应体特征（"Bad Request" + 无 error_type）置位，`run_turn` 据此走降级路径。
+        over_size_400: bool,
     },
     RetriesExhausted {
         attempts: u32,
@@ -143,6 +147,18 @@ impl ApiError {
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. }
             | Self::RequestBodySizeExceeded { .. } => false,
+        }
+    }
+
+    /// **2026-07-22 子 agent 撝爆 GLM 修复**：返回是否为 GLM 网关因请求体过大回 400 的降级可重试语义。
+    /// `expect_success` 据裸 "Bad Request" body 置位，`ProviderRuntimeClient::stream` 等调用方
+    /// 据此构造 `RuntimeError::with_kind(..., ErrorKind::OverSize400)` 透传到 `run_turn` 降级路径。
+    #[must_use]
+    pub fn is_over_size_400(&self) -> bool {
+        match self {
+            Self::Api { over_size_400, .. } => *over_size_400,
+            Self::RetriesExhausted { last_error, .. } => last_error.is_over_size_400(),
+            _ => false,
         }
     }
 
@@ -496,6 +512,7 @@ mod tests {
             body: String::new(),
             retryable: true,
             suggested_action: None,
+        over_size_400: false,
         };
 
         assert!(error.is_generic_fatal_wrapper());
@@ -519,6 +536,7 @@ mod tests {
                 body: String::new(),
                 retryable: true,
                 suggested_action: None,
+        over_size_400: false,
             }),
         };
 
@@ -540,6 +558,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+        over_size_400: false,
         };
 
         assert!(error.is_context_window_failure());
@@ -560,6 +579,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+        over_size_400: false,
         };
 
         assert!(error.is_context_window_failure());
