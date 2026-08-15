@@ -168,7 +168,7 @@ fn parse_stream_event(
                 body: payload.to_string(),
                 retryable: false,
                 suggested_action: None,
-        over_size_400: false,
+                over_size_400: false,
             });
         }
     }

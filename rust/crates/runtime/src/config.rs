@@ -1082,7 +1082,9 @@ fn parse_optional_subagent_provider_routing(
 /// 形态：`{ "subagents": { "<type>": { "description": "...", "tools": [...], "systemPrompt": "...", "model": "..." }, ... } }`
 /// 都没配 → 返回空 `BTreeMap`（保持向后兼容，主 LLM system prompt 不注入"Available subagents:"段）。
 /// 对照 `docs/SUBAGENT_GUIDE.md` 第二节 + `docs/multiprovider.md` 3.4septies 节。
-fn parse_optional_subagents(root: &JsonValue) -> Result<BTreeMap<String, SubagentConfig>, ConfigError> {
+fn parse_optional_subagents(
+    root: &JsonValue,
+) -> Result<BTreeMap<String, SubagentConfig>, ConfigError> {
     let Some(object) = root.as_object() else {
         return Ok(BTreeMap::new());
     };
@@ -1101,16 +1103,12 @@ fn parse_optional_subagents(root: &JsonValue) -> Result<BTreeMap<String, Subagen
     Ok(subagents)
 }
 
-fn parse_subagent_config(
-    value: &JsonValue,
-    context: &str,
-) -> Result<SubagentConfig, ConfigError> {
+fn parse_subagent_config(value: &JsonValue, context: &str) -> Result<SubagentConfig, ConfigError> {
     let object = expect_object(value, context)?;
     let description = optional_string(object, "description", context)?
         .unwrap_or("")
         .to_string();
-    let tools = optional_string_array(object, "tools", context)?
-        .unwrap_or_default();
+    let tools = optional_string_array(object, "tools", context)?.unwrap_or_default();
     let system_prompt = optional_string(object, "systemPrompt", context)?
         .unwrap_or("")
         .to_string();
@@ -2453,7 +2451,10 @@ mod tests {
             "apiKey".to_string(),
             JsonValue::String("sk-glm-plainkey".to_string()),
         );
-        review.insert("model".to_string(), JsonValue::String("glm-5.1".to_string()));
+        review.insert(
+            "model".to_string(),
+            JsonValue::String("glm-5.1".to_string()),
+        );
         providers.insert("review".to_string(), JsonValue::Object(review));
         obj.insert(
             "subagentProviders".to_string(),
@@ -2552,7 +2553,10 @@ mod tests {
     fn parse_optional_subagents_populated() {
         let mut root_map = std::collections::BTreeMap::new();
         let mut review_cfg = std::collections::BTreeMap::new();
-        review_cfg.insert("description".to_string(), JsonValue::String("Review code for bugs".to_string()));
+        review_cfg.insert(
+            "description".to_string(),
+            JsonValue::String("Review code for bugs".to_string()),
+        );
         review_cfg.insert(
             "tools".to_string(),
             JsonValue::Array(vec![
@@ -2560,19 +2564,28 @@ mod tests {
                 JsonValue::String("grep_search".to_string()),
             ]),
         );
-        review_cfg.insert("systemPrompt".to_string(), JsonValue::String("Be thorough.".to_string()));
-        review_cfg.insert("model".to_string(), JsonValue::String("glm-5.1".to_string()));
+        review_cfg.insert(
+            "systemPrompt".to_string(),
+            JsonValue::String("Be thorough.".to_string()),
+        );
+        review_cfg.insert(
+            "model".to_string(),
+            JsonValue::String("glm-5.1".to_string()),
+        );
         let mut subagents_map = std::collections::BTreeMap::new();
         subagents_map.insert("review".to_string(), JsonValue::Object(review_cfg));
         root_map.insert("subagents".to_string(), JsonValue::Object(subagents_map));
         let root = JsonValue::Object(root_map);
 
-        let subagents = parse_optional_subagents(&root)
-            .expect("populated subagents段 should parse");
+        let subagents =
+            parse_optional_subagents(&root).expect("populated subagents段 should parse");
         assert_eq!(subagents.len(), 1);
         let review = subagents.get("review").expect("review entry should exist");
         assert_eq!(review.description, "Review code for bugs");
-        assert_eq!(review.tools, vec!["read_file".to_string(), "grep_search".to_string()]);
+        assert_eq!(
+            review.tools,
+            vec!["read_file".to_string(), "grep_search".to_string()]
+        );
         assert_eq!(review.system_prompt, "Be thorough.");
         assert_eq!(review.model, "glm-5.1");
     }
@@ -2583,7 +2596,10 @@ mod tests {
         let mut subagents_map = std::collections::BTreeMap::new();
         // 只配 description，其他字段缺省
         let mut cfg = std::collections::BTreeMap::new();
-        cfg.insert("description".to_string(), JsonValue::String("Bare config".to_string()));
+        cfg.insert(
+            "description".to_string(),
+            JsonValue::String("Bare config".to_string()),
+        );
         subagents_map.insert("bare".to_string(), JsonValue::Object(cfg));
         root_map.insert("subagents".to_string(), JsonValue::Object(subagents_map));
         let root = JsonValue::Object(root_map);

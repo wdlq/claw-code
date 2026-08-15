@@ -1066,8 +1066,8 @@ mod tests {
         let config = ConfigLoader::default_for(&cwd)
             .load()
             .expect("configured settings should load");
-        let section = render_subagents_section(&config)
-            .expect("populated subagents should render a section");
+        let section =
+            render_subagents_section(&config).expect("populated subagents should render a section");
         assert!(section.contains("# Available subagents"));
         assert!(section.contains("`review`: Review code for bugs and security issues"));
         assert!(section.contains("`bare`: Bare config without tools"));
@@ -1095,8 +1095,8 @@ mod tests {
         let config = ConfigLoader::default_for(&cwd)
             .load()
             .expect("nodesc settings should load");
-        let section = render_subagents_section(&config)
-            .expect("populated subagents should render a section");
+        let section =
+            render_subagents_section(&config).expect("populated subagents should render a section");
         assert!(section.contains("`nodesc`: (no description)"));
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

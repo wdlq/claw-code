@@ -503,14 +503,14 @@ fn console_pending_char_key_count() -> usize {
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct InputRecord {
-        event_type: u16,   // offset 0: EventType
-        _align: [u8; 2],   // offset 2: padding to 4-byte align
-        key_down: i32,     // offset 4: KEY_EVENT_RECORD.bKeyDown (BOOL)
-        _repeat: u16,      // offset 8: wRepeatCount
-        _vk: u16,          // offset 10: wVirtualKeyCode
-        _scan: u16,        // offset 12: wVirtualScanCode
-        char_code: u16,    // offset 14: uChar.UnicodeChar
-        _ctrl: u32,        // offset 16: dwControlKeyState
+        event_type: u16, // offset 0: EventType
+        _align: [u8; 2], // offset 2: padding to 4-byte align
+        key_down: i32,   // offset 4: KEY_EVENT_RECORD.bKeyDown (BOOL)
+        _repeat: u16,    // offset 8: wRepeatCount
+        _vk: u16,        // offset 10: wVirtualKeyCode
+        _scan: u16,      // offset 12: wVirtualScanCode
+        char_code: u16,  // offset 14: uChar.UnicodeChar
+        _ctrl: u32,      // offset 16: dwControlKeyState
     }
 
     #[link(name = "kernel32")]
@@ -527,8 +527,14 @@ fn console_pending_char_key_count() -> usize {
 
     let handle = io::stdin().as_raw_handle();
     let mut records = [InputRecord {
-        event_type: 0, _align: [0; 2], key_down: 0,
-        _repeat: 0, _vk: 0, _scan: 0, char_code: 0, _ctrl: 0,
+        event_type: 0,
+        _align: [0; 2],
+        key_down: 0,
+        _repeat: 0,
+        _vk: 0,
+        _scan: 0,
+        char_code: 0,
+        _ctrl: 0,
     }; 256];
     let mut count: u32 = 0;
     let ok = unsafe { PeekConsoleInputW(handle.cast(), records.as_mut_ptr(), 256, &mut count) };
@@ -540,9 +546,7 @@ fn console_pending_char_key_count() -> usize {
     records[..count as usize]
         .iter()
         .filter(|r| {
-            r.event_type == KEY_EVENT
-                && r.key_down != 0
-                && r.char_code >= 0x20 // 可打印字符（排除 \x1b、\r、\n 等控制字符）
+            r.event_type == KEY_EVENT && r.key_down != 0 && r.char_code >= 0x20 // 可打印字符（排除 \x1b、\r、\n 等控制字符）
         })
         .count()
 }

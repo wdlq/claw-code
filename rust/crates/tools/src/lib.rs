@@ -20,12 +20,12 @@ use runtime::{
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
-    read_file_in_workspace_with_allowed,
+    read_file_in_workspace_with_allowed, should_use_compact_receipt,
     summary_compression::compress_summary_text,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
-    should_use_compact_receipt, write_file_in_workspace_with_allowed, ApiClient, ApiRequest, AssistantEvent, BashCommandInput,
+    write_file_in_workspace_with_allowed, ApiClient, ApiRequest, AssistantEvent, BashCommandInput,
     BashCommandOutput, BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage,
     ConversationRuntime, GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
     LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole,
@@ -3765,7 +3765,9 @@ where
     let normalized_subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
     // ★ 2026-07-19 路径 E 落地：读 RuntimeConfig.subagents[type] 拿预定义配置合并 input。
     // 配置优先——description/systemPrompt/model 字段配置配了且 input 没传时用配置的；input 显式传了仍优先（让主 LLM 派活时能临时覆盖）。
-    let subagent_cfg = load_subagents_config().get(&normalized_subagent_type).cloned();
+    let subagent_cfg = load_subagents_config()
+        .get(&normalized_subagent_type)
+        .cloned();
     // 配置优先——input 显式传了 description 就用 input 的，否则 fallback 到配置的 description。
     // 不用 `.clone().or_else(...)` 链（String 没 `or_else` 法，那是 Option 的）。
     let description = if input.description.is_empty() {
@@ -3776,16 +3778,15 @@ where
     } else {
         input.description.clone()
     };
-    let model = resolve_agent_model(
-        input
-            .model
-            .as_deref()
-            .or_else(|| {
-                subagent_cfg
-                    .as_ref()
-                    .and_then(|c| if c.model.is_empty() { None } else { Some(c.model.as_str()) })
-            }),
-    );
+    let model = resolve_agent_model(input.model.as_deref().or_else(|| {
+        subagent_cfg.as_ref().and_then(|c| {
+            if c.model.is_empty() {
+                None
+            } else {
+                Some(c.model.as_str())
+            }
+        })
+    }));
     let agent_name = input
         .name
         .as_deref()
@@ -3793,7 +3794,8 @@ where
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| slugify_agent_name(&description));
     let created_at = iso8601_now();
-    let system_prompt = build_agent_system_prompt(&normalized_subagent_type, &model, subagent_cfg.as_ref())?;
+    let system_prompt =
+        build_agent_system_prompt(&normalized_subagent_type, &model, subagent_cfg.as_ref())?;
     let allowed_tools = allowed_tools_for_subagent(&normalized_subagent_type);
 
     let output_contents = format!(
@@ -3943,8 +3945,7 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
     // 转成 `Box<dyn Fn() + Send + Sync>`（runtime setter 签名要求，不能直接传 Arc）。
     let heartbeat_counter_for_closure = heartbeat_counter.clone();
     let heartbeat: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
-        heartbeat_counter_for_closure
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        heartbeat_counter_for_closure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     });
 
     let thread_name = format!("clawd-agent-{}", job.manifest.agent_id);
@@ -4010,7 +4011,8 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                 }
                 // **2026-07-30 自适应判活核心**：读心跳计数器比对。
                 // 变了 → 重置静默计时器（判"还在干活"继续等）；没变 → 累加静默秒数。
-                let current_heartbeat = heartbeat_counter.load(std::sync::atomic::Ordering::Relaxed);
+                let current_heartbeat =
+                    heartbeat_counter.load(std::sync::atomic::Ordering::Relaxed);
                 if current_heartbeat != last_heartbeat {
                     last_heartbeat = current_heartbeat;
                     stale_secs = 0;
@@ -4064,7 +4066,7 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
     // 显式 join 子线程，确保子线程退出后再返回（避免子线程残留 panic / handle 被丢 Detached thread race）。
     // **超时/静默后子线程可能仍在卡死跑**——join 会阻塞等它跑完。这里选 Detached：
     // 超时后不 join，让子线程自己跑完退出（catch_unwind 兜底 panic 不会永久残留）。
-    let _ = handle;  // drop handle = Detached thread，子线程跑完自动退出
+    let _ = handle; // drop handle = Detached thread，子线程跑完自动退出
 
     // 把 outcome 回填到调用方（execute_agent_with_spawn 的 manifest）。但 spawn_agent_job 签名
     // 是 `FnOnce(AgentJob) -> Result<(), String>`，无法直接把 outcome 返给调用方。
@@ -4116,8 +4118,8 @@ fn run_agent_job_with_outcome(
         job.manifest.subagent_type.as_deref().unwrap_or(""),
     );
     let runtime_result = (|| -> Result<String, String> {
-        let mut runtime =
-            build_agent_runtime(job, Some(heartbeat))?.with_max_iterations(subagent_max_iterations());
+        let mut runtime = build_agent_runtime(job, Some(heartbeat))?
+            .with_max_iterations(subagent_max_iterations());
         // **2026-07-19 multiprovider 落地**：把子 agent 的 resolved model 注入 thread-local，
         // dispatch 层的 `current_dispatch_model()` 优先读 thread-local 算 `compact_receipt`。
         // 对照 `docs/multiprovider.md` 3.4bis 节选项 A。
@@ -4143,12 +4145,8 @@ fn run_agent_job_with_outcome(
             }
         }
         Err(error) => {
-            let _ = persist_agent_terminal_state(
-                &job.manifest,
-                "failed",
-                None,
-                Some(error.clone()),
-            );
+            let _ =
+                persist_agent_terminal_state(&job.manifest, "failed", None, Some(error.clone()));
             AgentRunOutcome {
                 status: String::from("failed"),
                 final_text: None,
@@ -4211,10 +4209,8 @@ fn build_agent_runtime(
         // 用实际请求中的 max_tokens（`max_tokens_for_model` 经 heuristic min 截断后的值）
         // 而非 `limit.max_output_tokens`（模型理论上限）——确保阈值与实际请求体匹配。
         let effective_max_tokens = api::max_tokens_for_model(resolved_model);
-        runtime = runtime.with_model_context_window_strict(
-            limit.context_window_tokens,
-            effective_max_tokens,
-        );
+        runtime = runtime
+            .with_model_context_window_strict(limit.context_window_tokens, effective_max_tokens);
     }
     Ok(runtime)
 }
@@ -7187,13 +7183,13 @@ mod tests {
         current_dispatch_model, derive_agent_state, execute_agent_with_spawn, execute_tool,
         extract_recovery_outcome, final_assistant_text, global_cron_registry,
         maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
-        persist_agent_terminal_state, push_output_block, resolve_subagent_provider, run_task_packet,
-        set_subagent_model, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName,
-        LaneFailureClass, ProviderRuntimeClient, SubagentToolExecutor,
+        persist_agent_terminal_state, push_output_block, resolve_subagent_provider,
+        run_task_packet, set_subagent_model, AgentInput, AgentJob, GlobalToolRegistry,
+        LaneEventName, LaneFailureClass, ProviderRuntimeClient, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
-    use runtime::ProviderFallbackConfig;
     use runtime::should_use_compact_receipt;
+    use runtime::ProviderFallbackConfig;
     use runtime::{
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
         PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,

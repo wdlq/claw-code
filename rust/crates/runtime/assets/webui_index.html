@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>claw · 历史会话</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #1e1e2e;
+    --bg-elev: #2a2a3c;
+    --bg-bubble: #313142;
+    --text: #cdd6f4;
+    --text-dim: #8b8ba7;
+    --accent: #89b4fa;
+    --user: #a6e3a1;
+    --tool: #f9e2af;
+    --border: #45475a;
+    --error: #f38ba8;
+  }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 14px;
+    line-height: 1.6;
+    overflow: hidden;
+  }
+  .app { display: flex; height: 100vh; }
+
+  /* ── Sidebar ─────────────────────────────────────────── */
+  .sidebar {
+    width: 280px;
+    background: var(--bg-elev);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    transition: width 0.2s ease, margin 0.2s ease;
+    overflow: hidden;
+  }
+  .sidebar.collapsed { width: 0; border-right: none; }
+  .sidebar-brand-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    gap: 6px;
+  }
+  .sidebar-brand-row .brand { font-weight: 700; font-size: 14px; }
+  .sidebar-brand-btns { display: flex; gap: 4px; }
+  .sidebar-brand-btns button {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    width: 28px; height: 28px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 14px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s;
+  }
+  .sidebar-brand-btns button:hover { color: var(--text); border-color: var(--accent); }
+  .sidebar-search-btn.active { color: var(--accent) !important; border-color: var(--accent) !important; }
+
+  .search-box {
+    display: none;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .search-box.open { display: block; }
+  .search-box input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    padding: 7px 10px;
+    font-size: 13px;
+    outline: none;
+  }
+  .search-box input:focus { border-color: var(--accent); }
+  .search-status { font-size: 11px; color: var(--text-dim); padding: 4px 14px 0; }
+
+  .sidebar h2 {
+    font-size: 12px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    padding: 12px 14px 6px;
+    letter-spacing: 0.05em;
+    flex-shrink: 0;
+  }
+  .session-list {
+    flex: 1;
+    overflow-y: auto;
+    min-height: 0;
+  }
+  .session-item {
+    padding: 10px 14px;
+    cursor: pointer;
+    border-bottom: 1px solid var(--border);
+    transition: background 0.15s;
+  }
+  .session-item:hover { background: var(--bg-bubble); }
+  .session-item.active { background: var(--bg-bubble); border-left: 3px solid var(--accent); }
+  .session-item .file { font-weight: 600; font-size: 13px; word-break: break-all; }
+  .session-item .meta { font-size: 11px; color: var(--text-dim); margin-top: 4px; }
+
+  /* ── Main area ───────────────────────────────────────── */
+  .main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    position: relative;
+  }
+  /* 折叠时，露出一个「展开」按钮让用户把 sidebar 拉回来 */
+  .sidebar-toggle {
+    display: none;
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    z-index: 5;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    width: 28px; height: 28px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 14px;
+    align-items: center;
+    justify-content: center;
+  }
+  .sidebar.collapsed ~ .main .sidebar-toggle { display: inline-flex; }
+
+  .main-header {
+    padding: 10px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-elev);
+    font-size: 13px;
+    color: var(--text-dim);
+    flex-shrink: 0;
+    position: sticky;
+    top: 0;
+    z-index: 4;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+  .main-header strong { color: var(--text); }
+  .main-header #header-time { margin-left: auto; color: var(--text); font-weight: 600; }
+  .hide-tools-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    user-select: none;
+    font-size: 12px;
+  }
+  .hide-tools-toggle input { cursor: pointer; }
+
+  .conversation-wrap {
+    flex: 1;
+    overflow-y: auto;
+    min-height: 0;
+    padding: 24px 0;
+  }
+  .conversation {
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 0 24px;
+    width: 100%;
+  }
+  /* 搜索命中定位高亮：渲染后短暂闪烁该消息 */
+  .msg.search-hit .bubble {
+    box-shadow: 0 0 0 2px var(--accent) inset;
+    animation: hit-flash 1.6s ease-out;
+  }
+  @keyframes hit-flash {
+    0%   { background: rgba(137, 180, 250, 0.35); }
+    100% { background: var(--bg-bubble); }
+  }
+
+  /* ── 消息气泡（微信式：user 右，其余左） ─────────────── */
+  .msg {
+    margin-bottom: 16px;
+    display: flex;
+    flex-direction: column;
+    max-width: 78%;
+  }
+  .msg.user {
+    align-self: flex-end;
+    align-items: flex-end;
+  }
+  .msg.assistant,
+  .msg.system,
+  .msg.tool {
+    align-self: flex-start;
+    align-items: flex-start;
+  }
+  .bubble {
+    padding: 10px 14px;
+    border-radius: 12px;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    width: fit-content;
+    max-width: 100%;
+  }
+  .msg.user .bubble {
+    background: rgba(166, 227, 161, 0.14);
+    border-left: 3px solid var(--user);
+    color: #d8e8d4;
+  }
+  .msg.assistant .bubble {
+    background: var(--bg-bubble);
+    border-left: 3px solid var(--accent);
+  }
+  .msg.system .bubble {
+    background: rgba(137, 180, 250, 0.06);
+    border-left: 3px solid var(--text-dim);
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .msg.tool .bubble {
+    background: rgba(249, 226, 175, 0.06);
+    border-left: 3px solid var(--tool);
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 12px;
+    width: 100%;
+    max-width: 100%;
+  }
+  .role-tag {
+    font-size: 10px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 4px;
+    padding: 0 4px;
+    font-weight: 600;
+  }
+  .bubble pre {
+    background: rgba(0,0,0,0.25);
+    padding: 10px 12px;
+    border-radius: 6px;
+    overflow-x: auto;
+    margin: 8px 0;
+    font-size: 12px;
+  }
+  .bubble code { font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; }
+  .bubble p { margin: 6px 0; }
+  .bubble ul, .bubble ol { margin: 6px 0 6px 22px; }
+  .bubble h1, .bubble h2, .bubble h3 { margin: 10px 0 6px; font-size: 15px; }
+  .tool-block {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin: 8px 0;
+    overflow: hidden;
+  }
+  .tool-block summary {
+    padding: 7px 10px;
+    cursor: pointer;
+    background: rgba(249, 226, 175, 0.1);
+    font-weight: 600;
+    font-size: 12px;
+    list-style: none;
+  }
+  .tool-block summary::before { content: "▸ "; color: var(--tool); }
+  .tool-block[open] summary::before { content: "▾ "; }
+  .tool-block .tool-content {
+    padding: 10px 12px;
+    background: rgba(0,0,0,0.2);
+    font-size: 11px;
+    white-space: pre-wrap;
+    max-height: 400px;
+    overflow-y: auto;
+  }
+  .empty { text-align: center; padding: 60px 20px; color: var(--text-dim); }
+  .loading { text-align: center; padding: 40px; color: var(--text-dim); }
+  .error-msg { color: var(--error); }
+  mark {
+    background: rgba(249, 226, 175, 0.35);
+    color: inherit;
+    border-radius: 2px;
+    padding: 0 1px;
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-brand-row">
+      <span class="brand">claw · 历史会话</span>
+      <span class="sidebar-brand-btns">
+        <button class="sidebar-search-btn" id="search-btn" title="搜索会话">🔍</button>
+        <button id="collapse-btn" title="折叠侧栏">◀</button>
+      </span>
+    </div>
+    <div class="search-box" id="search-box">
+      <input type="text" id="search-input" placeholder="搜索会话内容…" autocomplete="off">
+    </div>
+    <h2>会话列表</h2>
+    <div class="session-list" id="session-list"><div class="loading">加载中…</div></div>
+  </aside>
+
+  <main class="main">
+    <button class="sidebar-toggle" id="expand-btn" title="展开侧栏">▶</button>
+    <div class="main-header" id="main-header">
+      <label class="hide-tools-toggle">
+        <input type="checkbox" id="hide-tools" checked> 隐藏工具信息
+      </label>
+      <span id="header-title">claw · 历史会话查看器</span>
+      <span id="header-time"></span>
+    </div>
+    <div class="conversation-wrap" id="conv-wrap">
+      <div class="conversation" id="conversation">
+        <div class="empty">从左侧选择一个会话查看历史对话</div>
+      </div>
+    </div>
+  </main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script>
+  let allSessions = [];
+  let currentFile = null;
+  let hideTools = true; // 隐藏工具信息开关（默认勾选）
+  // 会话内容缓存：file -> messages[]，用于搜索时无需重复请求
+  const sessionCache = new Map();
+
+  // ── 「隐藏工具信息」开关 ──────────────────────────────
+  const hideToolsCheckbox = document.getElementById('hide-tools');
+  hideTools = hideToolsCheckbox.checked;
+  hideToolsCheckbox.addEventListener('change', () => {
+    hideTools = hideToolsCheckbox.checked;
+    // 重新渲染当前会话（保持滚动位置/命中定位）
+    if (currentFile) loadSession(currentFile);
+    // 重新搜索（若搜索框有内容）
+    const q = searchInput.value.trim();
+    if (q) runSearch(q);
+  });
+
+  // ── 侧栏折叠 ──────────────────────────────────────────
+  const sidebar = document.getElementById('sidebar');
+  document.getElementById('collapse-btn').addEventListener('click', () => {
+    sidebar.classList.add('collapsed');
+  });
+  document.getElementById('expand-btn').addEventListener('click', () => {
+    sidebar.classList.remove('collapsed');
+  });
+
+  // ── 搜索框开关 ────────────────────────────────────────
+  const searchBox = document.getElementById('search-box');
+  const searchInput = document.getElementById('search-input');
+  const searchBtn = document.getElementById('search-btn');
+  searchBtn.addEventListener('click', () => {
+    const open = searchBox.classList.toggle('open');
+    searchBtn.classList.toggle('active', open);
+    if (open) searchInput.focus();
+  });
+  searchInput.addEventListener('input', () => runSearch(searchInput.value.trim()));
+
+  // ── 加载会话列表 ──────────────────────────────────────
+  async function loadSessions() {
+    try {
+      const res = await fetch('/api/sessions');
+      allSessions = await res.json();
+      renderSessionList('');
+      if (allSessions.length > 0) {
+        loadSession(allSessions[0].file);
+      }
+    } catch (e) {
+      document.getElementById('session-list').innerHTML =
+        '<div class="error-msg" style="padding:20px">加载失败：' + escapeHtml(String(e)) + '</div>';
+    }
+  }
+
+  function renderSessionList(query) {
+    const list = document.getElementById('session-list');
+    if (!allSessions || allSessions.length === 0) {
+      list.innerHTML = '<div class="empty" style="padding:20px">暂无历史会话</div>';
+      return;
+    }
+    const q = query.toLowerCase();
+    const filtered = q ? allSessions.filter(s =>
+      (s.file || '').toLowerCase().includes(q) ||
+      (s.session_id || '').toLowerCase().includes(q) ||
+      (s.model || '').toLowerCase().includes(q)
+    ) : allSessions;
+    if (filtered.length === 0) {
+      list.innerHTML = '<div class="empty" style="padding:20px">无匹配会话</div>';
+      return;
+    }
+    list.innerHTML = filtered.map(s => {
+      const time = s.created_at_ms ? new Date(s.created_at_ms).toLocaleString('zh-CN') : '—';
+      const model = s.model || '—';
+      const isActive = s.file === currentFile ? 'active' : '';
+      return `<div class="session-item ${isActive}" data-file="${escapeAttr(s.file)}">
+        <div class="file">${highlight(s.file, q)}</div>
+        <div class="meta">${highlight(model, q)} · ${s.line_count} 行 · ${time}</div>
+      </div>`;
+    }).join('');
+    list.querySelectorAll('.session-item').forEach(el => {
+      el.addEventListener('click', () => loadSession(el.dataset.file));
+    });
+  }
+
+  // ── 全文搜索：遍历所有会话的内容，命中则高亮展示 ──────
+  async function runSearch(query) {
+    renderSessionList(query);
+    if (!query) return;
+    const q = query.toLowerCase();
+    const list = document.getElementById('session-list');
+    list.innerHTML = '<div class="loading">搜索中…</div>';
+    const hits = [];
+    for (const s of allSessions) {
+      const messages = await getMessages(s.file);
+      const matched = [];
+      let firstHitIndex = -1;
+      messages.forEach((m, idx) => {
+        if (firstHitIndex >= 0) return;
+        // 隐藏工具信息时跳过 tool 消息和 tool 块
+        if (hideTools && m.role === 'tool') return;
+        const parts = hideTools
+          ? (m.parts || []).filter(p => p.kind !== 'tool_use' && p.kind !== 'tool_result')
+          : (m.parts || []);
+        for (const p of parts) {
+          const txt = p.text || p.input || p.output || '';
+          if (txt.toLowerCase().includes(q)) {
+            firstHitIndex = idx;
+            matched.push({ role: m.role, snippet: extractSnippet(txt, q) });
+            break;
+          }
+        }
+      });
+      if (matched.length > 0) hits.push({ file: s.file, matched, firstHitIndex });
+    }
+    if (hits.length === 0) {
+      list.innerHTML = '<div class="empty" style="padding:20px">未找到包含「' + escapeHtml(query) + '」的会话</div>';
+      return;
+    }
+    list.innerHTML = hits.map(h => {
+      const preview = h.matched.slice(0, 2).map(m =>
+        `<div style="font-size:11px;color:var(--text-dim);margin-top:4px">[${escapeHtml(m.role)}] ${highlight(m.snippet, q)}</div>`
+      ).join('');
+      return `<div class="session-item" data-file="${escapeAttr(h.file)}" data-hit-index="${h.firstHitIndex}">
+        <div class="file">${highlight(h.file, q)}</div>
+        ${preview}
+      </div>`;
+    }).join('');
+    list.querySelectorAll('.session-item').forEach(el => {
+      el.addEventListener('click', () => {
+        const idx = el.dataset.hitIndex;
+        loadSession(el.dataset.file, idx != null ? parseInt(idx, 10) : undefined);
+      });
+    });
+  }
+
+  // 取会话内容（带缓存）
+  async function getMessages(file) {
+    if (sessionCache.has(file)) return sessionCache.get(file);
+    try {
+      const res = await fetch('/api/session?id=' + encodeURIComponent(file));
+      const messages = await res.json();
+      sessionCache.set(file, messages);
+      return messages;
+    } catch (_) { return []; }
+  }
+
+  function extractSnippet(text, q) {
+    const idx = text.toLowerCase().indexOf(q);
+    if (idx < 0) return text.slice(0, 80);
+    const start = Math.max(0, idx - 30);
+    const end = Math.min(text.length, idx + q.length + 50);
+    return (start > 0 ? '…' : '') + text.slice(start, end) + (end < text.length ? '…' : '');
+  }
+
+  // ── 加载并渲染单个会话 ────────────────────────────────
+  // scrollToIndex: 可选，渲染后滚动定位到该索引的消息（来自搜索命中）
+  async function loadSession(file, scrollToIndex) {
+    currentFile = file;
+    const conv = document.getElementById('conversation');
+    conv.innerHTML = '<div class="loading">加载中…</div>';
+    document.getElementById('header-title').innerHTML =
+      'claw · 历史会话查看器 <strong style="margin-left:12px">' + escapeHtml(file) + '</strong>';
+    // 解析文件名里的时间戳（session-<ms>[-0].jsonl 或 .rot-<ms>.jsonl）显示在右侧
+    document.getElementById('header-time').textContent = formatSessionTime(file);
+    // 更新 active 高亮
+    document.querySelectorAll('.session-item').forEach(el => {
+      el.classList.toggle('active', el.dataset.file === file);
+    });
+    // 保留当前搜索词；若无搜索则刷新列表 active 态
+    if (!searchInput.value.trim()) renderSessionList('');
+
+    try {
+      const messages = await getMessages(file);
+      if (currentFile !== file) return; // 用户已切换
+      if (!messages || messages.length === 0) {
+        conv.innerHTML = '<div class="empty">该会话没有消息</div>';
+        return;
+      }
+      conv.innerHTML = messages.map((m, i) => renderMessage(m, i, scrollToIndex)).filter(h => h).join('');
+      conv.querySelectorAll('.md-content').forEach(el => {
+        try { el.innerHTML = marked.parse(el.textContent || ''); } catch (_) {}
+      });
+      // 滚动定位
+      if (typeof scrollToIndex === 'number' && scrollToIndex >= 0 && scrollToIndex < messages.length) {
+        const target = conv.querySelector('[data-msg-index="' + scrollToIndex + '"]');
+        if (target) {
+          target.scrollIntoView({ block: 'center', behavior: 'auto' });
+          target.classList.add('search-hit');
+        }
+      } else {
+        document.getElementById('conv-wrap').scrollTop = 0;
+      }
+    } catch (e) {
+      conv.innerHTML = '<div class="error-msg">加载失败：' + escapeHtml(String(e)) + '</div>';
+    }
+  }
+
+  function renderMessage(msg, index, scrollToIndex) {
+    // 隐藏工具信息：跳过 tool 消息，以及 assistant 消息里的 tool_use/tool_result 块
+    const roleClass = msg.role;
+    const roleLabel = { user: 'USER', assistant: 'ASSISTANT', system: 'SYSTEM', tool: 'TOOL' }[msg.role] || msg.role.toUpperCase();
+    let partsHtml;
+    if (hideTools) {
+      // 只渲染非 tool 块；若该消息全是 tool 块则整体跳过
+      const nonToolParts = (msg.parts || []).filter(p => p.kind !== 'tool_use' && p.kind !== 'tool_result');
+      if (msg.role === 'tool' || nonToolParts.length === 0) return '';
+      partsHtml = nonToolParts.map(renderPart).join('');
+    } else {
+      partsHtml = (msg.parts || []).map(renderPart).join('');
+    }
+    const hitClass = (typeof scrollToIndex === 'number' && index === scrollToIndex) ? ' search-hit' : '';
+    return `<div class="msg ${roleClass}${hitClass}" data-msg-index="${index}">
+      <div class="role-tag">${roleLabel}</div>
+      <div class="bubble">${partsHtml}</div>
+    </div>`;
+  }
+
+  function renderPart(part) {
+    const kind = part.kind;
+    if (kind === 'text' && part.text) {
+      return `<div class="md-content">${escapeHtml(part.text)}</div>`;
+    }
+    if (kind === 'tool_use') {
+      const name = part.tool_name || 'tool';
+      const input = part.input ? escapeHtml(part.input) : '';
+      return `<details class="tool-block">
+        <summary>工具调用: ${escapeHtml(name)}</summary>
+        <div class="tool-content">${input || '(无输入)'}</div>
+      </details>`;
+    }
+    if (kind === 'tool_result') {
+      const output = part.output ? escapeHtml(part.output) : '(无输出)';
+      const errTag = part.is_error ? ' <span class="error-msg">[error]</span>' : '';
+      return `<details class="tool-block">
+        <summary>工具结果${errTag}</summary>
+        <div class="tool-content">${output}</div>
+      </details>`;
+    }
+    if (part.text) {
+      return `<div class="md-content">${escapeHtml(part.text)}</div>`;
+    }
+    return '';
+  }
+
+  // ── 工具函数 ──────────────────────────────────────────
+  // 从文件名解析会话时间戳并格式化为本地时间串。
+  // 支持形态：session-<ms>-0.jsonl、session-<ms>-0.rot-<ms>.jsonl
+  function formatSessionTime(file) {
+    // 优先取 rot 后的时间戳（轮转/续写时间），否则取 session 后的创建时间
+    const rotMatch = file.match(/rot-(\d+)/);
+    const sessMatch = file.match(/session-(\d+)/);
+    const ms = rotMatch ? Number(rotMatch[1]) : (sessMatch ? Number(sessMatch[1]) : NaN);
+    if (!Number.isFinite(ms) || ms <= 0) return '';
+    const d = new Date(ms);
+    if (isNaN(d.getTime())) return '';
+    const pad = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+  function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+      .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+  }
+  function escapeAttr(s) { return escapeHtml(s); }
+  function highlight(text, q) {
+    const safe = escapeHtml(text);
+    if (!q) return safe;
+    const qSafe = escapeHtml(q).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return safe.replace(new RegExp(qSafe, 'gi'), m => '<mark>' + m + '</mark>');
+  }
+
+  loadSessions();
+</script>
+</body>
+</html>

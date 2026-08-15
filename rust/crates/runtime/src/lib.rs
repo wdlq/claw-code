@@ -51,6 +51,7 @@ pub mod team_cron_registry;
 #[cfg(test)]
 mod trust_resolver;
 mod usage;
+pub mod webui;
 pub mod worker_boot;
 
 pub use approval_tokens::{
@@ -69,9 +70,8 @@ pub use config::{
     McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
     ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
-    RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig,
-    ScopedMcpServerConfig, SubagentConfig, SubagentProviderConfig, SubagentProviderRouting,
-    CLAW_SETTINGS_SCHEMA_NAME,
+    RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
+    SubagentConfig, SubagentProviderConfig, SubagentProviderRouting, CLAW_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
@@ -79,8 +79,8 @@ pub use config_validate::{
 };
 pub use conversation::{
     auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
-    ConversationRuntime, ErrorKind, PromptCacheEvent, RuntimeError, StaticToolExecutor,
-    ToolError, ToolExecutor, TurnSummary,
+    ConversationRuntime, ErrorKind, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolError,
+    ToolExecutor, TurnSummary,
 };
 pub use file_ops::{
     edit_file, edit_file_in_workspace, edit_file_in_workspace_with_allowed, glob_search,

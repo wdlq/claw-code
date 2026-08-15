@@ -209,9 +209,17 @@ pub struct WriteFileOutput {
     #[serde(rename = "filePath")]
     pub file_path: String,
     pub content: String,
-    #[serde(rename = "structuredPatch", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "structuredPatch",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub structured_patch: Option<Vec<StructuredPatchHunk>>,
-    #[serde(rename = "originalFile", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "originalFile",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub original_file: Option<String>,
     #[serde(rename = "gitDiff", default, skip_serializing_if = "Option::is_none")]
     pub git_diff: Option<serde_json::Value>,
@@ -243,9 +251,17 @@ pub struct EditFileOutput {
     pub old_string: String,
     #[serde(rename = "newString")]
     pub new_string: String,
-    #[serde(rename = "originalFile", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "originalFile",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub original_file: Option<String>,
-    #[serde(rename = "structuredPatch", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "structuredPatch",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub structured_patch: Option<Vec<StructuredPatchHunk>>,
     #[serde(rename = "userModified")]
     pub user_modified: bool,
@@ -434,11 +450,7 @@ pub fn read_file(
 /// 按**当前调度的 model 名**（`should_use_compact_receipt(model)`）算好传进来。file_ops 内部
 /// 不再读全局 `ANTHROPIC_MODEL` env，确保主 LLM / 子 agent 路径各自按自己的 model 判定。
 /// 对照 `docs/multiprovider.md` 3.4bis 节选项 A。
-pub fn write_file(
-    path: &str,
-    content: &str,
-    compact_receipt: bool,
-) -> io::Result<WriteFileOutput> {
+pub fn write_file(path: &str, content: &str, compact_receipt: bool) -> io::Result<WriteFileOutput> {
     if content.len() > MAX_WRITE_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -479,7 +491,11 @@ pub fn write_file(
             }
         })
     };
-    let structured_patch_output = if compact { None } else { Some(structured_patch) };
+    let structured_patch_output = if compact {
+        None
+    } else {
+        Some(structured_patch)
+    };
 
     Ok(WriteFileOutput {
         kind: if original_file.is_some() {
@@ -564,11 +580,18 @@ pub fn edit_file(
     let original_file_output = if compact {
         None
     } else if is_large_file {
-        Some(format!("[File content omitted - {} bytes]", original_file.len()))
+        Some(format!(
+            "[File content omitted - {} bytes]",
+            original_file.len()
+        ))
     } else {
         Some(original_file.clone())
     };
-    let structured_patch_output = if compact { None } else { Some(structured_patch) };
+    let structured_patch_output = if compact {
+        None
+    } else {
+        Some(structured_patch)
+    };
 
     Ok(EditFileOutput {
         file_path: absolute_path.to_string_lossy().into_owned(),
@@ -1418,8 +1441,14 @@ mod tests {
         let path = temp_path("edit.txt");
         write_file(path.to_string_lossy().as_ref(), "alpha beta alpha", false)
             .expect("initial write should succeed");
-        let output = edit_file(path.to_string_lossy().as_ref(), "alpha", "omega", true, false)
-            .expect("edit should succeed");
+        let output = edit_file(
+            path.to_string_lossy().as_ref(),
+            "alpha",
+            "omega",
+            true,
+            false,
+        )
+        .expect("edit should succeed");
         assert!(output.replace_all);
     }
 

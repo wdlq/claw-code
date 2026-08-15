@@ -1034,6 +1034,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         argument_hint: None,
         resume_supported: true,
     },
+    SlashCommandSpec {
+        name: "webui",
+        aliases: &[],
+        summary: "Open a browser to view history sessions of the current project",
+        argument_hint: Some("[port|stop]"),
+        resume_supported: false,
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1179,6 +1186,9 @@ pub enum SlashCommand {
     History {
         count: Option<String>,
     },
+    Webui {
+        arg: Option<String>,
+    },
     Paste,
     Unknown(String),
 }
@@ -1223,6 +1233,7 @@ impl SlashCommand {
             Self::Config { .. } => "/config",
             Self::Memory { .. } => "/memory",
             Self::History { .. } => "/history",
+            Self::Webui { .. } => "/webui",
             Self::Diff => "/diff",
             Self::Status => "/status",
             Self::Stats => "/stats",
@@ -1496,6 +1507,9 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::Paste
         }
+        "webui" => SlashCommand::Webui {
+            arg: optional_single_arg(command, &args, "[port|stop]")?,
+        },
         other => SlashCommand::Unknown(other.to_string()),
     }))
 }
@@ -4317,6 +4331,7 @@ pub fn handle_slash_command(
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
         | SlashCommand::History { .. }
+        | SlashCommand::Webui { .. }
         | SlashCommand::Paste
         | SlashCommand::Unknown(_) => None,
     }

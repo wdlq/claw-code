@@ -4206,6 +4206,7 @@ fn run_resume_command(
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
+        | SlashCommand::Webui { .. }
         | SlashCommand::Paste => Err("unsupported resumed slash command".into()),
     }
 }
@@ -4440,6 +4441,8 @@ struct LiveCli {
     /// instance and leave the current turn uninterruptible.  Reset at the
     /// start of each turn via `reset()` in `prepare_turn_runtime`.
     shared_abort_signal: runtime::HookAbortSignal,
+    /// `/webui` 启动的后台 HTTP server 句柄；CLI 退出时自动关停。
+    webui_server: Option<runtime::webui::WebuiServer>,
 }
 
 #[derive(Debug, Clone)]
@@ -5013,6 +5016,7 @@ impl LiveCli {
             session,
             prompt_history: Vec::new(),
             shared_abort_signal: runtime::HookAbortSignal::new(),
+            webui_server: None,
         };
         // **2026-07-23 子 agent Ctrl+C 中断修复**：把 abort signal 注册到进程级静态，
         // 让 tools crate 的 `spawn_agent_job` 能在 Ctrl+C 时提前中断子 agent 等待。
@@ -5418,6 +5422,10 @@ impl LiveCli {
                     }
                 }
             }
+            SlashCommand::Webui { arg } => {
+                self.handle_webui_command(arg.as_deref())?;
+                false
+            }
             SlashCommand::Stats => {
                 let usage = UsageTracker::from_session(self.runtime.session()).cumulative_usage();
                 println!("{}", format_cost_report(usage));
@@ -5470,6 +5478,39 @@ impl LiveCli {
                 false
             }
         })
+    }
+
+    /// `/webui` — 在浏览器中打开当前项目的历史会话查看器。
+    ///
+    /// 解析可选的端口号参数（如 `/webui 8080`）。启动后台 HTTP server 并
+    /// 自动打开浏览器。重复调用会复用已在运行的 server。
+    fn handle_webui_command(
+        &mut self,
+        arg: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let port = arg
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(runtime::webui::WEBUI_DEFAULT_PORT);
+
+        let sessions_dir = self.sessions_dir_path()?;
+        let server = runtime::webui::start_server(sessions_dir, "127.0.0.1", port)?;
+        let actual_port = server.port();
+        let url = format!("http://127.0.0.1:{actual_port}/");
+
+        // 存住句柄，CLI drop 时关停 server。
+        self.webui_server = Some(server);
+
+        match open_browser(&url) {
+            Ok(()) => println!("已在浏览器打开历史会话查看器：{url}"),
+            Err(_) => println!("请手动在浏览器打开：{url}"),
+        }
+        Ok(())
+    }
+
+    fn sessions_dir_path(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        Ok(current_session_store()?.sessions_dir().to_path_buf())
     }
 
     fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -6148,6 +6189,37 @@ fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
 fn current_session_store() -> Result<runtime::SessionStore, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     runtime::SessionStore::from_cwd(&cwd).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+}
+
+/// 跨平台打开浏览器（best-effort）。
+fn open_browser(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(url).spawn()?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        // 用 raw_arg 裸传，跳过 Rust Command::arg 的 argv 引号包裹。
+        // 否则 cmd /C "start "" "http://..."" 里的内引号被割裂，
+        // 表现为 "Windows 找不到文件 '\'"。
+        std::process::Command::new("cmd")
+            .raw_arg(format!("/C start \"\" \"{url}\""))
+            .spawn()?;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = url;
+    }
+    Ok(())
 }
 
 fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
@@ -10782,7 +10854,7 @@ mod tests {
                 body: String::new(),
                 retryable: false,
                 suggested_action: None,
-        over_size_400: false,
+                over_size_400: false,
             }),
         };
 

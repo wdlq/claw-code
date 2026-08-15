@@ -944,9 +944,8 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     // 之前此处硬编码 `over_size_400: false`，导致 conversation.rs 的 OverSize400 降级
     // 重试机制（auto-compact 后重试）对 GLM 子 agent 路径完全不生效。
     // 对照 openai_compat.rs:1629 的同名检测逻辑。
-    let over_size_400 = status.as_u16() == 400
-        && parsed_error.is_none()
-        && body.trim() == "Bad Request";
+    let over_size_400 =
+        status.as_u16() == 400 && parsed_error.is_none() && body.trim() == "Bad Request";
 
     Err(ApiError::Api {
         status,
@@ -1096,10 +1095,7 @@ fn strip_unsupported_beta_body_fields_with_counts(
         // DeepSeek 不报错但也不需要 thinking 坌，剥离后减小请求体、提升硬盘缓存命中率。
         if let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) {
             for message in messages.iter_mut() {
-                if let Some(content) = message
-                    .get_mut("content")
-                    .and_then(Value::as_array_mut)
-                {
+                if let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) {
                     // 删掉 type=="thinking" 的 content block，计数。
                     let before = content.len();
                     content.retain(|block| {
@@ -1138,12 +1134,7 @@ fn subagent_diag_context() -> (String, String, String, String) {
             String::new(),
         );
     }
-    (
-        "subagent".to_string(),
-        agent_id,
-        subagent_type,
-        iteration,
-    )
+    ("subagent".to_string(), agent_id, subagent_type, iteration)
 }
 
 /// Append a request-size record to `claw_glm_diag.log` so we can correlate
@@ -1834,7 +1825,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
-        over_size_400: false,
+            over_size_400: false,
         };
 
         // when
@@ -1876,7 +1867,7 @@ mod tests {
             body: String::new(),
             retryable: true,
             suggested_action: None,
-        over_size_400: false,
+            over_size_400: false,
         };
 
         // when
@@ -1906,7 +1897,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
-        over_size_400: false,
+            over_size_400: false,
         };
 
         // when
@@ -1935,7 +1926,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
-        over_size_400: false,
+            over_size_400: false,
         };
 
         // when
@@ -1961,7 +1952,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
-        over_size_400: false,
+            over_size_400: false,
         };
 
         // when

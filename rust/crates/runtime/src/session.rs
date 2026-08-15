@@ -231,6 +231,12 @@ impl Session {
     pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), SessionError> {
         let path = path.as_ref();
         let snapshot = self.render_jsonl_snapshot()?;
+        // 仅含 session_meta 首行、无任何对话内容时，若目标文件尚不存在则跳过创建，
+        // 避免在 .claw/sessions/ 下堆积只有 1 行的空会话文件。
+        // 文件已存在时照常覆写（不丢既有数据）。
+        if snapshot.lines().count() <= 1 && !path.exists() {
+            return Ok(());
+        }
         rotate_session_file_if_needed(path)?;
         write_atomic(path, &snapshot)?;
         cleanup_rotated_logs(path)?;

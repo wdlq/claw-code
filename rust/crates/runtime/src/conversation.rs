@@ -308,14 +308,13 @@ where
         max_output_tokens: u32,
     ) -> Self {
         let pct = 75u32; // 对齐官方claude-code的0.75阈值
-        // 基于输入预算（总窗口 - 输出预留）算阈值，确保触发 compact 时 input 仍在窗口内。
+                         // 基于输入预算（总窗口 - 输出预留）算阈值，确保触发 compact 时 input 仍在窗口内。
         let input_budget = context_window_tokens.saturating_sub(max_output_tokens);
         let dynamic_threshold = (input_budget as u64 * pct as u64 / 100) as u32;
         self.auto_compaction_input_tokens_threshold =
             dynamic_threshold.max(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD);
         self
     }
-
 
     #[must_use]
     pub fn with_hook_abort_signal(mut self, hook_abort_signal: HookAbortSignal) -> Self {
@@ -568,9 +567,7 @@ where
                             );
                         } else {
                             // compact 压不动（消息全保留或全空）——再试也是 400，提前放弃避免空转。
-                            eprintln!(
-                                "[over_size_400: auto-compact 压不动，放弃降级重试]"
-                            );
+                            eprintln!("[over_size_400: auto-compact 压不动，放弃降级重试]");
                             self.record_turn_failed(iterations, &error);
                             return Err(error);
                         }
@@ -1972,10 +1969,7 @@ mod tests {
     /// ApiClient 用最简的 `SimpleApiForBuilder`（返回空流即可——builder 测试不会真调 stream）。
     struct SimpleApiForBuilder;
     impl ApiClient for SimpleApiForBuilder {
-        fn stream(
-            &mut self,
-            _request: ApiRequest,
-        ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
             Ok(vec![AssistantEvent::MessageStop])
         }
     }
@@ -1993,11 +1987,9 @@ mod tests {
     /// 验 DeepSeek V4 Pro 1M 窗口 + max_output=0 → 750K 阈值。
     #[test]
     fn with_model_context_window_strict_uses_dynamic_threshold_without_env() {
-        let runtime = minimal_runtime()
-            .with_model_context_window_strict(1_000_000, 0);
+        let runtime = minimal_runtime().with_model_context_window_strict(1_000_000, 0);
         assert_eq!(
-            runtime.auto_compaction_input_tokens_threshold,
-            750_000,
+            runtime.auto_compaction_input_tokens_threshold, 750_000,
             "1M 窗口 × 75% = 750K，不读 env"
         );
     }
@@ -2007,11 +1999,9 @@ mod tests {
     #[test]
     fn with_model_context_window_strict_glm51_scenario() {
         // GLM-5.1: context=200K, effective max_tokens=64K
-        let runtime = minimal_runtime()
-            .with_model_context_window_strict(200_000, 64_000);
+        let runtime = minimal_runtime().with_model_context_window_strict(200_000, 64_000);
         assert_eq!(
-            runtime.auto_compaction_input_tokens_threshold,
-            102_000,
+            runtime.auto_compaction_input_tokens_threshold, 102_000,
             "(200K - 64K) × 75% = 102K，安全低于 136K 输入上限"
         );
     }
@@ -2028,11 +2018,9 @@ mod tests {
         std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_PCT_OVERRIDE", "75");
         std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "131000");
 
-        let runtime = minimal_runtime()
-            .with_model_context_window_strict(1_000_000, 0);
+        let runtime = minimal_runtime().with_model_context_window_strict(1_000_000, 0);
         assert_eq!(
-            runtime.auto_compaction_input_tokens_threshold,
-            750_000,
+            runtime.auto_compaction_input_tokens_threshold, 750_000,
             "strict 路径必须忽略 env 覆盖，按 (1M - 0) × 75% = 750K 算"
         );
 
@@ -2049,17 +2037,14 @@ mod tests {
     #[test]
     fn with_model_context_window_strict_keeps_floor_protection() {
         // (128K - 0) × 75% = 96K > 55K 下限，直接用 96K
-        let runtime = minimal_runtime()
-            .with_model_context_window_strict(128_000, 0);
+        let runtime = minimal_runtime().with_model_context_window_strict(128_000, 0);
         assert_eq!(
-            runtime.auto_compaction_input_tokens_threshold,
-            96_000,
+            runtime.auto_compaction_input_tokens_threshold, 96_000,
             "(128K - 0) × 75% = 96K > 55K 下限，用 96K"
         );
-    
+
         // (50K - 0) × 75% = 37.5K < 55K 下限，兖底到 55K
-        let runtime = minimal_runtime()
-            .with_model_context_window_strict(50_000, 0);
+        let runtime = minimal_runtime().with_model_context_window_strict(50_000, 0);
         assert_eq!(
             runtime.auto_compaction_input_tokens_threshold,
             DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
@@ -2082,11 +2067,9 @@ mod tests {
         // 我们设了 INPUT_TOKENS，那它就**不进入**动态算分支，
         // 字段保持 `ConversationRuntime::new()` 构造时调 `auto_compaction_threshold_from_env()`
         // 读 INPUT_TOKENS=131000 算出的 131K。
-        let runtime = minimal_runtime()
-            .with_model_context_window(1_000_000);
+        let runtime = minimal_runtime().with_model_context_window(1_000_000);
         assert_eq!(
-            runtime.auto_compaction_input_tokens_threshold,
-            131_000,
+            runtime.auto_compaction_input_tokens_threshold, 131_000,
             "原路径 env 设了 INPUT_TOKENS=131000 就用 131000，不动态算 750K"
         );
 
