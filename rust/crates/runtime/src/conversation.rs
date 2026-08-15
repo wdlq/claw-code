@@ -188,6 +188,10 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+    /// **2026-07-30 subagent 自适应判活**：心跳回调，`run_turn` loop 每轮完成时调一次。
+    /// 主线程（`spawn_agent_job`）注入 sender——收到心跳即知子 agent 还在干活，重置静默计时器；
+    /// 静默超过 `STALE_SECS` 判"已挂"提前结束，不再死切 600s。`None` = 主 LLM 路径，不判活。
+    heartbeat: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -237,6 +241,7 @@ where
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            heartbeat: None,
         }
     }
 
@@ -330,6 +335,15 @@ where
     #[must_use]
     pub fn with_session_tracer(mut self, session_tracer: SessionTracer) -> Self {
         self.session_tracer = Some(session_tracer);
+        self
+    }
+
+    /// **2026-07-30 subagent 自适应判活**：注入心跳回调，`run_turn` loop 每轮完成时调一次。
+    /// 子 agent 路径用此让主线程判活——收到心跳即"还在干活"重置静默计时器，
+    /// 静默超阈值判"已挂"提前结束。主 LLM 路径不注入（`None`），`run_turn` 调空回调即跳过。
+    #[must_use]
+    pub fn with_heartbeat(mut self, heartbeat: Box<dyn Fn() + Send + Sync>) -> Self {
+        self.heartbeat = Some(heartbeat);
         self
     }
 
@@ -580,6 +594,11 @@ where
                 self.usage_tracker.record(usage);
             }
             prompt_cache_events.extend(turn_prompt_cache_events);
+            // **2026-07-30 subagent 自适应判活**：本轮成功拿到 assistant 消息即证明子 agent 还在干活，
+            // 发心跳让主线程重置静默计时器。主 LLM 路径 heartbeat=None 跳过（if let Some 解构空 Option）。
+            if let Some(heartbeat) = self.heartbeat.as_ref() {
+                heartbeat();
+            }
             let pending_tool_uses = assistant_message
                 .blocks
                 .iter()
@@ -710,6 +729,11 @@ where
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 self.record_tool_finished(iterations, &result_message);
                 tool_results.push(result_message);
+                // **2026-07-30 subagent 自适应判活**：工具执行（grep/read_file 等）本身可能耗时数十秒，
+                // 主线程需要在工具期间也收到心跳才能判"还在干活"而非误判静默超时。每个工具完成发一次。
+                if let Some(heartbeat) = self.heartbeat.as_ref() {
+                    heartbeat();
+                }
             }
         }
 

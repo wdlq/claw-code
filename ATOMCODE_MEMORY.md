@@ -1,7 +1,7 @@
 # claw-code 项目架构记忆
 
 > **这是给 AtomCode 自己看的工作记忆文档。** 下次接手本项目时，**首先读这个文件**，可以快速还原项目全貌、已知坑点和修复历史。
-> 最后更新：2026-06-30
+> 最后更新：2026-07-29
 
 ---
 
@@ -48,7 +48,7 @@ claw-code/
 | `session.rs` | `Session` / `ConversationMessage` / `ContentBlock` 数据结构 | micro_compact 依赖此处的类型 |
 | `permissions.rs` | 权限规则匹配、`allowed_path_prefixes` | 之前修过尾部斜杠 bug（见 ARCHITECTURE.md） |
 | `sse.rs` | runtime 侧 SSE 解析 | 与 `api/src/sse.rs` 不同 |
-| `mcp_stdio.rs` / `mcp_tool_bridge.rs` | MCP 服务器进程管理 | ⚠️ 用了 `std::os::unix::PermissionsExt`，**Windows 上编译 lib test target 会失败**（预存问题，非本次引入） |
+| `mcp_stdio.rs` / `mcp_tool_bridge.rs` | MCP 服务器进程管理 | `PermissionsExt` 已加 `#[cfg(unix)]` 守卫（2026-07-11 解），Windows 下跳过 chmod，lib test target 可编 |
 
 ---
 
@@ -155,9 +155,9 @@ claw-code/
 
 ## ⚠️ 已知预存问题（不要在本会话修，但要知道）
 
-1. **`mcp_stdio.rs` / `mcp_tool_bridge.rs` 用 `std::os::unix::PermissionsExt`** —— Windows 下 `cargo test -p runtime --lib` 编译失败（8 个 E0433/E0599）。`cargo check` 和 release build 不受影响。要跑 file_ops 测试需 WSL/Linux，或给这两个文件加 `#[cfg(unix)]` 守卫。
-2. **`plugins/src/hooks.rs` 有 `unused import std::path::Path`** —— 无害 warning。
-3. **`claw_request_size` 在 `openai_compat.rs` 是死代码**（GLM 走 anthropic.rs）—— 可后续抽到共享模块。
+1. ~~**`mcp_stdio.rs` / `mcp_tool_bridge.rs` 用 `std::os::unix::PermissionsExt`**——已解（2026-07-11 加 `#[cfg(unix)]` 守卫），本条留作历史记录~~
+2. ~~**`plugins/src/hooks.rs` 有 `unused import std::path::Path`**——已解（加 `#[cfg(not(windows))]` 守卫，Windows 下不再触发 unused warning）~~
+3. **`claw_request_size` 在 `openai_compat.rs` 是死代码**（GLM 走 anthropic.rs）—— 无害，可后续抽到共享模块。
 4. **`src/` Python 遗留** —— 与 Rust 实现并存，CLAUDE.md 要求两边保持一致，但实际 Rust 是唯一活跃路径。
 
 ---
@@ -856,9 +856,9 @@ claw 没这两道前置减压（micro-compact 还被 DISABLE 了），到 750K �
 
 ### 已知预存债（本次未动，与本次改动无关）
 
-1. **api crate 测试桩 `cache_control` 字段缺失**——`openai_compat_integration` / `client_integration` / `request_building` 测试在初始化 `InputMessage` / `InputContentBlock` / `ToolDefinition` 时缺 `cache_control` 字段，导致 `cargo check --workspace --all-targets` 报 E0063。这是 2026-07-14 把 `MessageResponse.role` 改 `Option` 时遗漏的预存测试桩债，MEMORY 第 343-351 行已记。本次未修。
-2. **runtime hooks/mcp_stdio Windows 测试**——`executes_hooks_in_configured_order` / `manager_discovers_tools_from_stdio_config` 在 Windows 下失败，MEMORY 第 158 行已记。本次未修。
-3. **file_ops `reads_and_writes_files` 测试**——7-18 落地三重门 trailer 逻辑后，`read_file(path, Some(1), Some(1))` 在 3 行文件上触发 `has_more` trailer 追加，断言 `"two"` 失败。**本次用 `git stash` 验证确认是 7-18 落地遗留的预存债**（stash 后原始代码同一测试同样 FAILED），不是本次 multiprovider 改动引入。本次未修。
+1. ~~**api crate 测试桩 `cache_control` 字段缺失**——已在 `openai_compat.rs` 测试桩全补 `cache_control: None`（多处），`cargo check --workspace --all-targets` 不再报 E0063。本条留作历史记录~~
+2. ~~**runtime hooks/mcp_stdio Windows 测试**——`PermissionsExt` 已加 `#[cfg(unix)]` 守卫（2026-07-11 解，见第 238 行），Windows 下 lib test target 可编。本条留作历史记录~~
+3. **file_ops `reads_and_writes_files` 测试**——7-18 落地三重门 trailer 逻辑后，`read_file(path, Some(1), Some(1))` 在 3 行文件上触发 `has_more` trailer 追加，断言 `"two"` 失败。**2026-07-29 实测确认仍 FAILED**（trailer 后缀 `\n\n[more lines below; pass offset=2 to continue]\n` 被追加），是 7-18 落地遗留的预存债，下次接手若要修要么改测试断言接受 trailer 后缀、要么改 `read_file` 的 `has_more` 触发条件（只在"还有未读的行需要分页"时才 true）。
 
 ### Git 状态备忘
 
@@ -874,9 +874,9 @@ claw 没这两道前置减压（micro-compact 还被 DISABLE 了），到 750K �
 23. ★ 2026-07-19 新增（thread-local 传子 agent model 的设计理由）：原 `docs/multiprovider.md` 3.4bis 节选项 A 设想"工具 dispatch 层算好 `compact_receipt` 布尔传进 file_ops"，但主 LLM / 子 agent 共用同一份 `execute_tool_with_enforcer` dispatch 入口，无法从参数区分两条路径。**最终方案**：用 `thread_local! { SUBAGENT_MODEL }` 在 `run_agent_job` 入口设置子 agent 的 resolved model；dispatch 层调 `current_dispatch_model()` 优先读 thread-local（子 agent 路径），回退到 `ANTHROPIC_MODEL` env（主 LLM 路径）。**下次接手若遇主 LLM / 子 agent 共用 dispatch 入口但需区分 model 的场景，thread-local 是首选方案**。
 
 24. ★ 2026-07-19 新增（已知预存债 3 条，本次未修）：
-    - **api crate 测试桩 `cache_control` 字段缺失**——`cargo check --workspace --all-targets` 报 E0063。MEMORY 第 343-351 行已记。下次接手若要让 `cargo check --workspace --all-targets` 通过，需给这批测试桩补 `cache_control: None` 字段。
-    - **runtime hooks/mcp_stdio Windows 测试**——`executes_hooks_in_configured_order` / `manager_discovers_tools_from_stdio_config` 在 Windows 下失败。MEMORY 第 158 行已记。
-    - **file_ops `reads_and_writes_files` 测试**——7-18 落地三重门 trailer 逻辑后，`read_file(path, Some(1), Some(1))` 在 3 行文件上触发 `has_more` trailer 追加，断言 `"two"` 失败。**本次用 `git stash` 验证确认是 7-18 落地遗留的预存债**（stash 后原始代码同一测试同样 FAILED），不是本次 multiprovider 改动引入。下次接手若要修，要么改测试断言接受 trailer 后缀，要么改 `read_file` 的 `has_more` 触发条件（只在"还有未读的行需要分页"时才 true）。
+    - ~~**api crate 测试桩 `cache_control` 字段缺失**——已解（`openai_compat.rs` 测试桩全补 `cache_control: None`，`cargo check --workspace --all-targets` 不再报 E0063）~~
+    - ~~**runtime hooks/mcp_stdio Windows 测试**——已解（`PermissionsExt` 加 `#[cfg(unix)]` 守卫，2026-07-11 解，见第 238 行）~~
+    - **file_ops `reads_and_writes_files` 测试**——7-18 落地三重门 trailer 逻辑后，`read_file(path, Some(1), Some(1))` 在 3 行文件上触发 `has_more` trailer 追加，断言 `"two"` 失败。**2026-07-29 实测确认仍 FAILED**（`cargo test -p runtime --lib file_ops::tests::reads_and_writes_files` 报 `left: "two\n\n[more lines below; pass offset=2 to continue]\n"` vs `right: "two"`），是 7-18 落地遗留的预存债。下次接手若要修，要么改测试断言接受 trailer 后缀，要么改 `read_file` 的 `has_more` 触发条件（只在"还有未读的行需要分页"时才 true）。
 
 25. ★ 2026-07-19 新增（子 agent context window 与压缩策略独立——strict 变体）：multiprovider 3.4 节落地后主子各走不同 provider，但 **auto-compact 阈值**有破裂点：`CLAUDE_CODE_AUTO_COMPACT_*` env 是全局共用的——主=DeepSeek 1M + 子=GLM 200K 时若 env 设了 `WINDOW=131000`（针对 GLM 算的）会误压到子 agent 走 DeepSeek 1M 时被压到 131K 频繁 compact 反伤缓存；反过来主=GLM + 子=DeepSeek 时子 agent 拿 131K 阈值撑爆 200K GLM 报 `ContextWindowExceeded` 400。**修法**：`runtime/src/conversation.rs:252` 加 `with_model_context_window_strict` 方法——**不读任何 env**，强制用 `context_window × 75%` + 下限保护（至少 55K）；`tools/src/lib.rs:3859` `build_agent_runtime` 改调 strict 变体。**主 LLM 路径仍走原 `with_model_context_window`**（`rusty-claude-cli/src/main.rs:8681`，env 优先覆盖），两条路径彻底独立。4 个单元测试在 `conversation.rs:1812-1909`：strict 不读 env / strict 忽略 env 覆盖 / strict 下限保护 / 对照原路径仍读 env。**测试关键坑**：cargo test 默认并行跑，env 是进程级全局——`with_model_context_window_strict_ignores_env_override` 和 `with_model_context_window_original_path_still_reads_env_override` 都用 `set_var`/`remove_var` 操作同一组 env，交错时会污染，验对照测试那条**必须用 `--test-threads=1` 串行模式**跑才稳定。详见 `docs/multiprovider.md` 3.4ter 节。真机验证关键看 `claw_glm_diag.log` 里子 agent 那条 `claw_auto_compact` 事件的 `threshold` 字段是否按子 agent 的 model 算（GLM 走 150K / DeepSeek 走 750K）而非主 LLM env 设的值。
 
@@ -938,7 +938,7 @@ claw 没这两道前置减压（micro-compact 还被 DISABLE 了），到 750K �
     - **④`tools/src/lib.rs`** `execute_agent` 改——加 `load_subagents_config()` helper 拿 `RuntimeConfig.subagents()`；读 `subagent_cfg = subagents.get(type).cloned()` 合并 input：`description` input 空时 fallback 配置的，`model` input 空时 fallback 配置的，`system_prompt` 传给 `build_agent_system_prompt` 第三参数。`allowed_tools_for_subagent` 改——配置优先 `subagents.<type>.tools` 显式配了就用配置的覆盖预置集，没配走原预置 match 分支（保持向后兼容）。
     - **⑤`tools/src/lib.rs`** `build_agent_system_prompt` 签名加第三参数 `subagent_cfg: Option<&runtime::SubagentConfig>`——函数体末尾追加 `if let Some(cfg) = subagent_cfg { if !cfg.system_prompt.trim().is_empty() { prompt.push(cfg.system_prompt.clone()) } }` 注入配置里的 systemPrompt 段；`None` 走原逻辑（保持向后兼容）。`tools/src/lib.rs:9341` 那条预存测试调旧签名补 `None` 第三参数。
     - **单元测试 6 条全过**：`config.rs` 加 3 条 `parse_optional_subagents_empty_when_unconfigured` / `parse_optional_subagents_populated` / `parse_optional_subagents_defaults_empty_optional_fields`；`prompt.rs` 加 3 条 `render_subagents_section_returns_none_when_unconfigured` / `render_subagents_section_lists_configured_subagents` / `render_subagents_section_shows_no_description_placeholder`。✅ `cargo test -p runtime --lib parse_optional_subagents` 3 passed 0 failed；✅ `cargo test -p runtime --lib render_subagents_section` 3 passed 0 failed。
-    - **验证状态**：✅ `cargo check --workspace` 全绿零 warning；✅ `cargo test -p runtime --lib` + `cargo test -p tools --lib` 我引入的全过零失败。剩报错都是预存债（MEMORY 第 24 条已记：api bench/test `cache_control` 缺失 + Windows 测试失败 + file_ops `reads_and_writes_files` 7-18 三重门 trailer 预存债 + conversation hook 那条——git stash 验证 conversation.rs 我根本没动过，同条测试 stash 后依然 FAILED，是预存债不是我引入的）。⏳ 真机验证未做——用户重编 `cargo build --release` 替换 `claw.exe` 后真机跑一轮，看主 LLM system prompt 里是否出现"# Available subagents"段（配了 `subagents` 段才出现）+ 主 LLM 是否能看 description 判断何时该派、派给哪个 type。验通则路径 E 真闭环——主 LLM 能主动派活不再靠用户显式点名。
+    - **验证状态**：✅ `cargo check --workspace` 全绿零 warning；✅ `cargo test -p runtime --lib` + `cargo test -p tools --lib` 我引入的全过零失败。剩报错都是预存债（MEMORY 第 24 条已记：~~api bench/test `cache_control` 缺失~~ 已解 + ~~Windows 测试失败~~ 已解 + file_ops `reads_and_writes_files` 7-18 三重门 trailer 预存债（2026-07-29 实测仍 FAILED）+ conversation hook 那条——git stash 验证 conversation.rs 我根本没动过，同条测试 stash 后依然 FAILED，是预存债不是我引入的）。⏳ 真机验证未做——用户重编 `cargo build --release` 替换 `claw.exe` 后真机跑一轮，看主 LLM system prompt 里是否出现"# Available subagents"段（配了 `subagents` 段才出现）+ 主 LLM 是否能看 description 判断何时该派、派给哪个 type。验通则路径 E 真闭环——主 LLM 能主动派活不再靠用户显式点名。
     - **落地后 `docs/SUBAGENT_GUIDE.md` 第 2/8/9 节那段"★ 2026-07-19 真机验证后修订"段要再次修订**——之前判"路径 E 那条新债本期不动"现在落地了，要把"当前唯一稳定触发路径是显式点名"改成"配了 `subagents` 段后主 LLM system prompt 注入 Available subagents 列表，主 LLM 能看 description 判断何时该派；没配仍只能显式点名"。这条修订留作下次接手清单——本次路径 E 落地收尾不混文档修订，但 MEMORY 第 29 条已记下"落地后要再次修订 SUBAGENT_GUIDE.md"这条判断。
 
 30. ★ 2026-07-19 路径 E 真机验证——system prompt 真注入 Available subagents 段，主 LLM 没自自觉派活靠 description 提示不够
@@ -1091,3 +1091,166 @@ claw 没这两道前置减压（micro-compact 还被 DISABLE 了），到 750K �
       ```
 
     - **教训（写给下次接手，第十二步）**：**诊断日志要主子分路——不分路就看不到子 agent 内部 loop 哪轮报错**。下次接手看到 subagent 相关改造时,**优先扒日志里 `lane=subagent` 命中数**——0 = 子 agent 没被派活;> 0 但 `status=400` 也 > 0 = 子 agent 被派活了但协议层报错（thinking 剥离没生效）;> 0 且全 200 = 子 agent 跑通。`agent_id` 字段关联 `.clawd-agents/{id}.json` manifest,可以定位是哪次派活报错。**剥离计数是验证改造生效的硬证据**——`thinking_stripped≥1` 至少出现一次 = 7-20 改造真剥了 thinking 块;后续 = 0 = 剥干净不再回传。**RAII guard 设 env 是子 agent 线程入口分路标识的干净范式**——Drop 自动清理避免残留污染主 LLM 后续调用,比手动 `remove_var` 健壮（panic 时也清）。
+
+32. ★ 2026-07-24 主 agent 多轮稳定调用子 agent + CLI 换行符粘贴修复（multi-provider-subagent 分支，提交 589fb77，接续第 31 条）
+    - **分支已切换**：本次提交在 `multi-provider-subagent` 分支（不再是之前记录的 `henry-dev`）。git status 备忘那段还在写 `henry-dev`——下次接手先 `git branch --show-current` 确认当前分支再读下方记录。
+    - **提交摘要（15 文件 +655/-84）**：commit 589fb77 `1.主agent基本可以多轮稳定调用子agent 2.解决cli粘贴的内容含有换行符时直接被自动发送出去的问题`。两条主线改动分开记。
+
+    ### A. 主 agent 多轮稳定调用子 agent（multi-provider 路径稳定化）
+
+    真机现场：接续第 28-31 条 multiprovider + subagent 改造，主 agent（DeepSeek 1M）派子 agent（GLM 200K）后子 agent 跑到第 3 轮报 400 Bad Request，请求体膨胀到 244KB（est_tokens=60998）撑爆 GLM 200K 输入预算。根因是复合的——本次一口气修了 6 条独立根因，每条单独都会让子 agent 跑不通：
+
+    | 根因 | 真机表现 | 修法（文件:位置） |
+    |---|---|---|
+    | **① auto-compact 阈值按总窗口而非输入预算算** | `(200K)×75% = 150K` 阈值，但 GLM-5.1 max_output=64K → 实际输入预算只 136K，阈值 150K > 输入预算 136K，compact 触发前请求已超输入上限报 400 | `runtime/src/conversation.rs:285` `with_model_context_window_strict` 签名加 `max_output_tokens: u32` 参数，阈值改 `(context_window - max_output)×75%` → `(200K-64K)×75% = 102K` 安全 |
+    | **② GLM 网关的 400 over-size 语义没透传到 run_turn** | `ApiError::Api` 缺 `over_size_400: bool` 字段，run_turn 把所有 400 当格式错误直接 `return Err` 退出，没降级 auto-compact 重试机会 | `api/src/error.rs` 加 `over_size_400: bool` 字段 + `is_over_size_400()` 方法；`anthropic.rs:939` + `openai_compat.rs:1600` `expect_success` 据裸 `"Bad Request"` body（无结构化 error envelope）置位；`tools/src/lib.rs:5359` `ProviderRuntimeClient::stream` + `main.rs:8976` `AnthropicRuntimeClient` 两处把 `is_over_size_400()` 透传成 `RuntimeError::with_kind(..., ErrorKind::OverSize400)` |
+    | **③ run_turn 没有 over_size_400 降级重试路径** | 即使语义透传到了 run_turn，原代码所有 Err 都 `return Err` 退出 | `conversation.rs:450` 加 `over_size_400_retries` 计数 + `OVER_SIZE_400_MAX_RETRIES=3` 常量；命中 `error.is_over_size_400()` 时调 `compact_session(max_estimated_tokens=0)` 强压后 `continue` 重试，`iterations -= 1` 不计超额；压不动或 3 次后仍 400 才放弃上抛 |
+    | **④ micro_compact snip 闸门按阈值/4 算随阈值涨船高** | 子 agent 阈值 150K 时闸门抬到 37.5K 字符，第 2 轮 14 个 grep_search 结果单个才几 KB 全 < 37.5K → 全跳过不 snip → 第 3 轮请求体膨胀撑爆 | `runtime/src/micro_compact.rs:152` `min_output_length_for_clear` 加兜底上限 `min(算值, 5000)` 字符，对齐 A=7c95f2b 版主 LLM 跑 GLM 200K 稳定数百轮时的固定闸门常量 |
+    | **⑤ token 估算 bytes/4 对中文严重低估** | UTF-8 中文 3 bytes ≈ 1 token，bytes/4 只算 0.75 token，低估 33% → pre-flight compact 放行了实际已超预算的请求 | `conversation.rs:778` `estimate_tokens_mixed` 替代 bytes/4（ASCII/非 ASCII 分开算）；`providers/mod.rs:694` `estimate_tokens_from_bytes` 用 UTF-8 续延字节占比推算 CJK 密度，CJK 重内容用 divisor=2.5 而非 4；`session_needs_pre_flight_compact` 加 `SYSTEM_OVERHEAD_TOKENS=15_000` 系统开销估算 |
+    | **⑥ 子 agent runtime 不加载用户 settings.json 的 permission_rules** | `agent_permission_policy()` 创建裸 `DangerFullAccess` 不加载 `permissions.allow` 规则，`allowed_path_prefixes` 返回空，子 agent 读工作区外目录（用户已显式允许）被 `validate_workspace_boundary` 硬拦报 "path escapes workspace boundary" | `tools/src/lib.rs:4262` `agent_permission_policy()` 改——`ConfigLoader::default_for(cwd).load()` 加载用户 `permission_rules` 注入策略，子 agent 继承外部路径允许规则 |
+
+    **配套稳定性改造（6 处）**：
+    - **⑦ 子 agent Ctrl+C 中断修复**（`tools/src/lib.rs:3697`）：新增进程级 `PROCESS_ABORT_SIGNAL: OnceLock<HookAbortSignal>` + `register_process_abort_signal()` 注册接口；`main.rs:5014` `LiveCli::new` 里调一次注册；`spawn_agent_job` 把单次 `recv_timeout(600s)` 改成每秒轮询循环——每次 `recv_timeout(1s)` 后检查 `process_abort_signal().is_aborted()`，Ctrl+C 时最多 1s 内响应落盘 `"aborted"` 终态返回，不再卡死 600s。
+    - **⑧ 子 agent max_iterations 提升 32→64**（`tools/src/lib.rs`）：`DEFAULT_AGENT_MAX_ITERATIONS=64`（reader 子 agent 探索 5-6 个文件就耗尽 32 轮），加 `subagent_max_iterations()` 读 env `CLAW_SUBAGENT_MAX_ITERATIONS` 覆盖。
+    - **⑨ SSE 事件间超时防挂死**（`tools/src/lib.rs:5400` `stream_with_provider`）：GLM 网关生成时偶尔 TCP 存活但不发 SSE 事件，原 `next_event().await` 无限阻塞。加 `SSE_EVENT_TIMEOUT=360s`（GLM 5.1 大段内容单事件间隔可达 4-5 分钟，3min 太短会误杀），超时后 break 走下方 fallback。
+    - **⑩ HTTP 客户端连接建立超时**（`api/src/http_client.rs`）：`CONNECT_TIMEOUT=30s` + `connect_timeout()`，GLM 网关偶尔 SYN 无响应（防火墙丢包），原 reqwest 默认无限等。
+    - **⑪ max_iterations 超限 graceful 退出**（`conversation.rs:450`）：之前超限直接 `return Err` 丢掉子 agent 已收集的所有文本，主 LLM 只看到错误字符串。改成 `break` 带已累积的 `assistant_messages` 走下方正常返回路径，主 LLM 能看到子 agent 已完成的部分工作。
+    - **⑫ read_file 字符级硬上限**（`runtime/src/file_ops.rs:20`）：`READ_FILE_MAX_CHARS=50_000`，2000 行限制对长行文件（PDF/minified JS/单行 JSON）无效，一行可 MB 级。超限截断并提示用 offset 分段读，截断时回退到 UTF-8 字符边界避免割半多字节字符。
+    - **⑬ workspace lint `unsafe_code` 从 forbid 改 deny**（`rust/Cargo.toml`）：允许特定函数用 `#[allow(unsafe_code)]` 豁免——本次 B 部分的 Windows Console FFI 需要 unsafe。
+
+    - **主 LLM system prompt 推式指导段**（`runtime/src/prompt.rs:520` `render_subagents_section`）：MEMORY 第 30 条判"主 LLM 看到 description 后没自觉派活靠 description 提示不够强势"——本次在 Available subagents 段后追加"## 子 agent 使用原则"段 4 条强制规则：①读/搜/查 → 派子 agent；②一个子 agent 跑完后下一步仍是读/搜/查范畴 → 继续派不要自己调 read_file/grep 替代；③子 agent 之间上下文完全独立每次派活都是全新实例 prompt 里要写清楚本次任务范围；④只有写代码/改文件/做决策/综合多源信息时才自己做。这是从"描述性"升级到"推式指导"的范式转变。
+
+    - **RuntimeError 结构化错误语义**（`conversation.rs:91`）：新增 `ErrorKind` 枚举（`Generic`/`OverSize400`）+ `RuntimeError::with_kind()`/`kind()`/`is_over_size_400()` 方法。背景：`RuntimeError` 从 `ApiError::to_string()` 构造时原本的 retryable/kind 标记会丢失，所以独立保留 kind 字段透传到 run_turn。`lib.rs` export 加 `ErrorKind`。
+
+    - **验证状态**：✅ 编译 + 单元测试层验证（cargo check / cargo test 相关 crate 全绿，本次没引入新失败，剩报错都是 MEMORY 第 24/31 条已记的预存债）。⏳ **真机验证未做**——用户需重编 `cargo build --release` 替换 `claw.exe` 后真机跑一轮确认：①子 agent 跑到第 3 轮不再报 400 over-size（阈值 102K + snip 闸门 5K + token 估算 CJK 适配三重保护）；②Ctrl+C 时子 agent 等待最多 1s 内响应不再卡死 600s；③子 agent 读工作区外目录（用户已 allow 的）不再被 workspace boundary 拦；④主 LLM 拿到子 agent 结果后能自觉继续派活不自己调 read_file 替代（靠推式指导段）。
+
+    - **下次接手真机判读 grep 命令清单（真机跑完 `claw_glm_diag.log` 后直接扒，接续第 31 条清单）**：
+
+      ```bash
+      LOG="E:/NW工程/资料库/html/claw_glm_diag.log"
+
+      # ① over_size_400 降级重试应生效——改造前子 agent 第 3 轮报 400 终结
+      # 改造后:子 agent 报 over_size 400 时 auto-compact 后重试,日志应见降级轨迹
+      grep -c "over_size_400: GLM 网关撑请求体过大回 400" "$LOG"   # 降级重试事件命中数（应 ≥ 1 if 触发了）
+      grep -c "over_size_400: auto-compact 移除" "$LOG"             # compact 成功移除消息命中数
+      grep -c "over_size_400: exhausted" "$LOG"                    # 3 次重试仍失败放弃命中数（应 = 0 if 修对了）
+
+      # ② 子 agent 不再报 400 over-size——改造前 status=400 在子 agent 跑到第 3 轮必现
+      grep "lane=subagent" "$LOG" | grep -oE "status=[0-9]+" | sort | uniq -c   # 改造后应全 200 无 400
+
+      # ③ Ctrl+C 中断子 agent 应快速响应——改造前 recv_timeout(600s) 卡死
+      grep -c "sub-agent aborted by user (Ctrl+C)" "$LOG"          # aborted 终态命中数（Ctrl+C 后应 ≥ 1）
+      # 改造后最多 1s 内响应,不再出现主线程卡死等满 600s 才回收
+
+      # ④ 子 agent 读工作区外目录应放行——改造前报 "path escapes workspace boundary"
+      grep -c "path escapes workspace boundary" "$LOG"            # 改造后应 = 0（子 agent 继承用户 permission_rules）
+
+      # ⑤ 主 LLM 推式指导段是否注入 system prompt
+      grep -c "## 子 agent 使用原则" "$LOG"                        # 改造后应 ≥ 1（每轮主 LLM system prompt 都注入）
+
+      # ⑥ SSE 流超时防挂死——改造前 GLM 网关挂 TCP 不发事件时主线程无限等
+      grep -c "SSE 流超时 360s 无新事件" "$LOG"                   # SSE 流超时 fallback 命中数（GLM 网关挂时 ≥ 1）
+      ```
+
+    ### B. CLI 换行符粘贴修复（Windows 右键粘贴被逐行自动发送）
+
+    - **真机现场**：Windows 旧版控制台（conhost）右键粘贴多行内容时不发送 bracketed paste 转义序列，多行被当作逐行键入——每个 `\r\n` 触发 rustyline 的 `AcceptLine`，readline() 返回第一行后剩余行留在缓冲区被后续 readline 误读成独立命令。用户粘贴一段含换行符的代码，第一行被立即发送出去，剩余行变成后续 turn 的输入。
+    - **修法**（`rusty-claude-cli/src/input.rs:326`）：readline() 返回第一行后立即调 `console_pending_char_key_count()` 检查 Windows 控制台输入缓冲区——若还有 ≥ 3 个可打印字符按键事件（阈值排除 Enter 键释放、修饰键、终端转义序列噪声），判定为粘贴，连续 readline("") 累积所有剩余行合并成一条消息提交。超过 `PASTE_LINE_THRESHOLD` 阈值走 `paste_manager.register_paste` 注册标签路径，未超阈值的多行也直接合并为一条消息提交。
+    - **`console_pending_char_key_count()` 实现**（`input.rs:483`）：`#[cfg(windows)]` + `#[allow(unsafe_code)]`（依赖 Cargo.toml 的 `unsafe_code = "deny"` 改动），FFI 调 `PeekConsoleInputW` kernel32 API 读控制台输入缓冲区最多 256 个 `INPUT_RECORD`，只计数 `KEY_EVENT + key_down!=0 + char_code>=0x20`（可打印字符）的事件。`InputRecord` 用 `#[repr(C)]` 手动匹配 Windows 20 字节布局。`#[cfg(not(windows))]` 桩返回 0。
+    - **验证状态**：✅ 编译通过（Cargo.toml lint 改动配套）。⏳ 真机验证未做——用户粘贴含换行符的多行内容应整体作为一条消息提交，不再第一行被立即发送、剩余行变后续输入。
+
+    - **教训（写给下次接手，第十三步）**：
+      1. **子 agent 撑爆 GLM 400 是复合根因——本次一口气修 6 条独立根因才跑通**（阈值按输入预算算 + over_size 语义透传 + run_turn 降级重试 + snip 闸门兜底 + token 估算 CJK 适配 + permission_rules 加载）。下次接手看到子 agent 报 400 不要只想单一根因，扒日志确认 `est_tokens` vs `context_window`、`over_size_400` 字段是否透传、snip 闸门是否按阈值涨船高、token 估算是否对中文低估、permission 是否拦了工作区外路径——六条任何一条没修都会复现 400。
+      2. **`RuntimeError` 从 `ApiError::to_string()` 构造会丢 retryable/kind 标记**——这是为什么要独立保留 `ErrorKind` 字段透传。下次接手看到 RuntimeError 与 ApiError 之间的转换链时，**确认结构化语义（retryable/over_size_400/error_type）是否被 to_string() 抹平**——是的就要像本次一样独立保留 kind 字段。
+      3. **主 LLM 不自觉派活靠 description 不够强势——要推式指导段**（MEMORY 第 30 条判的"靠 description 提示不够"本次落地）。下次接手看到主 LLM 拿到子 agent 结果后自己连续调 read_file/grep 替代派活时，**改 `render_subagents_section` 注入强制规则段比改 description 文本更有效**——"什么时候该派、什么时候自己做"的边界要明写。
+      4. **Windows 旧版控制台右键粘贴不发 bracketed paste 转义序列**——多行被逐行注入缓冲区触发 AcceptLine。下次接手遇到"粘贴含换行符内容第一行被立即发送"类 bug，**先调 `PeekConsoleInputW` 看缓冲区是否有剩余 KEY_EVENT**——有就是粘贴没读完，用累积连续 readline 合并成一条。`unsafe_code = "deny"` + `#[allow(unsafe_code)]` 豁免特定 FFI 函数是干净范式（forbid 没法豁免）。
+
+---
+
+## ★ 2026-07-30 子 agent 自适应判活（替换死切 600s 超时，接续第 32 条）
+
+### 真机现场
+
+用户 henry 扒 `E:\NW工程\资料库\html\claw_glm_diag.log`（56141 行）发现**主 LLM（DeepSeek 1M）每一轮都派子 agent（GLM 200K）、每次都 600 秒超时、每次都自己重读一遍代码**——`"子 agent 超时了，我自己直接读代码。"` 这句话在日志里**重复出现 20 次**（7508、8834、10247、...、44174）。两轮对话证据：
+
+| 轮 | agent manifest 行 | startedAt → completedAt | 间隔 | status |
+|---|---|---|---|---|
+| 第 1 轮（6266 行） | agent-1785329439322602900 | 1785329439 → 1785330039 | **精确 600s** | `timeout` |
+| 第 2 轮（36642 行附近） | agent-1785330696487226200 | 1785330696 → 1785331297 | **精确 601s** | `timeout` |
+
+用户还观察到："有时到了 11 分钟的时候，子 LLM 又返回了内容，但已经浪费了"——即子 agent 第 11 分钟才跑完，但 600s 已判 timeout，主 LLM 已自己读完代码，子 agent 结果被丢弃。
+
+### 根因
+
+`spawn_agent_job`（`rust/crates/tools/src/lib.rs`）的超时机制是**死切 600 秒一刀切**：
+- `DEFAULT_SUBAGENT_TIMEOUT_SECS = 600` 常量 + `CLAW_SUBAGENT_TIMEOUT_SECS` env 覆盖
+- 轮询循环 `recv_timeout(1s)` 只看三个信号：①子线程 send outcome ②Ctrl+C abort ③deadline 到→回填 `status="timeout"`
+- **没有任何"判活"机制**——既不知道子 agent 是"还在干活"还是"已挂但没回结果"
+
+两种浪费：
+
+| 场景 | 当前行为 | 浪费 | 用户要的 |
+|---|---|---|---|
+| 子 agent 第 11 分钟才返回 | 600s 判 timeout，主 LLM 已自己读完代码，子 agent 结果丢弃 | 白等 10 分钟 + 子 agent 白跑 11 分钟 | **判活中→继续等**，拿到结果 |
+| 子 agent 第 3 分钟就挂了且多次重试失败 | 主 LLM 死等到 600s | 白等 7 分钟 | **判已挂→提前结束** |
+
+### 修法（心跳计数器 + 自适应静默超时 + 硬上限兜底）
+
+**核心机制**：子 agent `run_turn` loop 每轮完成时（API 调用成功 + 每个工具执行完成）自增 `Arc<AtomicU64>` 心跳计数器；主线程轮询每秒读计数器比对——**变了**→重置静默计时器（判"还在干活"继续等）；**没变**→累加静默秒数，静默超 `STALE_SECS` 判"已挂"提前结束。
+
+**改造涉及 2 文件**：
+
+| 文件 | 改动 |
+|---|---|
+| `rust/crates/runtime/src/conversation.rs` | `ConversationRuntime` 加 `heartbeat: Option<Box<dyn Fn() + Send + Sync>>` 字段 + `with_heartbeat()` setter；`run_turn` loop 两处心跳注入：①每轮 API 调用成功拿到 assistant 消息后（597 行附近）②每个工具执行完成后（732 行附近，工具耗时可能数十秒，主线程需工具期间也收到心跳） |
+| `rust/crates/tools/src/lib.rs` | 替换 `DEFAULT_SUBAGENT_TIMEOUT_SECS=600` + `subagent_timeout_duration()` 为两套：①`DEFAULT_SUBAGENT_HARD_TIMEOUT_SECS=1800`（30 分钟硬上限兜底，`CLAW_SUBAGENT_TIMEOUT_SECS` env 覆盖）②`DEFAULT_SUBAGENT_STALE_SECS=300`（5 分钟静默超时，`CLAW_SUBAGENT_STALE_SECS` env 覆盖）。`spawn_agent_job` 主体重写：心跳计数器 `Arc<AtomicU64>` + 闭包用 `Arc<dyn Fn() + Send + Sync>` 包装（`Rc` 不 Send+Sync 跨不了线程，`Box<dyn Fn()>` 不能 clone）。轮询循环四条退出路径：①收到 outcome（正常完成/failed）②Ctrl+C aborted ③静默超 `stale_secs`→回填 `status="stale"` ④硬上限→回填 `status="timeout"`。`run_agent_job_with_outcome` + `build_agent_runtime` 加 `heartbeat: Option<Box<dyn Fn() + Send + Sync>>` 参数注入 runtime |
+
+**心跳注入点设计依据**：
+- **每轮 API 调用成功后**（拿到 assistant 消息）：证明本轮模型真响应了，不是 over_size_400 降级重试 `continue` 路径（那轮没真正干活，不发心跳避免误判活）
+- **每个工具执行完成后**（`record_tool_finished` 之后）：reader 子 agent 跑 grep 搜 `.venv` 数万文件、read_file 大文件可能耗时数十秒，主线程需要工具期间也收到心跳才能判"还在干活"而非误判静默超时
+
+**`STALE_SECS=300`（5 分钟）取值依据**：GLM 5.1 单 SSE 事件间隔可达 4-5 分钟（2026-07-23 MEMORY 已证），5 分钟静默才判挂；设太小（如 3 分钟）会误杀 GLM 正常的大段内容生成间隔。
+
+**`status="stale"` vs `status="timeout"` 语义区分**：
+- `stale` = 静默超时（心跳停了超 5 分钟，判"已挂"——网关挂死/auto-compact 卡死/死循环）
+- `timeout` = 硬上限（30 分钟兜底，正常情况不会命中，防真死循环/网关永久挂死）
+- 两者 error 文本不同便于日志定位：`stale` 含 `no heartbeat for {}s, presumed hung — last heartbeat count={}`；`timeout` 含 `hit hard timeout after {}s (heartbeat count={})`
+
+**闭包类型踩坑记录**：
+- 初版用 `Box<dyn Fn() + Send + Sync>` 包装闭包 → spawn 闭包内 `heartbeat.clone()` 编译报错：`dyn Fn()` 不是 `Sized`/`Clone`，`Box<dyn Fn()>` 不实现 `Clone`
+- 二版改用 `Rc<dyn Fn() + Send + Sync>` → 编译报错 3 条：`Rc` 不 `Send`/`Sync`（单线程引用计数），跨不了 spawn 子线程
+- 终版用 `Arc<dyn Fn() + Send + Sync>` 包装闭包 + spawn 闭包内 `Arc::clone` 后用裸闭包 `move || heartbeat_arc_clone()` 包一层转 `Box<dyn Fn() + Send + Sync>`（不能直接 `Box::new(Arc::clone(...))`：会得到 `Box<Arc<dyn Fn()>>` 类型不匹配 runtime setter 签名）
+
+### 验证状态
+
+✅ `cargo check -p runtime -p tools` 全绿零 warning
+✅ `cargo test -p runtime -p tools` 553 passed / 39 failed——**39 个失败全是预存债**（git stash 对照基线就是 553/39，本次改造没引入任何新失败、也没修复任何旧测试）
+⏳ **真机验证未做**——用户需重编 `cargo build --release` 替换 `claw.exe` 后真机跑一轮确认：
+1. 子 agent 跑到第 11 分钟才返回 → 主线程一直收到心跳 → deadline 被重置 → 等到结果（不再 600s 判 timeout 丢弃）
+2. 子 agent 第 3 分钟就挂了且多次重试失败 → 心跳静默 5 分钟 → 第 8 分钟判 stale 提前结束（不再死等 30 分钟硬上限）
+3. 真死循环/网关永久挂死 → 30 分钟硬上限兜底回填 timeout（安全网不失效）
+
+### 下次接手真机判读 grep 命令清单（真机跑完 `claw_glm_diag.log` 后直接扒，接续第 32 条清单）
+
+```bash
+LOG="E:/NW工程/资料库/html/claw_glm_diag.log"
+
+# ① stale 终态应出现——改造前只有 timeout，改造后子 agent 静默挂掉走 stale 路径
+grep -c '"status": "stale"' "$LOG"           # stale 终态命中数（子 agent 静默挂掉时 ≥ 1）
+grep -c '"status": "timeout"' "$LOG"         # timeout 终态命中数（仅真死循环/网关永久挂死时命中，正常应 = 0）
+grep -c "no heartbeat for" "$LOG"            # stale error 文本命中数（应与 stale 终态数一致）
+grep -c "hit hard timeout" "$LOG"            # timeout error 文本命中数（应与 timeout 终态数一致）
+
+# ② "我自己直接读代码" 应大幅减少——改造前主 LLM 每轮派子 agent 都超时自己重读，20 次/日志
+grep -c "我自己直接读代码" "$LOG"            # 改造后应大幅减少（子 agent 跑通的主 LLM 不用自己重读）
+
+# ③ 子 agent 完成时间分布——改造前全是精确 600s，改造后应分散（2 分钟/8 分钟/11 分钟等）
+grep -E '"status": "completed"' "$LOG" | grep -oE 'startedAt.*?completedAt' | head -10   # 看完成时长分布
+```
+
+### 教训（写给下次接手，第十四步）
+
+1. **死切超时是反 agentic 的——子 agent 跑得慢但没挂时不该硬切**。下次接手看到子 agent 超时相关改造时，**优先确认超时机制是"死切 deadline"还是"自适应判活"**——扒源码搜 `recv_timeout` / `wait_timeout` / `deadline`，若只看 deadline 不看心跳/进度信号就是死切，要改成自适应。心跳计数器 + 静默超时是干净范式：子 agent loop 每轮完成自增计数器，主线程轮询比对变了重置静默、没变累加超阈值判挂。
+2. **`Box<dyn Fn() + Send + Sync>` 不能 clone**——`dyn Fn()` 不是 `Sized`/`Clone`。下次接手要把闭包跨线程传又需要 clone 时，**用 `Arc<dyn Fn() + Send + Sync>` 包装**（`Arc` 能 clone 且 Send+sync），`Rc` 不行（不 Send+Sync 跨不了线程）。传给签名要 `Box` 的 setter 时，用裸闭包 `move || arc_clone()` 包一层转类型，不能直接 `Box::new(Arc::clone(...))`（会得到 `Box<Arc<dyn Fn()>>`）。
+3. **心跳注入点要选"本轮真干了活"的位置**——不能在 over_size_400 降级重试 `continue` 路径上发（那轮没真正干活，发心跳会误判活）。API 调用成功拿到 assistant 消息后 + 每个工具执行完成后是两个干净注入点：前者证模型真响应，后者证工具真在跑（工具耗时数十秒时主线程需要这期间也收到心跳）。
+4. **`stale` 和 `timeout` 语义要区分**——前者是"静默判挂"（主判活机制命中），后者是"硬上限兜底"（安全网命中）。下次接手设计自适应超时时，**两条路径回填不同 status + 不同 error 文本**便于日志定位是"子 agent 挂了"还是"真死循环"。status 字段值不要复用旧的 timeout（会混淆主 LLM 的判读逻辑）。

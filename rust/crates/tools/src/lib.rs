@@ -3881,20 +3881,41 @@ fn read_back_terminal_manifest(manifest_file: &str) -> Option<AgentOutput> {
     Some(terminal)
 }
 
-/// **2026-07-20 subagent 超时兜底**：主线程等子 agent 跑完的最长时间。
-/// 默认 10 分钟（`DEFAULT_SUBAGENT_TIMEOUT_SECS`），用 `CLAW_SUBAGENT_TIMEOUT_SECS` env 覆盖。
-/// 超时后主线程不再阻塞，回填 `status="timeout"` 让主 LLM 知道子 agent 没回结果。
-const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 600;
+/// **2026-07-30 subagent 自适应判活**：硬上限兜底——防真死循环/网关挂死导致永久阻塞。
+/// 默认 30 分钟（`DEFAULT_SUBAGENT_HARD_TIMEOUT_SECS`），用 `CLAW_SUBAGENT_TIMEOUT_SECS` env 覆盖。
+/// 这是安全网不是主判活机制——主机制是静默超时（`STALE_SECS`）：心跳静默超阈值即判"已挂"提前结束。
+/// 命中硬上限回填 `status="timeout"`，命中静默超时回填 `status="stale"`，语义区分便于日志定位。
+const DEFAULT_SUBAGENT_HARD_TIMEOUT_SECS: u64 = 1800;
 
-/// **2026-07-20 subagent 超时兜底**：读 `CLAW_SUBAGENT_TIMEOUT_SECS` env 算超时。
-/// env 没设 / 解析失败 / ≤0 → 用 `DEFAULT_SUBAGENT_TIMEOUT_SECS`（10 分钟）兜底。
-fn subagent_timeout_duration() -> Duration {
+/// **2026-07-30 subagent 自适应判活**：静默超时——心跳信号静默多久判"子 agent 已挂"。
+/// 默认 5 分钟（`DEFAULT_SUBAGENT_STALE_SECS`），用 `CLAW_SUBAGENT_STALE_SECS` env 覆盖。
+/// 子 agent `run_turn` loop 每轮完成（API 调用成功 + 每个工具执行完成）发一次心跳，
+/// 主线程轮询每秒读计数器比对——变了重置静默计时器；没变累加静默秒数。
+/// 静默超此阈值即判"已挂"（网关挂死/auto-compact 卡死/死循环），回填 `status="stale"` 提前结束。
+/// GLM 5.1 单事件间隔可达 4-5 分钟（MEMORY 2026-07-23 已证），所以 5 分钟静默才判挂；
+/// 设太小（如 3 分钟）会误杀 GLM 正常的大段内容生成间隔。
+const DEFAULT_SUBAGENT_STALE_SECS: u64 = 300;
+
+/// **2026-07-30 subagent 自适应判活**：读 `CLAW_SUBAGENT_TIMEOUT_SECS` env 算硬上限。
+/// env 没设 / 解析失败 / ≤0 → 用 `DEFAULT_SUBAGENT_HARD_TIMEOUT_SECS`（30 分钟）兜底。
+fn subagent_hard_timeout_duration() -> Duration {
     std::env::var("CLAW_SUBAGENT_TIMEOUT_SECS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .filter(|secs| *secs > 0)
         .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(DEFAULT_SUBAGENT_TIMEOUT_SECS))
+        .unwrap_or_else(|| Duration::from_secs(DEFAULT_SUBAGENT_HARD_TIMEOUT_SECS))
+}
+
+/// **2026-07-30 subagent 自适应判活**：读 `CLAW_SUBAGENT_STALE_SECS` env 算静默超时。
+/// env 没设 / 解析失败 / ≤0 → 用 `DEFAULT_SUBAGENT_STALE_SECS`（5 分钟）兜底。
+fn subagent_stale_duration() -> Duration {
+    std::env::var("CLAW_SUBAGENT_STALE_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(DEFAULT_SUBAGENT_STALE_SECS))
 }
 
 fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
@@ -3903,22 +3924,44 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
     // 让主 LLM 在 tool_result 里直接看到子 agent 的结论文本（而非 `status:"running"` 占位回执）。
     //
     // **2026-07-21 Condvar race 修复**：去掉 Condvar + wait_timeout，改用 `mpsc::channel` +
-    // `recv_timeout` 同步等子线程退出。绕开 Windows Condvar wait_timeout 的 notify-before-wait race
-    // （子线程 set outcome + notify_one 在主线程 wait_timeout 之前发生，主线程等不到下一次 notify → 阻塞到超时）。
-    // **保留超时兜底**：用户 Ctrl+C 现场证据证明子 agent 在 auto_compact 后会卡死（Bug ①），若主线程
-    // 用 `handle.join()` 无限等会永久阻塞。`recv_timeout` 在子 agent 卡死时主线程超时 break 回填 timeout 终态。
+    // `recv_timeout` 同步等子线程退出。绕开 Windows Condvar wait_timeout 的 notify-before-wait race。
+    //
+    // **2026-07-30 自适应判活改造**：替换死切 600s——心跳计数器 + 静默超时 + 硬上限兜底。
+    // 子 agent `run_turn` loop 每轮完成（API 调用成功 + 每个工具执行完成）自增 `Arc<AtomicU64>` 心跳计数器，
+    // 主线程轮询每秒读计数器比对——变了重置静默计时器（判"还在干活"继续等）；没变累加静默秒数，
+    // 静默超 `STALE_SECS`（默认 5 分钟）判"已挂"提前结束回填 `status="stale"`，不再死等硬上限。
+    // 硬上限（默认 30 分钟）保留为兜底安全网，防真死循环/网关永久挂死。
+    // 这是用户 henry 2026-07-29 提的需求："让主 LLM 判断子 agent 没失效时继续等，而非限制死 10 分钟；
+    // 同样若没到 10 分钟子 LLM 却挂掉且多次重试也未成功，就提前结束"。
     let (outcome_tx, outcome_rx) = std::sync::mpsc::channel::<AgentRunOutcome>();
     let manifest_for_timeout = job.manifest.clone();
+    let heartbeat_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // 心跳闭包：注入到 runtime 的 `with_heartbeat`，子 agent loop 每轮完成时调一次自增计数器。
+    // `Arc<AtomicU64>` 跨线程共享计数器；闭包本身用 `Arc<dyn Fn() + Send + Sync>` 包装——
+    // `Arc` 能 clone（仅增减引用计数）且 `Send+Sync`，spawn 闭包内 clone 后用裸闭包 `move || arc()` 包一层
+    // 转成 `Box<dyn Fn() + Send + Sync>`（runtime setter 签名要求，不能直接传 Arc）。
+    let heartbeat_counter_for_closure = heartbeat_counter.clone();
+    let heartbeat: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        heartbeat_counter_for_closure
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
 
     let thread_name = format!("clawd-agent-{}", job.manifest.agent_id);
     let builder_result = std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
             // **2026-07-20 panic 兜底**：catch_unwind 包 run_agent_job_with_outcome，
-            // panic 时也 send outcome（status="failed", error="sub-agent thread panicked"），
-            // 避免主线程 recv_timeout 超时回错（应正常收到 failed outcome）。
+            // panic 时也 send outcome（status="failed", error="sub-agent thread panicked"）。
+            // **2026-07-30 心跳注入**：clone Arc 后用裸闭包包一层转 Box<dyn Fn()> 传给 run_agent_job_with_outcome，
+            // 后者调 `build_agent_runtime(..., Some(heartbeat))` 注入到 `ConversationRuntime`。
+            // Arc::clone 只增减引用计数，闭包本身不深拷贝（dyn Fn() 不是 Clone）。
+            // 不直接 Box::new(Arc::clone(&heartbeat))：会得到 `Box<Arc<dyn Fn()>>` 类型不匹配 setter 签名。
+            let heartbeat_arc_clone = std::sync::Arc::clone(&heartbeat);
+            let heartbeat_for_call: Box<dyn Fn() + Send + Sync> =
+                Box::new(move || heartbeat_arc_clone());
             let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_agent_job_with_outcome(&job)
+                run_agent_job_with_outcome(&job, heartbeat_for_call)
             })) {
                 Ok(outcome) => outcome,
                 Err(_) => AgentRunOutcome {
@@ -3927,17 +3970,19 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                     error: Some(String::from("sub-agent thread panicked")),
                 },
             };
-            // send 失败仅记日志——主线程可能已 recv_timeout 超时 break 走了，send 报错是正常竞态。
+            // send 失败仅记日志——主线程可能已超时 break 走了，send 报错是正常竞态。
             let _ = outcome_tx.send(outcome);
         });
     let handle = builder_result.map_err(|error| error.to_string())?;
 
-    // **2026-07-23 Ctrl+C 中断修复**：把单次 recv_timeout(600s) 改成每秒轮询循环，
-    // 每次 recv_timeout(1s) 后检查进程级 abort signal。Ctrl+C 时主线程最多 1s 内响应，
-    // 落盘 "aborted" 终态后返回，不再卡死 600s。
-    let timeout = subagent_timeout_duration();
+    // **2026-07-30 自适应判活轮询**：每秒 recv_timeout(1s) 后读心跳计数器比对。
+    // 三条退出路径：①收到 outcome（正常完成/failed）②Ctrl+C aborted ③静默超 stale ④硬上限超 timeout。
+    let hard_timeout = subagent_hard_timeout_duration();
+    let stale_threshold = subagent_stale_duration();
     let poll_interval = Duration::from_secs(1);
-    let deadline = std::time::Instant::now() + timeout;
+    let hard_deadline = std::time::Instant::now() + hard_timeout;
+    let mut last_heartbeat: u64 = 0;
+    let mut stale_secs: u64 = 0;
     let _outcome = loop {
         match outcome_rx.recv_timeout(poll_interval) {
             Ok(outcome) => break outcome,
@@ -3963,18 +4008,52 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                         error: Some(String::from("sub-agent aborted by user (Ctrl+C)")),
                     };
                 }
-                // 检查总超时。
-                if std::time::Instant::now() >= deadline {
+                // **2026-07-30 自适应判活核心**：读心跳计数器比对。
+                // 变了 → 重置静默计时器（判"还在干活"继续等）；没变 → 累加静默秒数。
+                let current_heartbeat = heartbeat_counter.load(std::sync::atomic::Ordering::Relaxed);
+                if current_heartbeat != last_heartbeat {
+                    last_heartbeat = current_heartbeat;
+                    stale_secs = 0;
+                } else {
+                    stale_secs += poll_interval.as_secs();
+                }
+                // 静默超时——判"子 agent 已挂"提前结束。回填 `status="stale"` 与硬上限 `timeout` 区分。
+                if stale_secs >= stale_threshold.as_secs() {
+                    let detail = format!(
+                        "sub-agent went stale (no heartbeat for {}s), presumed hung — \
+                         last heartbeat count={current_heartbeat}",
+                        stale_secs
+                    );
+                    let _ = persist_agent_terminal_state(
+                        &manifest_for_timeout,
+                        "stale",
+                        None,
+                        Some(detail.clone()),
+                    );
+                    break AgentRunOutcome {
+                        status: String::from("stale"),
+                        final_text: None,
+                        error: Some(detail),
+                    };
+                }
+                // 硬上限兜底——防真死循环/网关永久挂死。正常情况不会命中（静默超时先触发）。
+                if std::time::Instant::now() >= hard_deadline {
                     let _ = persist_agent_terminal_state(
                         &manifest_for_timeout,
                         "timeout",
                         None,
-                        Some(format!("sub-agent timed out after {}s", timeout.as_secs())),
+                        Some(format!(
+                            "sub-agent hit hard timeout after {}s (heartbeat count={current_heartbeat})",
+                            hard_timeout.as_secs()
+                        )),
                     );
                     break AgentRunOutcome {
                         status: String::from("timeout"),
                         final_text: None,
-                        error: Some(format!("sub-agent timed out after {}s", timeout.as_secs())),
+                        error: Some(format!(
+                            "sub-agent hit hard timeout after {}s (heartbeat count={current_heartbeat})",
+                            hard_timeout.as_secs()
+                        )),
                     };
                 }
                 // 继续轮询。
@@ -3983,11 +4062,8 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
     };
 
     // 显式 join 子线程，确保子线程退出后再返回（避免子线程残留 panic / handle 被丢 Detached thread race）。
-    // join 失败本身不影响 outcome（outcome 已通过 channel 拿到），但记录日志。
-    // **recv_timeout 超时后子线程可能仍在卡死跑**——join 会阻塞等它跑完。这是 trade-off：
-    // 超时后主线程已回填 timeout 让主 LLM 继续干活，但子线程仍残留直到自己跑完或用户 Ctrl+C abort。
-    // 不调 join 会让子线程变 Detached thread（跑完自动退出），但 join 调了会阻塞主线程——
-    // 这里选 Detached：超时后不 join，让子线程自己跑完退出（catch_unwind 兜底 panic 不会永久残留）。
+    // **超时/静默后子线程可能仍在卡死跑**——join 会阻塞等它跑完。这里选 Detached：
+    // 超时后不 join，让子线程自己跑完退出（catch_unwind 兜底 panic 不会永久残留）。
     let _ = handle;  // drop handle = Detached thread，子线程跑完自动退出
 
     // 把 outcome 回填到调用方（execute_agent_with_spawn 的 manifest）。但 spawn_agent_job 签名
@@ -4028,7 +4104,10 @@ impl Drop for SubagentDiagEnvGuard {
     }
 }
 
-fn run_agent_job_with_outcome(job: &AgentJob) -> AgentRunOutcome {
+fn run_agent_job_with_outcome(
+    job: &AgentJob,
+    heartbeat: Box<dyn Fn() + Send + Sync>,
+) -> AgentRunOutcome {
     // **2026-07-21 子 LLM 诊断日志改造**：在子 agent 线程入口设 `CLAW_SUBAGENT_*` env，
     // api 层 `subagent_diag_context()` 读这三个 env 区分主子流量 + 关联 `.clawd-agents/{id}.json` manifest。
     // 用 RAII guard 跑完自动清理，避免子 agent 终态后 env 残留污染主 LLM 后续调用。
@@ -4038,7 +4117,7 @@ fn run_agent_job_with_outcome(job: &AgentJob) -> AgentRunOutcome {
     );
     let runtime_result = (|| -> Result<String, String> {
         let mut runtime =
-            build_agent_runtime(job)?.with_max_iterations(subagent_max_iterations());
+            build_agent_runtime(job, Some(heartbeat))?.with_max_iterations(subagent_max_iterations());
         // **2026-07-19 multiprovider 落地**：把子 agent 的 resolved model 注入 thread-local，
         // dispatch 层的 `current_dispatch_model()` 优先读 thread-local 算 `compact_receipt`。
         // 对照 `docs/multiprovider.md` 3.4bis 节选项 A。
@@ -4081,6 +4160,7 @@ fn run_agent_job_with_outcome(job: &AgentJob) -> AgentRunOutcome {
 
 fn build_agent_runtime(
     job: &AgentJob,
+    heartbeat: Option<Box<dyn Fn() + Send + Sync>>,
 ) -> Result<ConversationRuntime<ProviderRuntimeClient, SubagentToolExecutor>, String> {
     let model = job
         .manifest
@@ -4115,6 +4195,11 @@ fn build_agent_runtime(
         permission_policy,
         job.system_prompt.clone(),
     );
+    // **2026-07-30 自适应判活**：注入心跳回调到 runtime，run_turn loop 每轮完成时调一次。
+    // 主线程 spawn_agent_job 传 Some(heartbeat) 让主线程判活；None = 主 LLM 路径不注入（不判活）。
+    if let Some(heartbeat) = heartbeat {
+        runtime = runtime.with_heartbeat(heartbeat);
+    }
     // 二期-C1：按模型上下文窗口动态算auto-compact阈值。
     // DeepSeek V4 Pro 1M窗口→750K才压，几乎不触发，前缀稳定→DeepSeek硬盘缓存命中。
     // **2026-07-19 multiprovider 落地**：子 agent 走 strict 变体——阈值严格按自己 model 算，
