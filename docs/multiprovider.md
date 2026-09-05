@@ -686,12 +686,13 @@ claw 源码侧 `model_token_limit` 表（`api/src/providers/mod.rs:648`）注册
     "baseUrl": "https://aigw-gzgy2.cucloud.cn:8443",
     "apiKey": "sk-sp-...",
     "model": "glm-5.1",
-    "authKind": "bearer"
+    "authKind": "bearer",
+    "subAgentMaxOutputTokens": 131072
   }
 }
 ```
 
-**关键**：`"authKind": "bearer"` 必须显式配——默认空走 `ApiKey` 分支连不上 GLM 网关。
+**关键**：`"authKind": "bearer"` 必须显式配——默认空走 `ApiKey` 分支连不上 GLM 网关。（`subAgentMaxOutputTokens` 是 2026-09-05 新增的段内可选字段，见 3.4novies 节。）
 
 ### 验证状态
 
@@ -884,3 +885,58 @@ multiprovider 落地时**别让 `input_model.unwrap_or(&cfg.model)` 这种"input
 | tool_use 调用命中 | `"type": "tool_use"` 段（input/id 那个）| 主 LLM 真输出工具调用，算派活 |
 
 本轮我第一次 grep `"name": "Agent"` 命中 2 次差点判成"主 LLM 真派活了"，细看行 360-380 那段才看清是 tool schema 定义不是真调用——这条教训跟第 27 条修订版第四步那条"`Agent` 命中要区分工具定义 vs 工具调用"同根源，但本次再踩一次说明那条教训要更强记：**光看 `"name": "X"` 命中不能判主 LLM 调了 X 工具，必须看那行周围是 `"type": "tool"` 还是 `"type": "tool_use"`**。
+
+---
+
+## 3.4novies ★ 2026-09-05 `subAgentMaxOutputTokens` 段内字段——子 agent 独立 max_tokens 覆盖
+
+### 背景：GLM-5.3-Flash 首轮 400 的根因
+
+用户在 scnet 网关（`api.scnet.cn/api/llm/anthropic`）把主 LLM 换成 `GLM-5.3-Flash` 后，发第一个 prompt 就 400 `invalid_request_error: Format Error`。curl 逐字段重放日志里的 request_body 定位：**`max_tokens=384000` 超网关硬上限 131072**（131072 过 / 131073 挂，精确边界二分）。384000 来自 `plugins.maxOutputTokens`，主 lane `max_tokens_for_model_with_override`（`api/src/providers/mod.rs`）对 override 无条件直传不封顶。
+
+### 用户决策（原话）
+
+"在 subagentProviderDefault 下面也加一个 `subAgentMaxOutputTokens` 设置项，作用类似于 plugins 下的 maxOutputTokens 设置项对于主 LLM 的作用"——且明确 **"下面"指段内**（与 `baseUrl`/`apiKey`/`model`/`authKind` 平级），不是顶层兄弟 key。不做 registry 封顶，主 lane 的 `plugins.maxOutputTokens` 无限直传语义保持不动。
+
+### 落地改动（3 文件）
+
+| 文件 | 改动 |
+|---|---|
+| `runtime/src/config.rs` | `SubagentProviderConfig` 加 `max_output_tokens: Option<u32>` 字段；`parse_subagent_provider_config` 用 `optional_u32(object, "subAgentMaxOutputTokens", context)?` 解析（非负整数校验）。首版（顶层兄弟 key + `RuntimeConfig` 访问器 + `load()` 解析）已删 |
+| `runtime/src/config_validate.rs` | **不加白名单条目**——`subagentProviderDefault`/`subagentProviders` 段内字段本就无 schema 白名单（子段校验留给 config.rs 解析，`authKind` 先例）；顶层误放会被 `TOP_LEVEL_FIELDS` 白名单报 `unknown key`（层级防护，测试 `rejects_top_level_subagent_max_output_tokens` 锁定） |
+| `tools/src/lib.rs` | `ResolvedSubagentProvider` 加 `max_output_tokens: Option<u32>`（`resolve_subagent_provider` 三分支：by_type / default 从 `cfg.max_output_tokens` 填充，fallback 与 hard 路径 `None`）；`ProviderRuntimeClient::new_with_resolved` 注入 `max_output_tokens_override: resolved.max_output_tokens`；`stream()` 的 `MessageRequest` 改用 `max_tokens_for_model_with_override(&entry.model, self.max_output_tokens_override)`。首版的 setter 链式注入 + `load_subagent_max_output_tokens` helper 已迁移删除 |
+
+### 配置示例
+
+```json
+{
+  "subagentProviderDefault": {
+    "baseUrl": "https://aigw-gzgy2.cucloud.cn:8443",
+    "apiKey": "sk-sp-...",
+    "model": "glm-5.1",
+    "authKind": "bearer",
+    "subAgentMaxOutputTokens": 131072
+  }
+}
+```
+
+`subagentProviders.by_type` 各段同样支持该字段（同一 struct）。
+
+### 语义
+
+| 配置 | 子 agent 请求体 max_tokens |
+|---|---|
+| 段内配 `subAgentMaxOutputTokens: n` | `n`（直传不封顶，配错超网关上限就是 `Format Error` 400） |
+| 段内未配 | `max_tokens_for_model(model)` 兜底：glm-5.1/5.2/5.3 = 64000，deepseek 系 = 8192 |
+| 顶层误放 `subAgentMaxOutputTokens` | 启动即 `unknown key` 拒识（白名单层级防护） |
+
+### 验证
+
+- ✅ `cargo check -p runtime -p tools --all-targets` 零 error（修掉 config.rs routing 测试桩 + tools `make_routing` 两处 E0063）
+- ✅ runtime 新 4 条测试：`loads_subagent_max_output_tokens_from_provider_config` / `subagent_max_output_tokens_absent_yields_none_in_provider_config` / `subagent_max_output_tokens_wrong_type_fails_load` / config_validate `rejects_top_level_subagent_max_output_tokens`
+- ⏳ 真机验证未做——用户重编 `cargo build --release` 后子 agent 派活一轮，看日志 request_body 的 `"max_tokens"` 是否按配置/兜底取值
+
+### 教训
+
+- **配置层级听用户原话的字面位置语义**——"X 下面加一个设置项"指 X **段内**（对象内部字段），不是同级后面。首版理解成顶层兄弟 key 整体返工。
+- **per-provider 可配字段的预言应验**——3.4quinquies 教训段"同理其他可能差异的字段（如 max_output_tokens / context_window / cache_control 支持）也要做成 per-provider 可配"，本期 `max_output_tokens` 落地；`context_window` / `cache_control` 仍留待需要时照同一套范式（struct 字段 → parse → Resolved → client 注入）加。

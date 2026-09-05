@@ -1775,4 +1775,56 @@ grep -oE "cache_read=[0-9]+" "$LOG" | sort -t= -k2 -n | tail -5
 
 37. ★ 2026-09-03 新增（窗口矩阵用户裁定，第 34 条 threshold 指纹判读法的修订）：**仅 glm-5.1 是 200K + 老压缩模式；其余全系（glm-5.2/5.3、deepseek pro/flash）一律 1M + 前缀缓存（高缓存命中）模式**。查表指纹：deepseek-v4-flash=1M（不是 128K——那是映射推断错值，用户已推翻）；glm-5.* 前缀兜底=1M（glm-5.1 走精确条目不受影响）。**子 agent 阈值判读矩阵**：glm-5.1=160000 / glm-5.2=967000 / deepseek-v4-flash=978808（max_output 8,192 全额预留）。扒日志判 threshold 按此矩阵对号，别再用 107000/90K 旧指纹。
 
+---
+
+## ★★ 2026-09-05 GLM-5.3-Flash 首轮 400 根因锁定（max_tokens=384000 超网关上限 131072）+ 子 agent 独立 maxOutputTokens 配置落地（本次会话）
+
+### 400 根因（curl 逐字段变量复现，100% 锁定）
+
+用户在 `E:\NW工程\资料库\html` 用新编译的 claw.exe 发**第一个 prompt 就 400**。日志（被新会话覆盖成 1189 行）唯一一次请求：`POST https://api.scnet.cn/api/llm/anthropic/v1/messages`，model=`GLM-5.3-Flash`（新换的主 LLM），报 `invalid_request_error: Format Error`（无 param 指向）。请求体仅 7 个标准字段（max_tokens/messages/model/stream/system/tool_choice/tools），50 个 tools，1 条 user 消息，无 thinking/signature/cache_control 怪字段。
+
+**curl 重放定位**（真实 key 原样重放日志里的 request_body）：
+| max_tokens | 结果 |
+|---|---|
+| 384000（配置值） | **400 Format Error**（一字不差复现） |
+| 256000 | 400 |
+| 200000 | 400 |
+| 131073 | **400**（精确边界） |
+| **131072** | **200，SSE 正常出流** |
+| 128000 | 200 |
+
+**GLM-5.3-Flash 在 scnet 网关的 max_tokens 硬上限 = 131072（128K）**。384000 来自 `.claw.json` 的 `plugins.maxOutputTokens=384000`，主 lane `max_tokens_for_model_with_override`（`api/src/providers/mod.rs:602`）对 override **无条件直传不封顶** → 超上限 400。不带 override 时 `max_tokens_for_model` 会算出 64000（heuristic 64K min registry 128K），本来不会出事。
+
+### 用户决策（原话 + 层级修订）
+
+用户原话："不，你听我的。子agent的max_tokens也要支持独立配置。settings.json文件中，在subagentProviderDefault下面也加一个`subAgentMaxOutputTokens`设置项，作用类似于plugins下的maxOutputTokens设置项对于主LLM的作用。"——即**不做封顶**，主 lane 的 `plugins.maxOutputTokens` 保持无限直传语义不动；子 agent 加同语义的独立配置项（配了整体替代兜底，不配走 `max_tokens_for_model` 兜底）。
+
+**★ 层级修订（用户二次纠正）**："你对'下面'理解有误，应是 subagentProviderDefault **内部**增加 subAgentMaxOutputTokens，而不是排列在同级的后面。"——首版做成顶层兄弟 key 整体返工：`subAgentMaxOutputTokens` 最终是 `subagentProviderDefault`（及 `subagentProviders.by_type` 各段，同一 struct）**段内可选字段**，与 `baseUrl`/`apiKey`/`model`/`authKind` 平级。
+
+### 落地改动（3 文件，修订版）
+
+| 文件 | 改动 |
+|---|---|
+| `runtime/src/config.rs` | `SubagentProviderConfig` 加 `max_output_tokens: Option<u32>` 字段；`parse_subagent_provider_config` 用 `optional_u32(object, "subAgentMaxOutputTokens", context)?` 解析（非负整数校验免费获得）。**首版的顶层 `RuntimeFeatureConfig` 字段 + `load()` 解析 + `RuntimeConfig::subagent_max_output_tokens()` 访问器已删** |
+| `runtime/src/config_validate.rs` | **段内不加白名单**——`subagentProviderDefault`/`subagentProviders` 子段本就无 schema 白名单（子段校验留给 config.rs 解析，`authKind` 先例）；顶层误放被 `TOP_LEVEL_FIELDS` 白名单报 `unknown key`（层级防护，测试 `rejects_top_level_subagent_max_output_tokens` 锁定）。首版加的顶层条目已删 |
+| `tools/src/lib.rs` | `ResolvedSubagentProvider` 加 `max_output_tokens: Option<u32>`（`resolve_subagent_provider` 三分支：by_type/default 从 `cfg.max_output_tokens` 填充，fallback 与 hard 路径 `None`）；`ProviderRuntimeClient` 保留 `max_output_tokens_override` 字段但构造时从 `resolved.max_output_tokens` 注入（与 cache_config 同模式）；`stream()` 的 `MessageRequest` 用 `max_tokens_for_model_with_override(&entry.model, self.max_output_tokens_override)`。**首版的 setter 链式注入 + `load_subagent_max_output_tokens` helper 已迁移删除**；测试桩 `make_routing`（tools:11560/11568）+ `routing_equality_and_default_construction`（config.rs）构造点补 `max_output_tokens: None` |
+
+### 子 agent max_tokens 取值矩阵（修订版）
+
+| 配置 | 子 agent 请求体 max_tokens |
+|---|---|
+| provider 段内配 `subAgentMaxOutputTokens: n` | `n`（直传不封顶；配错超网关上限就是 Format Error 400） |
+| 段内未配 | `max_tokens_for_model(model)` 兜底：glm-5.1/5.2/5.3 = 64000，deepseek 系 = 8192 |
+| 顶层误放 `subAgentMaxOutputTokens` | 启动即 `unknown key` 拒识（白名单层级防护） |
+
+### 验证（修订版）
+
+- ✅ `cargo check --workspace` 全绿零 warning；`cargo check -p runtime -p tools --all-targets` 零 error
+- ✅ `cargo test -p runtime --lib subagent` 13 passed 0 failed（含新 4 条：段内解析 / 段内缺省 None / 段内类型错 load 失败 / 顶层误放拒识）
+- ✅ `scripts/fmt.sh --check` 干净
+- ⏳ **真机验证未做**——用户需 ①`cargo build --release` 重编；②**主 lane 的 400 必须靠改配置**：`.claw.json` 的 `plugins.maxOutputTokens` 从 384000 改 ≤131072（scnet GLM-5.3-Flash 实测上限，主 lane 封顶被用户明确否了）；③子 agent 覆盖写在 `subagentProviderDefault` **段内**：`"subAgentMaxOutputTokens": 131072`（值 ≤ 子 agent 所用网关上限；GLM 网关 glm-5.1 实测 128K、scnet GLM-5.3-Flash 实测 131072）
+
+38. ★ 2026-09-05 新增（max_tokens 网关上限摸底法 + 独立配置债）：**"Format Error" 无 param 指向时优先怀疑 max_tokens 超网关上限**——curl 原样重放日志 request_body（真实 key）→ 逐字段二分（只改 max_tokens：384000 挂 / 128000 过 → 131072 过 / 131073 挂 精确边界）。scnet GLM-5.3-Flash 上限 **131072**；GLM 网关（aigw-gzgy2）glm-5.1 上限 **128000**（2026-06-28 实测）。主 lane `plugins.maxOutputTokens` 是**无限直传**语义（用户明确保留，勿改回封顶）；子 agent 独立覆盖 `subAgentMaxOutputTokens` 是 **`subagentProviderDefault` 段内字段**（与 baseUrl/apiKey/model/authKind 平级，同语义：配了替代、不配兜底），不是顶层 key——顶层误放启动即拒识。两 lane 都不校验网关上限——**配错值就是 Format Error 400**，排查看 `claw_glm_diag.log` 的 `[request_body]` 里 `"max_tokens"` 字段。详见 `docs/multiprovider.md` 3.4novies 节。
+39. ★ 2026-09-05 新增（配置层级理解教训）：用户说"在 X 下面加一个设置项"，"下面"指 **X 段内**（对象内部字段），不是同级后面。首版理解成顶层兄弟 key 整体返工（config/tools/validate/测试 4 处迁移）。per-provider 可配字段的落地范式已稳定：`SubagentProviderConfig` 加字段 → `parse_subagent_provider_config` 解析 → `resolve_subagent_provider` 填充 `ResolvedSubagentProvider` → `new_with_resolved` 注入 client → `stream()` 使用；段内字段无 schema 白名单（解析层校验），顶层误放由 `TOP_LEVEL_FIELDS` 拒识。
+
 

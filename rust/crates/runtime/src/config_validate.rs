@@ -620,6 +620,28 @@ mod tests {
     }
 
     #[test]
+    fn rejects_top_level_subagent_max_output_tokens() {
+        // given — ★ 2026-09-05 修订：`subAgentMaxOutputTokens` 是 `subagentProviderDefault`
+        // **段内**字段（与 baseUrl/apiKey/model/authKind 平级），不再是顶层 key。
+        // 顶层误放会被白名单拒识，防止配错层级后 schema 放行但解析拿不到、静默不生效
+        //（对齐第 26/27 条三重口径教训）。
+        let source = r#"{"subAgentMaxOutputTokens": 131072}"#;
+        let parsed = JsonValue::parse(source).expect("valid json");
+        let object = parsed.as_object().expect("object");
+
+        // when
+        let result = validate_config_file(object, source, &test_path());
+
+        // then
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].field, "subAgentMaxOutputTokens");
+        assert!(matches!(
+            result.errors[0].kind,
+            DiagnosticKind::UnknownKey { .. }
+        ));
+    }
+
+    #[test]
     fn detects_wrong_type_for_model() {
         // given
         let source = r#"{"model": 123}"#;

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use api::{
-    max_tokens_for_model, model_family_identity_for, resolve_model_alias, ApiError,
+    max_tokens_for_model_with_override, model_family_identity_for, resolve_model_alias, ApiError,
     ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
     OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
     ToolResultContentBlock,
@@ -4277,6 +4277,7 @@ fn build_agent_runtime(
             model: model.clone(),
             base_url: None,
             auth: None,
+            max_output_tokens: None,
         }
     } else {
         // simple / 默认路径：走原 routing endpoint（更廉）。
@@ -5362,6 +5363,11 @@ struct ProviderRuntimeClient {
     /// never changed, so mid-session TTL flips cannot bust the
     /// server-side prompt cache key.
     cache_config: api::CacheConfig,
+    /// ★ 2026-09-05 新增：子 agent 独立 max_tokens 覆盖（`.claw.json` 顶层
+    /// `subAgentMaxOutputTokens`）。`None`（未配）→ `stream()` 走 `max_tokens_for_model`
+    /// 兜底（向后兼容）；`Some(n)` → 整体替代兜底值，语义对齐主 lane 的
+    /// `plugins.maxOutputTokens`（经 `max_tokens_for_model_with_override` 透传）。
+    max_output_tokens_override: Option<u32>,
 }
 
 impl ProviderRuntimeClient {
@@ -5401,6 +5407,9 @@ impl ProviderRuntimeClient {
             } else {
                 api::CacheConfig::disabled()
             },
+            // ★ 2026-09-05 新增：子 agent 独立 max_tokens 覆盖从 resolved（provider 段内
+            // `subAgentMaxOutputTokens`）带入——与 cache_config 同一注入模式。
+            max_output_tokens_override: resolved.max_output_tokens,
         })
     }
 
@@ -5430,6 +5439,7 @@ impl ProviderRuntimeClient {
             chain,
             allowed_tools,
             cache_config: api::CacheConfig::from_env(),
+            max_output_tokens_override: None,
         })
     }
 }
@@ -5514,6 +5524,10 @@ struct ResolvedSubagentProvider {
     base_url: Option<String>,
     /// 覆盖主 env 的 auth；`None` 表示走 `AuthSource::from_env`
     auth: Option<api::AuthSource>,
+    /// ★ 2026-09-05 新增：子 agent 独立 max_tokens 覆盖（provider 段内 `subAgentMaxOutputTokens`）。
+    /// `None`（未配）→ `stream()` 走 `max_tokens_for_model` 兜底（向后兼容）；
+    /// `Some(n)` → 整体替代兜底值，语义对齐主 lane 的 `plugins.maxOutputTokens`（直传不封顶）。
+    max_output_tokens: Option<u32>,
 }
 
 /// **2026-07-19 multiprovider 落地**：按 `subagent_type` 路由子 agent 的 provider 配置。
@@ -5546,6 +5560,7 @@ fn resolve_subagent_provider(
             model: cfg.model.clone(),
             base_url: Some(cfg.base_url.clone()),
             auth: Some(resolve_auth_source(&cfg)),
+            max_output_tokens: cfg.max_output_tokens,
         };
     }
     if let Some(cfg) = &routing.default {
@@ -5553,6 +5568,7 @@ fn resolve_subagent_provider(
             model: cfg.model.clone(),
             base_url: Some(cfg.base_url.clone()),
             auth: Some(resolve_auth_source(cfg)),
+            max_output_tokens: cfg.max_output_tokens,
         };
     }
     // 都没配 → fallback 主 env：从 ANTHROPIC_MODEL 取 model，否则用 input_model / DEFAULT_AGENT_MODEL
@@ -5564,6 +5580,7 @@ fn resolve_subagent_provider(
         model,
         base_url: None,
         auth: None,
+        max_output_tokens: None,
     }
 }
 
@@ -5637,7 +5654,10 @@ impl ApiClient for ProviderRuntimeClient {
         for (index, entry) in chain.iter().enumerate() {
             let message_request = MessageRequest {
                 model: entry.model.clone(),
-                max_tokens: max_tokens_for_model(&entry.model),
+                max_tokens: max_tokens_for_model_with_override(
+                    &entry.model,
+                    self.max_output_tokens_override,
+                ),
                 messages: messages.clone(),
                 system: system.clone(),
                 tools: (!tools.is_empty()).then(|| tools.clone()),
@@ -11542,6 +11562,7 @@ printf 'pwsh:%s' "$1"
                     api_key: api_key.to_string(),
                     model: model.to_string(),
                     auth_kind: "api_key".to_string(),
+                    max_output_tokens: None,
                 },
             );
         }
@@ -11550,6 +11571,7 @@ printf 'pwsh:%s' "$1"
             api_key: api_key.to_string(),
             model: model.to_string(),
             auth_kind: "api_key".to_string(),
+            max_output_tokens: None,
         });
         runtime::SubagentProviderRouting {
             by_type: by_type_map,

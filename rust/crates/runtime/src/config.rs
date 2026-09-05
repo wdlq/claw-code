@@ -104,6 +104,11 @@ pub struct SubagentProviderConfig {
     /// ★ 2026-07-19 新增：决定 `api_key` 走 `x-api-key` 头还是 `Authorization: Bearer` 头。
     /// 默认空字符串等价 `"api_key"`（保持向后兼容）。
     pub auth_kind: String,
+    /// ★ 2026-09-05 新增：子 agent 独立 max_tokens 覆盖（本段内 `subAgentMaxOutputTokens`）。
+    /// 语义对齐 `plugins.maxOutputTokens` 对主 LLM 的作用：配了整体替代
+    /// `max_tokens_for_model(model)` 兜底值（直传不封顶，与主 lane override 行为一致），
+    /// 不配走兜底保持向后兼容。
+    pub max_output_tokens: Option<u32>,
 }
 
 /// 按 `subagent_type` 路由的 provider 映射 + 默认兜底。
@@ -1140,11 +1145,16 @@ fn parse_subagent_provider_config(
         .and_then(|v| v.as_str())
         .unwrap_or("api_key")
         .to_string();
+    // ★ 2026-09-05 新增：subAgentMaxOutputTokens 可选字段（子 agent 独立 max_tokens 覆盖）。
+    // 语义对齐 `plugins.maxOutputTokens` 对主 LLM 的作用——配了整体替代
+    // `max_tokens_for_model(model)` 兜底值，不配走兜底。
+    let max_output_tokens = optional_u32(object, "subAgentMaxOutputTokens", context)?;
     Ok(SubagentProviderConfig {
         base_url,
         api_key,
         model,
         auth_kind,
+        max_output_tokens,
     })
 }
 
@@ -1545,6 +1555,98 @@ mod tests {
         assert!(error
             .to_string()
             .contains("top-level settings value must be a JSON object"));
+
+        if root.exists() {
+            fs::remove_dir_all(root).expect("cleanup temp dir");
+        }
+    }
+
+    #[test]
+    fn loads_subagent_max_output_tokens_from_provider_config() {
+        // given — ★ 2026-09-05 修订：`subAgentMaxOutputTokens` 是 `subagentProviderDefault`
+        // 段内字段（与 baseUrl/apiKey/model/authKind 平级），不是顶层 key。
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"subagentProviderDefault":{"baseUrl":"https://example.com","apiKey":"sk-test","model":"glm-5.1","authKind":"bearer","subAgentMaxOutputTokens":131072}}"#,
+        )
+        .expect("write user settings");
+
+        // when
+        let config = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        let default_cfg = config
+            .subagent_provider_routing()
+            .default
+            .as_ref()
+            .expect("default provider cfg");
+        assert_eq!(default_cfg.max_output_tokens, Some(131_072));
+
+        if root.exists() {
+            fs::remove_dir_all(root).expect("cleanup temp dir");
+        }
+    }
+
+    #[test]
+    fn subagent_max_output_tokens_absent_yields_none_in_provider_config() {
+        // given — 段内未配该字段时保持 None（子 agent lane 走 max_tokens_for_model 兜底）
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"subagentProviderDefault":{"baseUrl":"https://example.com","apiKey":"sk-test","model":"glm-5.1"}}"#,
+        )
+        .expect("write user settings");
+
+        // when
+        let config = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        let default_cfg = config
+            .subagent_provider_routing()
+            .default
+            .as_ref()
+            .expect("default provider cfg");
+        assert_eq!(default_cfg.max_output_tokens, None);
+
+        if root.exists() {
+            fs::remove_dir_all(root).expect("cleanup temp dir");
+        }
+    }
+
+    #[test]
+    fn subagent_max_output_tokens_wrong_type_fails_load() {
+        // given — 段内类型错（字符串）应让 load 报错（optional_u32 的非负整数校验）
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"subagentProviderDefault":{"baseUrl":"https://example.com","apiKey":"sk-test","model":"glm-5.1","subAgentMaxOutputTokens":"big"}}"#,
+        )
+        .expect("write user settings");
+
+        // when
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("config should fail");
+
+        // then
+        assert!(error.to_string().contains("subAgentMaxOutputTokens"));
 
         if root.exists() {
             fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -2529,6 +2631,7 @@ mod tests {
             api_key: "sk-test".to_string(),
             model: "test-model".to_string(),
             auth_kind: "api_key".to_string(),
+            max_output_tokens: None,
         };
         let mut by_type = std::collections::BTreeMap::new();
         by_type.insert("review".to_string(), cfg.clone());
