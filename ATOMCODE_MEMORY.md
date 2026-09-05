@@ -1,7 +1,7 @@
 # claw-code 项目架构记忆
 
 > **这是给 AtomCode 自己看的工作记忆文档。** 下次接手本项目时，**首先读这个文件**，可以快速还原项目全貌、已知坑点和修复历史。
-> 最后更新：2026-07-29
+> 最后更新：2026-09-03
 
 ---
 
@@ -1254,3 +1254,525 @@ grep -E '"status": "completed"' "$LOG" | grep -oE 'startedAt.*?completedAt' | he
 2. **`Box<dyn Fn() + Send + Sync>` 不能 clone**——`dyn Fn()` 不是 `Sized`/`Clone`。下次接手要把闭包跨线程传又需要 clone 时，**用 `Arc<dyn Fn() + Send + Sync>` 包装**（`Arc` 能 clone 且 Send+sync），`Rc` 不行（不 Send+Sync 跨不了线程）。传给签名要 `Box` 的 setter 时，用裸闭包 `move || arc_clone()` 包一层转类型，不能直接 `Box::new(Arc::clone(...))`（会得到 `Box<Arc<dyn Fn()>>`）。
 3. **心跳注入点要选"本轮真干了活"的位置**——不能在 over_size_400 降级重试 `continue` 路径上发（那轮没真正干活，发心跳会误判活）。API 调用成功拿到 assistant 消息后 + 每个工具执行完成后是两个干净注入点：前者证模型真响应，后者证工具真在跑（工具耗时数十秒时主线程需要这期间也收到心跳）。
 4. **`stale` 和 `timeout` 语义要区分**——前者是"静默判挂"（主判活机制命中），后者是"硬上限兜底"（安全网命中）。下次接手设计自适应超时时，**两条路径回填不同 status + 不同 error 文本**便于日志定位是"子 agent 挂了"还是"真死循环"。status 字段值不要复用旧的 timeout（会混淆主 LLM 的判读逻辑）。
+
+---
+
+## ★ 2026-08-15 atomcode task 思想落地到 claw-code（本次会话，multi-provider-subagent 分支接续）
+
+### 背景
+
+用户让探究 atomcode 源码 `E:\Claude Code\atomcode\atomcode-main-20260815` 的 task 机制是否为云端 LLM 节省 token。探究结论：**是**。通过三条机制叠加节 token ——①上下文隔离（子代理独立会话，父会话不背过程历史）②结果压缩（只回传 `<task_result>` 摘要块）③难度路由 + 工具裁剪（`is_hard` → capable/fast 双 provider）。用户随后让把这套思想用到本项目 claw-code。
+
+### 落地前的架构现状（本次会话上半场核实）
+
+对照 atomcode task 思想扒 claw-code 当前 subagent 实现差距：
+
+| atomcode task 思想 | claw-code 落地前 | 差距 |
+|---|---|---|
+| 子代理**精简摘要块回传** `<task id="..."><task_result>...</task_result></task>` + `first_line_capped` 截断 | `AgentOutput.result` 是子 agent 的完整 `final_text`，**无硬性字节上限**——长 findings 会原样进父会话上下文 | **缺**截断 + 块包装 |
+| **persona 软约束** explore="concise findings report" / worker="one-line summary" | `build_agent_system_prompt` 只说 "finish with a concise result"，**无按 type 分级 persona** | **缺**分类型 persona |
+| **难度路由** `is_hard` → capable provider；否则 → fast provider | **无难度概念**，所有子 agent 走同一 `resolve_subagent_provider` resolved provider | **缺** `difficulty` 字段 + 双 provider 路由 |
+| 子代理**只回传 summary**，过程细节留在子会话 | 已对齐（`result` 只回传 final_text） | ✅ |
+| 子代理**独立会话** `Session::new()` | 已对齐（`build_agent_runtime` 里 `Session::new()`） | ✅ |
+| 主 LLM 派活后**自己不再重读** | 已对齐（2026-07-22 推式指导段 `render_subagents_section` 4 条强制规则） | ✅ |
+| 父拿到结果**同步等结果**（非 fire-and-forget） | 已对齐（2026-07-20 改造 `spawn_agent_job` 同步等结果 + 2026-07-30 自适应判活） | ✅ |
+
+**架构差异未落地**（判断留债）：atomcode `Args { tasks: Vec<SubTask> }` + `JoinSet` + `Semaphore` **批量并行派活**；claw 是 `AgentInput` 单任务串行派活。批量并行需重写 dispatch 表入口，改动面过大——本次不动，下次接手若用户要"一次派 5 个子 agent 并行干 5 件事"再考虑。
+
+### 落地改动（全部在 `rust/crates/tools/src/lib.rs`，3 条机制 6 处改动）
+
+| # | atomcode 思想 | claw-code 落地 | 位置 |
+|---|---|---|---|
+| 1 | `render_task_block` + `first_line_capped` 精简摘要块回传 | `read_back_terminal_manifest` 里 `terminal.result` 改成 `<task id="..." model="..." state="..."><task_result>...首行截断到200字符...</task_result></task>` 块包装；新增 `first_line_capped(s, max)` 函数按 UTF-8 字符边界截首行 + 追加 `…` 省略号 | `lib.rs` 那两个函数 |
+| 2 | `EXPLORE_PERSONA` / `WORKER_PERSONA` 分类型 persona | `build_agent_system_prompt` 加 `subagent_persona(subagent_type)` 注入分级 persona——Explore/claw-guide/Plan（只读+检索）="concise findings report，列发现不堆过程"；Verification（只读+bash）="list pass/fail per check, no prose"；statusline-setup/general-purpose（含 write/edit）="one-line summary of what you changed"；默认=通用精简约束 | `lib.rs::subagent_persona` 新增 |
+| 3 | `is_hard` → capable/fast 双 provider 路由 | `AgentInput` 加 `difficulty: String` 字段（`#[serde(default)]`，默认空串走 simple 路径）；`AgentJob` 加 `difficulty` 字段；`build_agent_runtime` 按难度路由——`"hard"` → `ResolvedSubagentProvider{model, base_url:None, auth:None}` 走主 env endpoint（更强模型）；`"simple"`/其他 → 原 `resolve_subagent_provider` routing endpoint（更廉） | `lib.rs::build_agent_runtime` |
+
+**两层约束叠加**：persona 是软约束（从源头让子代理输出精简），`first_line_capped` 截断是硬兜底（子代理不听话时割掉）。两层一起确保子代理回传不爆父上下文。
+
+### 落地后的节 token 机制（本次新增的第三层）
+
+| 层 | 机制 | 状态 |
+|---|---|---|
+| ① 父会话不背过程历史 | 子代理独立 `Session::new()` + `result` 只回传 final_text | ✅ 已有 |
+| ② **父会话只收精简摘要块** | `<task_result>` 块包装 + `first_line_capped` 200 字符截断 | ✅ 本次落地 |
+| ③ **persona 软约束从源头压缩** | 分类型 persona（只读/写/plan 三类） | ✅ 本次落地 |
+| ④ **难度路由按任务复杂度选模型** | `"hard"` → 主 env 更强模型；`"simple"` → routing 更廉模型 | ✅ 本次落地 |
+| ⑤ 主 LLM 派活后不再自己重读 | 推式指导段 4 条强制规则 | ✅ 已有 |
+| ⑥ 同步等结果（非 fire-and-forget） | `spawn_agent_job` 同步 + 自适应判活 | ✅ 已有 |
+
+### 验证状态
+
+- ✅ `cargo check --workspace` 全绿零 warning
+- ✅ `cargo test -p tools --lib` 102 passed / 13 failed——**`git stash` 对照基线也是 102 passed / 13 failed**，13 个失败全是预存债（bash 工具、file_tools、powershell、skill 加载、worker_create、glob/grep），本次三条改动没引入任何新失败
+- ⏳ **真机验证未做**——用户需 `cargo build --release` 替换 `claw.exe` 后真机跑一轮确认（见下方 grep 命令清单）
+
+### 向后兼容性
+
+三条改动都保持向后兼容：
+- `AgentInput.difficulty` 加 `#[serde(default)]`，主 LLM 不传该字段时默认空串（走 `"simple"` 路径，等价原行为），不破坏现有 Agent 工具调用
+- `AgentJob.difficulty` 是新字段，所有构造 `AgentJob` 的测试桩（10 处）都已补 `difficulty: String::new()`
+- `subagent_persona` 是纯新增函数，`build_agent_system_prompt` 原有逻辑只多一行 `prompt.push(subagent_persona(...))`
+- `first_line_capped` 是纯新增函数，只改动 `read_back_terminal_manifest` 里 `terminal.result` 的赋值方式
+
+### 下次接手真机判读 grep 命令清单（真机跑完 `claw_glm_diag.log` 后直接扒，接续第 32 条清单）
+
+```bash
+LOG="E:/NW工程/资料库/html/claw_glm_diag.log"
+
+# ① 精简摘要块回传——改造前 result 是完整 final_text，改造后是 <task_result> 块 + 首行截断到 200 字符
+grep -c '"result":' "$LOG"                    # result 字段命中数（改造后应 > 0）
+grep -c '<task_result>' "$LOG"                # <task_result> 块命中数（改造后应 > 0）
+grep -c '<task id=' "$LOG"                    # <task id="..."> 块命中数（改造后应 > 0）
+
+# ② persona 分级约束——改造后子 agent system prompt 应含分级 persona 文本
+grep -c "READ-ONLY investigation subagent" "$LOG"       # Explore / Plan 子 agent 命中数
+grep -c "VERIFICATION subagent" "$LOG"                   # Verification 子 agent 命中数
+grep -c "focused EXECUTION subagent" "$LOG"              # statusline-setup / general-purpose 子 agent 命中数
+
+# ③ 难度路由——改造后主 LLM 派活时填 difficulty: "hard" 的子 agent 应走主 env endpoint
+grep -c "difficulty" "$LOG"                               # difficulty 字段命中数（改造后应 > 0）
+grep -E "lane=subagent" "$LOG" | grep -oE "model=[^ ]+" | sort | uniq -c   # 子 agent model 分布
+```
+
+### 教训（写给下次接手，第十五步）
+
+1. **atomcode task 思想的核心是"父会话不背子代理过程历史"**——claw 落地前是"主 LLM 同步等子 agent 结果"但回传的是完整 final_text，父会话仍背了子 agent 的完整输出。落地精简摘要块回传后，父会话只收到 `<task_result>` 块 + 首行截断到 200 字符，子 agent 的完整 final_text 留在子会话不进父上下文。**这是 token 节省的核心机制**，比对齐 atomcode `render_task_block` + `first_line_capped`。
+2. **persona 分级是软约束，`first_line_capped` 截断是硬兜底**——两层叠加确保子代理回传不爆父上下文。光有硬截断会割半信息（截掉子 agent 想说的关键内容），光有软约束模型可能不听话（输出超长 findings），两层一起最稳。下次接手改 subagent 输出体积相关逻辑时**这两层都要保留**，不要删 persona 只留截断（会割信息），也不要删截断只留 persona（会失效兜底）。
+3. **难度路由让主 LLM 派活时能按任务复杂度选模型**——`"hard"` 走主 env endpoint（更强模型），`"simple"` 走原 routing endpoint（更廉模型）。这是 atomcode `make_capable_provider` / `make_fast_provider` 的对应落地。**下次接手若新增 provider 路由字段**（如 region / latency 优先），按同一套"在 `AgentInput` 加字段 → `AgentJob` 加字段 → `build_agent_runtime` 按字段选 `ResolvedSubagentProvider` 分支"范式做，别新起一套配置入口。
+4. **批量并行派活（atomcode `JoinSet` + `Semaphore`）未落地是判断不是疏漏**——claw 当前 `AgentInput` 是单任务结构，主 LLM 一次只派一个子 agent。批量并行需重写 dispatch 表入口（`"Agent" => from_value::<AgentInput>` 改成接 `Vec<AgentInput>`）+ `spawn_agent_job` 改成 spawn 多子线程 + 结果聚合，改动面过大。**下次接手若用户要"一次派 5 个子 agent 并行干 5 件事"再考虑**，别在一次 atomcode 思想落地里顺手做——会混进来不该混的架构改动。
+5. **预存债 13 个失败不是本次引入**——`git stash` 对照基线确认基线也是 102 passed / 13 failed。下次接手若 `cargo test -p tools --lib` 报 13 个失败，先 `git stash` 对照基线再判是否新引入，别一上来就追——那 13 个是 bash 工具 / file_tools / powershell / skill 加载 / worker_create / glob/grep 的预存债，跟 subagent 改动无关。
+
+---
+
+## ★ 2026-08-17 stale/timeout 后 kill detached 子线程（本次会话）
+
+### 背景
+
+用户报"子 agent 超时后主 agent 又爆了上下文"。`atomcode-v4.25.6-windows-x64.exe` 主 agent 已从 DeepSeek 换成 200K 窗口的 GLM-5.1，子模型仍是 GLM-5.1。第一对话时间戳 t=1786942144（"帮我分析一下这个网站，它是如何让用户自助修改邮箱的密码的"）。
+
+### 真凶不是主 agent，是 detached 子线程
+
+`agent-1786942156282712600`（reader 子 agent，model glm-5.1，200K 窗口）实测证据：
+
+| t (秒) | 事件 | request est_tokens |
+|---|---|---|
+| 1786942144 | 主 agent 发第一个请求 | 7027 |
+| 1786942156 | 子 agent 启动 | 4388 |
+| 1786942209 | 子 agent 心跳计数到 14 后进入长工具执行 | — |
+| **1786942510** | **静默达 300s 判 `status="stale"`** | 8641 |
+| 1786942519~1786942614 | **stale 后 detached 子线程又发 13 个请求** | **一路涨到 70918 / 283KB** |
+
+主 agent 拿到的 `<task state="stale">` 只是 `first_line_capped` 200 字符截断摘要，**不会爆父上下文**。真正爆的是 **detached 子线程 stale 后继续跑**——`spawn_agent_job` 注释明说"选 Detached：超时后不 join，让子线程自己跑完退出"，但子线程不知道主线程已 break，`run_turn` loop 继续发 API 请求把子会话上下文一路撑到 70K+ est_tokens。
+
+### 根因（两点）
+
+| # | 问题 | 位置 |
+|---|---|---|
+| ① | **300s 静默阈值对 reader 子 agent 太低**。reader 跑 grep 大目录 / read_file 大文件，单工具执行轻易 5+ 分钟；心跳只在"每轮 API 成功"和"每个工具完成"发，长工具执行期间静默计时器一直累加，正常干活被误判 stale。 | `DEFAULT_SUBAGENT_STALE_SECS=300`（`lib.rs:3956`） |
+| ② | **stale/timeout 后 detached 子线程不 kill，继续爆上下文**。`build_agent_runtime` 创建的 `ConversationRuntime` 用 `HookAbortSignal::default()`，主线程拿不到这个引用，没法 abort。detached 子线程在 stale 后继续发 13 个 API 请求，子会话上下文一路涨到 70K+ est_tokens。 | `spawn_agent_job` 结尾 `let _ = handle; // drop = Detached`（`lib.rs:4126`）+ `build_agent_runtime` 没注入 abort signal |
+
+### 修法（两处）
+
+**修法 ① — STALE_SECS 300→600**（`lib.rs:3956`）
+
+1 行常量改动立即缓解——reader 子 agent 跑大文件扫描有 10 分钟时间，不再被误杀。真正死循环让 30 分钟硬上限兜底。
+
+**修法 ② — stale/timeout/aborted break 前 `abort()` detached 子线程**
+
+核心机制：spawn 前创建共享 `HookAbortSignal`，一份 clone 进 spawn 闭包注入子 agent runtime（`with_hook_abort_signal`），主线程持另一份在 break 前 `.abort()`。子 agent `run_turn` loop 在每轮迭代开头检查 `hook_abort_signal.is_aborted()`（`conversation.rs:487`）即 `return Err("Turn aborted by user")` 退出，不再继续发 API 请求爆 detached 子会话上下文。
+
+`HookAbortSignal` 内部是 `Arc<AtomicBool>` + `Arc<Notify>`，clone 仅增引用计数，主线程 clone 与子线程 clone 共享同一 AtomicBool，abort 信号互相可见。
+
+改动涉及 1 文件 4 处：
+
+| 文件 | 改动 |
+|---|---|
+| `rust/crates/tools/src/lib.rs` | ① `spawn_agent_job` 创建共享 `subagent_abort_signal` + `subagent_abort_for_thread` clone（spawn 前 clone，避免 move 后主线程再用 E0382）② spawn 闭包传 `subagent_abort_for_thread` 给 `run_agent_job_with_outcome` ③ `run_agent_job_with_outcome` 加 `subagent_abort_signal: runtime::HookAbortSignal` 参数，clone 后传给 `build_agent_runtime` ④ `build_agent_runtime` 加同名参数，`.with_hook_abort_signal(subagent_abort_signal)` 注入 runtime ⑤ stale/timeout/aborted 三处 break 前各加一行 `subagent_abort_signal.abort()` |
+
+### 验证状态
+
+- ✅ `cargo check --workspace` 全绿零 warning（编译通过）
+- ⏳ **真机验证未做**——用户需 `cargo build --release` 替换 `claw.exe` 后真机跑一轮确认
+
+### 下次接手真机判读 grep 命令清单（真机跑完 `claw_glm_diag.log` 后直接扒）
+
+```bash
+LOG="E:/NW工程/资料库/html/claw_glm_diag.log"
+
+# ① stale 后 detached 子线程是否还继续发请求——改造前 stale 后又发 13 个，改造后 abort 应让子线程在下次 run_turn loop 检查时退出
+# 找出每个子 agent 的 stale 时间点，再看 stale 后是否还有同 agent_id 的 subagent 请求
+grep -E 'lane=subagent.*agent-1786942156282712600' "$LOG" | tail -20
+
+# ② STALE_SECS 600 是否生效——stale 触发时静默秒数应 ≥ 600（改造前是 ≥ 300）
+grep "sub-agent went stale" "$LOG" | tail -5
+
+# ③ abort 后子线程退出时间——stale 时间点到该 agent 最后一个 subagent 请求的间隔应 < 几秒（abort 生效）
+```
+
+### 教训（写给下次接手，第十六步）
+
+1. **detached 线程不是"自己跑完退出"那么简单**——`spawn_agent_job` 注释说"选 Detached：超时后不 join，让子线程自己跑完退出"，但这隐含一个假设：子线程会"自己跑完"。实际上 detached 子线程在 stale 后又跑了 13 轮 API 请求把子会话上下文撑到 70K+ est_tokens。**下次遇到"超时后 X 又爆了"类 bug，先扒 detached 线程在超时后是否还在发请求**，别只看主线程。日志 `claw_glm_diag.log` 里 `lane=subagent` + `agent_id` 时间线是关键证据。
+2. **abort signal 必须是 spawn 前 clone，不能 spawn 闭包内 clone**——`subagent_abort_signal` 创建后若直接 move 进 spawn 闭包，主线程在 break 前 `subagent_abort_signal.abort()` 就 E0382（borrow of moved value）。修法是 spawn 前 `let subagent_abort_for_thread = subagent_abort_signal.clone();`，闭包 capture `subagent_abort_for_thread`，主线程保留 `subagent_abort_signal` 原变量。**`HookAbortSignal` 内部 `Arc<AtomicBool>` clone 仅增引用计数，主子两份共享同一 AtomicBool**，abort 信号互相可见。这是 Rust move 语义的常见坑，下次接手若加新的共享信号量，同一套"spawn 前 clone"范式做。
+3. **`HookAbortSignal` 已有现成机制，别另起一套**——`ConversationRuntime` 已有 `hook_abort_signal: HookAbortSignal` 字段 + `with_hook_abort_signal()` setter + `run_turn` loop 第 487 行检查 `is_aborted()` 后 `return Err("Turn aborted by user")`。本次只需在 `build_agent_runtime` 里调 `with_hook_abort_signal(subagent_abort_signal)` 注入。**下次接手若要让主线程控制子线程生命周期（abort/reset/wait），直接用 `HookAbortSignal` 这套，别新起 `Arc<AtomicBool>` + `Notify`**——重复造轮子且会跟现有 abort 检查点冲突。
+4. **STALE_SECS 600 不是终点，是 trade-off**——600s 让 reader 大文件扫描有 10 分钟时间，但若子 agent 真挂了（网关死/auto-compact 卡死），主线程要多等 5 分钟才判 stale。下次接手若用户报"子 agent 挂了主线程还在等"，考虑两个方向：① 加工具级细粒度心跳（每 30s 发一次，工具执行期间主线程也能判活）② 把 STALE_SECS 改成 env 可调（`CLAW_SUBAGENT_STALE_SECS` 已经支持 env 覆盖，用户可自己调）。**别一上来就把 STALE_SECS 改回 300**——那会重新触发本次修复的"reader 大文件扫描被误杀"问题。
+5. **诊断日志体系是金矿，别只读 manifest**——本次定位真凶的关键证据是 `claw_glm_diag.log` 里 stale 后的 13 个 `lane=subagent` 请求时间线，不是 `.clawd-agents/{id}.json` manifest（manifest 只记终态，不记 stale 后的 detached 残留）。**下次接手遇"超时/中断后 X 又爆了"类 bug，第一件事扒 `claw_glm_diag.log` 的 `lane=subagent` + `agent_id` 时间线**，看 detached 子线程在终态后是否还在发请求。日志读法见 MEMORY"诊断日志体系"段。
+
+---
+
+## ★ 2026-08-17 SSE 流超时 fallback 卡死 + 文案 180s/360s 不一致（本次会话，接上条）
+
+### 背景
+
+上一条修复（stale/timeout 后 kill detached 子线程）落地后真机跑，子 agent `read-pwd-code`（`agent-1786945537624322000`）跑到一半报新错：
+
+```
+[stream_with_provider: SSE 流超时 180s 无新事件，model=glm-5.1]
+```
+
+### 真凶：SSE 流级超时 fallback 路径无超时保护
+
+`stream_with_provider`（`tools/src/lib.rs:5633`）的 SSE 事件循环有 `SSE_EVENT_TIMEOUT=360s` 保护（事件间超时）。超时后 `break` 跳出循环，走第 5768 行 **非流式 fallback**：`client.send_message(...stream: false...)`。
+
+问题在 fallback 路径的底层 `send_raw_request`（`anthropic.rs:524`）——`reqwest::Client` 只设了 `connect_timeout(30s)`，**没有整体请求超时**。GLM 网关偶尔 TCP 活着但不响应，`request_builder.send().await` 无限阻塞。
+
+实测时间线（`agent-1786945537624322000`）：
+
+| t (秒) | 间隔 | est_tokens | 事件 |
+|---|---|---|---|
+| 1786945539 | — | 4337 | 子 agent 启动 |
+| 1786945643 | 104s | 23127 | 最后一个正常 SSE 事件 |
+| **1786946006** | **363s** | 23124 | 363s 后出现下一帧（命中 360s SSE_EVENT_TIMEOUT） |
+
+363s 间隔正好命中 `SSE_EVENT_TIMEOUT=360s`，触发 `Err(_elapsed)` 分支 break，走非流式 fallback 重发（t=1786946006 的 est_tokens=23124 跟前一帧 23127 几乎一样，是同一请求的非流式重发）。
+
+### 文案 bug：180s vs 360s
+
+报错文案写"180s 无新事件"，但常量是 `Duration::from_secs(360)`。文案与实际超时值不一致，诊断时误判。**修法**：文案改成 `format!("...{}s 无新事件...", SSE_EVENT_TIMEOUT.as_secs())` 据实陈述。
+
+### 修法（两处）
+
+| # | 改动 | 文件 |
+|---|---|---|
+| ① | SSE 流超时文案 180s→360s（用 `SSE_EVENT_TIMEOUT.as_secs()` 据实格式化） | `tools/src/lib.rs:5660` |
+| ② | `send_raw_request` 加 per-request `.timeout(HTTP_REQUEST_HARD_TIMEOUT=600s)`——让 reqwest 在网关挂死时自己产生 `is_timeout()` 错误，`is_retryable()` 自动判断重试。不用全局 client `.timeout()`（会误杀流式大响应体读取）；不用 `tokio::time::timeout` 包 `send().await`（`ApiError` 没有 `Network` variant，手写超时返回类型不匹配） | `api/src/providers/anthropic.rs:524` |
+
+### 验证状态
+
+- ✅ `cargo check --workspace` 全绿零 warning
+- ⏳ **真机验证未做**——用户需 `cargo build --release` 替换 `claw.exe` 后真机跑一轮确认
+
+### 下次接手真机判读 grep 命令清单
+
+```bash
+LOG="E:/NW工程/资料库/html/claw_glm_diag.log"
+
+# ① SSE 流超时是否还触发——改造后文案应含 "360s 无新事件"（不再是 "180s"）
+grep "SSE 流超时" "$LOG" | tail -5
+
+# ② send_raw_request 超时是否触发——改造后 reqwest is_timeout 错误会走 is_retryable 重试
+#    若 GLM 网关持续挂死，send_with_retry 重试 8 次后返回 RetriesExhausted
+grep "timed out after 600s" "$LOG" | tail -5
+
+# ③ fallback 路径是否还卡死——看 stream_with_provider 超时后是否还在 600s+ 间隔发请求
+grep -E 'lane=subagent.*agent-1786945537624322000' "$LOG" | tail -20
+```
+
+### 教训（写给下次接手，第十七步）
+
+1. **文案与常量必须同步**——`SSE_EVENT_TIMEOUT=360s` 但文案写"180s 无新事件"，诊断时直接误判超时阈值。**下次接手遇报错文案与代码常量对不上的情况，第一步 grep 报错文案字符串，确认它引用的常量是否一致**。修法：文案用 `format!("{}", CONST.as_secs())` 据实格式化，别硬编码数字。
+2. **`reqwest::Client` 的 `.connect_timeout()` 不是整体请求超时**——它只管 TCP 连接建立阶段。连接建立后等响应头、读响应体，`.connect_timeout()` 不管。**下次接手遇"网关挂死但 TCP 活着"类 bug，查 `reqwest::Client::builder()` 是否设了 `.timeout()`（整体请求超时）；没设就给单次请求的 `RequestBuilder` 加 per-request `.timeout()`**。per-request 比 client-level 灵活——流式响应体读取不受单次 `send().await` 超时影响。
+3. **`ApiError` variant 要先查再写**——本次第一版手写 `ApiError::Network { message: ... }`，编译报 E0599 "no variant named `Network`"。`ApiError` 只有 `Http(reqwest::Error)` / `Api{...}` / `ContextWindowExceeded{...}` 等 variant。**下次接手要构造新错误类型，先 `read_file error.rs` 查现有 variant**，别凭名字猜。本次最终用 per-request `.timeout()` 让 reqwest 自己产生 `Http(reqwest::Error)`（`is_timeout()` 为 true），`is_retryable()` 自动判断重试，不需要手写新 variant。
+4. **三层超时体系要分清**——claw 现在有**三层**超时机制，每层管不同东西：
+   - **SSE_EVENT_TIMEOUT=360s**（`stream_with_provider`）：SSE **事件间**超时，防 GLM 生成卡死。**只对流式路径生效**。
+   - **HTTP_REQUEST_HARD_TIMEOUT=600s**（`send_raw_request` per-request `.timeout()`）：单次 HTTP **连接 + 等响应头**超时，防网关挂死。**流式初始连接 + 非流式 fallback 都走这条**。
+   - **STALE_SECS=600s / HARD_TIMEOUT=1800s**（`spawn_agent_job`）：子 agent **心跳静默** + **硬上限**超时，主线程判 detached 子线程死活。**只对子 agent 路径生效**。
+   **下次接手遇"某层超时不生效"，先确认是哪层：是 SSE 事件间？HTTP 连接？还是心跳静默？**三层独立，改一层不影响另两层。
+5. **非流式 fallback 是隐藏的卡死点**——`stream_with_provider` 在 SSE 超时后走 `send_message(...stream: false...)` fallback（`tools/src/lib.rs:5768`）。这个 fallback 之前**没有任何超时保护**，GLM 网关挂死时无限阻塞。**下次接手遇"流式超时后整体卡死"，第一步查 fallback 路径的 `send_message` → `send_with_retry` → `send_raw_request` 链是否有超时保护**。本次修法是 per-request `.timeout(600s)`，让 reqwest 自己产生 timeout error 走 `is_retryable()` 重试。
+
+---
+
+## ★ 2026-08-17 主 agent 路径原缺 SSE 事件间超时（本次会话，接上条）
+
+### 背景
+
+上一条修完 SSE 流超时 fallback 后真机跑，子 agent `read-pwd-code`（`agent-1786945537624322000`）t=1786946245 判 stale（600s 静默，心跳 21 次），主 agent 输出"子 agent 超时了，我直接读取关键文件"接手。**主 agent 接手后连续多轮调 `read_file` / `grep_search` 读文件，任务最终成功完成——全程没报"SSE 流超时"**。
+
+用户追问：主子都是同一个 GLM-5.1、同 200K 上下文，**为什么子 agent 超时、主 agent 接手后不超时？**
+
+### 已证伪的假设（写给下次接手，别再踩）
+
+| # | 假设 | 证伪证据 |
+|---|---|---|
+| ① | "主 agent 没接手，还是子 agent 在跑" | 用户贴 CLI 上下文铁证：主 agent 接手后自己调了 `read_file` / `grep_search`（如 `chatcmpl-tool-afa61bb6f2e1fcf4` 调 `grep_search` 搜 `function httpRequest`）。**主 agent 确实接手了**。 |
+| ② | "主 agent 接手时上下文更干净" | 错。子 agent 刚启动时上下文是零（只有 `job.prompt`），主 agent 接手时上下文反而已经有 12K（用户问题 + 派子 agent 的 tool_use 块 + stale 摘要）。**主 agent 上下文更大，不是更干净**。 |
+| ③ | "主 agent 只读了 4 个文件" | 错。用户补充 `grep_search` 证据说明主 agent 接手后调了多次工具，远不止 4 个 `read_file`。 |
+| ④ | "主 agent 路径跟子 agent 走同一个 `stream_with_provider`，都有 360s SSE 超时" | 错。主 agent 走 `AnthropicRuntimeClient::consume_stream`（`main.rs:9032`），子 agent 走 `ProviderRuntimeClient::stream` → `stream_with_provider`（`tools/lib.rs:5556/5633`）。**两条路径是不同实现**。 |
+
+### 真凶：主 agent 路径根本没有 SSE 事件间超时检测
+
+主 agent 路径 `AnthropicRuntimeClient::consume_stream`（`main.rs:9032`）的 SSE 循环（`main.rs:9095-9240`）原本只有：
+
+- **`POST_TOOL_STALL_TIMEOUT=10s`**（`main.rs:170`）：只在"工具执行后恢复流式，等第一个事件"时生效（`apply_stall_timeout && !received_any_event`）。
+- 收到第一个事件后（`received_any_event = true`），`stream.next_event()` 在 `main.rs:9147/9154` **直接 await，没有 `tokio::time::timeout` 包裹**。
+
+**主 agent 不报"SSE 流超时"的真正原因**：它的 `consume_stream` 代码路径**根本没有事件间超时检测**，所以"不报超时"≠"没卡死"。
+
+主 agent 那次能顺利完成任务，是因为**GLM 网关 SSE 卡死是偶发的**——主 agent 接手后没撞上。但这不代表主 agent 路径有保护——**主 agent 路径在 GLM 网关 SSE 卡死时会无限阻塞**，这是个真实 bug。
+
+### 修法（一处）
+
+`main.rs:170` 加 `SSE_EVENT_TIMEOUT=360s` 常量（对齐子 agent `tools/lib.rs:5648`）。
+
+`consume_stream` 的两个裸 `stream.next_event()` await 点（`main.rs:9147/9154`）包 `tokio::time::timeout(SSE_EVENT_TIMEOUT, ...)`，超时即 `break` 走非流式 fallback（`main.rs:9260` 的 `send_message(...stream: false...)`）。
+
+| 路径 | 实现 | SSE 事件间超时（修复前） | SSE 事件间超时（修复后） |
+|---|---|---|---|
+| 子 agent | `tools/lib.rs:5633 stream_with_provider` | ✅ `SSE_EVENT_TIMEOUT=360s` | ✅ 不变 |
+| 主 agent | `main.rs:9032 AnthropicRuntimeClient::consume_stream` | ❌ **没有事件间超时**——`stream.next_event()` 直接 await，GLM 网关 SSE 卡死时无限阻塞 | ✅ `SSE_EVENT_TIMEOUT=360s`，超时 break 走非流式 fallback |
+
+### 验证状态
+
+- ✅ `cargo check --workspace` 全绿零 warning
+- ⏳ **真机验证未做**——用户需 `cargo build --release` 替换 `claw.exe` 后真机跑一轮确认
+
+### 下次接手真机判读 grep 命令清单
+
+```bash
+LOG="E:/NW工程/资料库/html/claw_glm_diag.log"
+
+# ① 主 agent 路径 SSE 超时是否触发——改造后应出现 "consume_stream: SSE 流超时"
+grep "consume_stream" "$LOG" | tail -5
+
+# ② 主 agent 接手后是否走非流式 fallback——改造后 SSE 超时会 break 走 send_message
+grep "SSE 流超时" "$LOG" | tail -5
+```
+
+### 教训（写给下次接手，第十八步）
+
+1. **主子 agent 走不同 stream 实现**——主 agent 走 `main.rs:9032 AnthropicRuntimeClient::consume_stream`，子 agent 走 `tools/lib.rs:5556 ProviderRuntimeClient::stream` → `5633 stream_with_provider`。**两条路径是不同实现，超时保护不对齐**。下次接手遇"主子行为不一致"类 bug，第一步确认两边走的是不是同一个 `stream` 实现——`grep -n "impl ApiClient for" rust/crates/` 列出所有 `ApiClient` 实现。
+2. **"不报超时"≠"没卡死"**——主 agent 路径原缺 SSE 事件间超时检测，GLM 网关 SSE 卡死时无限阻塞但**不报错**。用户看到"主 agent 接手后顺利跑完"以为主 agent 路径有保护，实际上只是那次没撞上偶发的 GLM 网关卡死。**下次接手遇"X 不报超时但行为异常"，第一步查 X 的代码路径有没有超时检测——`grep -n "tokio::time::timeout" <file>`**。没超时检测的路径，"不报超时"就是"无限阻塞"的伪装。
+3. **三层超时体系要分清（更新版）**——claw 现在有**四层**超时机制：
+   - **SSE_EVENT_TIMEOUT=360s**（子 agent `tools/lib.rs:5648` + 主 agent `main.rs:170`）：SSE **事件间**超时。**本次修复让主 agent 路径也有这层**。
+   - **HTTP_REQUEST_HARD_TIMEOUT=600s**（`send_raw_request` per-request `.timeout()`）：单次 HTTP **连接 + 等响应头**超时。
+   - **POST_TOOL_STALL_TIMEOUT=10s**（`main.rs:170`，仅主 agent）：工具执行后恢复流式，等**第一个事件**的超时。**注意：这层只管"第一个事件"，不管"事件间"**——这是为什么主 agent 路径原缺事件间超时。
+   - **STALE_SECS=600s / HARD_TIMEOUT=1800s**（`spawn_agent_job`）：子 agent **心跳静默** + **硬上限**超时。
+   **下次接手遇"某层超时不生效"，先确认是哪层**。四层独立，改一层不影响另三层。
+4. **已证伪的假设要记录，别让下次接手再踩**——本次证伪了 4 个假设（"主 agent 没接手"、"主 agent 上下文更干净"、"主 agent 只读了 4 个文件"、"主子走同一个 stream_with_provider"）。**这些假设听起来都"合理"，但全是错的**。下次接手遇类似"为什么 X 不超时"问题，**先查代码路径，别凭"模型能力一样所以应该一样"的直觉判断**。直觉在"两条不同代码路径"面前是失效的。
+5. **用户的反例补充是金矿**——用户补充 `grep_search` 工具调用证据（`chatcmpl-tool-afa61bb6f2e1fcf4`）直接证伪了"主 agent 只读 4 个文件"的假设。**下次接手遇自己的判断跟用户观察冲突时，第一步请用户补充 CLI 上下文 / 日志证据**，别固执己见。用户视角的 CLI 渲染 + 日志硬证据结合起来，才能定位真凶。
+
+---
+
+## ★ 2026-08-17 修订：SSE 超时改为"只在等首个事件 600s 超时，工具调用期间不超时"（本次会话，接上条）
+
+### 上一条修复已证伪，要修订
+
+上一条（"主 agent 路径原缺 SSE 事件间超时"）给主 agent `consume_stream` 加了 `SSE_EVENT_TIMEOUT=360s` + `break` 走非流式 fallback。**这违背了 2026-07-30 自适应判活的设计意图**（MEMORY 第 1170-1231 行）：死切超时是反 agentic 的，子 agent 跑得慢但没挂时不该硬切。同样 360s 流内事件间超时，会把 GLM 5-6 分钟大段生成期间的正常间隔误判成超时硬切。
+
+用户 henry 钉回原定义（原话）：**"不管是主 agent 还是子 agent，只要还在调用工具，即便没有请求云端 LLM 都不能算作超时。超时的定义是：一个工具调用之后，把调用结果上传到云端，并且等了 600s 后都没返回，这才算超时。"**
+
+### 修订后的超时定义（写入代码注释）
+
+| 阶段 | 行为 | 超时？ |
+|---|---|---|
+| 工具调用期间（本地 read_file / grep_search） | 不发云端请求 | **不算超时**——本地跑，没法"上传云端等返回" |
+| 把工具结果上传云端，等第一个 SSE 事件 | GLM 网关 TCP 活着但不发 | **600s 没返回才算超时**，走非流式 fallback |
+| 收到首个事件后，流内事件间 | GLM 5-6 分钟大段生成间隔 | **不超时**——收到首事件后流内不再有任何 timeout，正常大段生成不被硬切 |
+
+### 修订改动（两处）
+
+| # | 改动 | 文件 |
+|---|---|---|
+| ① | **主 agent `consume_stream`**：删掉刚加的 `SSE_EVENT_TIMEOUT=360s` 常量 + 两个 `tokio::time::timeout` 包裹点（回退到原裸 `stream.next_event().await`）。把 `POST_TOOL_STALL_TIMEOUT` 从 10s 改 600s；入口 `consume_stream(..., apply_stall_timeout = attempt == 1)`（原 `is_post_tool && attempt == 1`）——**所有请求**都生效首事件超时，不只 post-tool。`max_attempts` 那段"post-tool stall 时 nudge 重发"保持原样。 | `rusty-claude-cli/src/main.rs:170, 9004, 9013` |
+| ② | **子 agent `stream_with_provider`**：删掉 `SSE_EVENT_TIMEOUT=360s` 常量 + 流内 `tokio::time::timeout` 包裹。加 `SSE_FIRST_EVENT_TIMEOUT=600s` + `received_any_event: bool` 标志位——**只在等首个事件时**包 `tokio::time::timeout`，收到首事件后置 `received_any_event=true`，后续 `stream.next_event()` 裸 await，不再有任何 timeout。GLM 5-6 分钟大段生成期间不被硬切。 | `rust/crates/tools/src/lib.rs:5643-5673` |
+
+### 修订后的四层超时体系（更新版）
+
+| 层 | 值 | 作用域 | 触发条件 |
+|---|---|---|---|
+| **SSE 首事件超时** | 600s | 主子都有（主 `POST_TOOL_STALL_TIMEOUT=600s` + 子 `SSE_FIRST_EVENT_TIMEOUT=600s`） | 把工具结果上传云端后，等首个 SSE 事件 600s 没收到——GLM 网关卡死（TCP 活但永久不发）。**只在等首事件窗口生效，收到首事件后不再触** |
+| **HTTP_REQUEST_HARD_TIMEOUT** | 600s | `send_raw_request` per-request `.timeout()` | 单次 HTTP 连接 + 等响应头超时，防网关挂死。流式初始连接 + 非流式 fallback 都走这条 |
+| **STALE_SECS / HARD_TIMEOUT** | 600s / 1800s | 子 agent `spawn_agent_job` | 心跳静默 + 硬上限，主线程判 detached 子线程死活 |
+| ~~SSE_EVENT_TIMEOUT=360s（流内事件间）~~ | — | — | **已删**——违背"工具调用期间不超时"定义，把 GLM 5-6 分钟大段生成误判成超时硬切 |
+
+### 验证状态
+
+- ✅ `cargo check --workspace` 全绿零 warning
+- ⏳ **真机验证未做**——用户需 `cargo build --release` 替换 `claw.exe` 后真机跑一轮确认
+
+### 下次接手真机判读 grep 命令清单
+
+```bash
+LOG="E:/NW工程/资料库/html/claw_glm_diag.log"
+
+# ① 首事件超时是否触发——改造后应出现 "等首个 SSE 事件超时" 或 "post-tool stall"
+grep -E "等首个|post-tool stall" "$LOG" | tail -5
+
+# ② 流内 360s 硬切是否消失——改造后不应再有 "SSE 流超时 360s" 文案
+grep "SSE 流超时 360s" "$LOG" | tail -5    # 应为空
+```
+
+### 教训（写给下次接手，第十九步）
+
+1. **加超时前先核 MEMORY 看有没有"反死切"的既定设计**——本次首版给主 agent 加 `SSE_EVENT_TIMEOUT=360s` break，直接违背了 2026-07-30 已落地的"自适用判活"范式（MEMORY 第 1170-1231 行）。**下次接手遇超时相关改造，第一步 grep MEMORY `超时\|deadline\|判活\|死切`**，看有没有既定范式要对齐——别另起一套死切。
+2. **"工具调用期间不算超时"是用户既定原则**——用户 henry 的原话："只要还在调用工具，即便没有请求云端 LLM 都不能算作超时"。**下次接手设计任何超时机制，先确认它会不会在工具执行期间误触**——超时只能作用在"等云端返回"的窗口，不能作用在本地工具跑的窗口。
+3. **收到首事件后流内不再有 timeout**——GLM 5.1 大段内容生成期间 5-6 分钟不发新事件是正常的，流内事件间 timeout 会误切。**下次接手看 `stream.next_event()` 有没有包 `tokio::time::timeout`，确认它是不是只在"等首事件"窗口生效**——收 `received_any_event` 标志位后裸 await 才对。
+4. **修订记录要留，已证伪的修复也要写**——本次上一条"主 agent 路径原缺 SSE 事件间超时"已经被证伪（加 360s break 违背反死切意图），但 MEMORY 保留那条 + 本次修订，让下次接手看到**完整推理链**：从误判→修复→用户反驳→修订→正确范式。**下次接手遇自己上一轮的修复被证伪，别删原记录，追加修订段**——删了就看不到教训。
+
+---
+
+## ★★★ 2026-09-03 缓存命中率长效修复：模型名识别失配根因 + glm-5.1-only 老机制 / 其他模型高缓存命中模式（本次会话，multi-provider-subagent 分支）
+
+### 用户提问 → 日志诊断 → 根因确认
+
+用户问：**GLM-5.2（1M 上下文）同时用于 claw-code 主 agent 和子 agent 时，为什么云端 LLM 缓存命中率不如 atomcode-main0903 高？**
+
+扒 `E:\NW工程\资料库\html\claw_glm_diag.log`（38.5MB，2026-08-28 05:00-07:00 约 3 小时窗口，372 次请求）实测：
+
+| lane | 请求数 | 请求体 model 实测 | 总 prompt tokens | cache_read | 命中率 | cache_read 峰值 |
+|---|---|---|---|---|---|---|
+| main | 107 | `GLM-5.2` | 2,881,828 | 2,006,631 | **69.6%** | **仅 42,240** |
+| subagent | 264 | `DeepSeek-V4-Flash-0731`（scnet 网关自动路由） | 6,263,117 | 5,006,848 | **79.9%** | **仅 50,176** |
+
+**铁证三连**：① 3 小时 **31 次 auto_compact**（主 7 / 子 24），threshold 全部 **55000**（默认兜底值！）；② cache_read 天花板 42-50K ≈ 55K 阈值——缓存刚爬起来就被 compact 砍掉重盖；③ 该网关（api.scnet.cn）是自动前缀缓存，`cache_creation`/`hit`/`miss` 全程 0，请求体里 744 处 `cache_control` 是死字节（网关忽略）。
+
+**根因链（已核实）**：网关配置/回显的 model 名（`GLM-5.2`、`DeepSeek-V4-Flash-0731`）与 `api/src/providers/mod.rs` 的 `model_token_limit` 表内小写精确名（`"glm-5"|"glm-5.1"`、`"deepseek-v4-pro"`、`"deepseek-v4-flash"`）不匹配 → 查表返回 `None` → 主 lane `main.rs` 的 `if let Some(limit)` 整段静默跳过、子 lane `build_agent_runtime` 同样跳过 → 动态阈值没设，回落 `DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD=55000` → 1M 窗口的 GLM-5.2 按 55K 硬压摘要 → 前缀字节彻底改变 → 缓存永远积累不到 50K 以上。
+
+**用户确认**：之前用 `deepseek-v4-pro`（恰好精确命中表内条目 → 750K 阈值 → 87 轮 0-1 次 compact → cache_read 峰值 378-405K）命中率正常。就是这个原因。
+
+**atomcode 高命中率的对照机制**（atomcode-main0903 源码核实）：① 不发 cache_control，纯靠请求字节稳定性；② compaction stub 单调提交、冻结、net-loss guard 拒绝重写，每轮至多尾部破坏一次然后冻结，低于阈值零改写（纯 append-only）；③ `x-atomcode-session-id` 会话亲和 header，task 子代理与父会话**同 id**（还规避 GLM-5.2 拒绝并发 DISTINCT-session 请求的坑）。
+
+### 用户决策
+
+长效修复机制：**只有 `glm-5.1` 维持当前这种缓存压缩机制（老激进压缩）；其他情况（主 agent 或子 agent 用 glm 系列其他型号、deepseek 系列）都采用高缓存命中模式。**
+
+### 落地改动（4 文件，双 lane 同套分支）
+
+| 文件 | 改动 |
+|---|---|
+| `api/src/providers/mod.rs` | ① 新增 `model_registry_key()` 归一化：小写 + 剥路径前缀/方括号后缀 + 剥尾部**纯数字≥3位**段（`DeepSeek-V4-Flash-0731`→`deepseek-v4-flash`；含点版本段 `4.1`/`5.2` 不剥）；② `model_token_limit` 改用归一化 key 查表 + **新增 `"glm-5.2"` 条目（1M 窗口，max_output 128K）** + `_` 分支加前缀兜底（`glm-5.2*`→1M / `glm-5.*|glm5.*`→200K / `deepseek-v4-pro*`→1M / `deepseek-v4-flash*`→128K，**glm-5.2 前缀判断必须先于通用 glm-5 前缀**）；③ 新增 `pub fn is_glm51_cache_model()`——仅 `glm-5.1`（大小写不敏感、容忍日期后缀）返回 true；④ `api/src/lib.rs` 导出 `is_glm51_cache_model`。`max_tokens_for_model` 内部走 `model_token_limit`，自动受益无需改 |
+| `runtime/src/micro_compact.rs` | ① 新增 runtime 本地 `pub fn is_glm51_cache_model()`——**与 api 侧同名同源的副本**（runtime 不依赖 api crate，循环依赖禁令，对齐 `should_use_compact_receipt` 先例；**改任一份务必同步另一份**）；② `microcompact_session()` 加第三参 `high_cache_mode: bool`——`true` 时常规 snip/清空整体跳过（历史字节完全稳定），**仅保留 emergency 清**（output ≥ `EMERGENCY_CLEAR_THRESHOLD=500K` 字符的巨型输出仍清成占位符，防撑爆上下文的安全网）；③ `lib.rs` 导出；④ 新增 2 测试（routine 跳过 + emergency 保留） |
+| `runtime/src/conversation.rs` | ① `ConversationRuntime` 加字段 `microcompact_high_cache_mode: bool`（默认 false）；② `run_turn` 的 `microcompact_session` 调用点透传该字段；③ 新增 `with_cache_mode_for_model(model)` 构造器——`!is_glm51_cache_model(model)` 一次性设定模式位；④ 新增读取器 `microcompact_high_cache_mode()`；⑤ 新增测试 `with_cache_mode_for_model_only_glm51_keeps_legacy_compaction` |
+| `rusty-claude-cli/src/main.rs` | 主 lane `build_runtime_with_plugin_state` 接线：`runtime.with_cache_mode_for_model(&model)` 后按 `api::is_glm51_cache_model` 分支——glm-5.1 走 `with_model_context_window`（**保留 env 覆盖能力**，.claw.json 里 GLM 时代配置继续生效）；其他走 `with_model_context_window_strict(窗口, max_tokens_for_model)`（**不读任何 env**，用户 GLM-5.1 时代配的 `CLAUDE_CODE_AUTO_COMPACT_*` 旧值不顶回 1M 窗口）。api 层归一化后网关回显名也能命中查表，动态阈值真正生效 |
+| `tools/src/lib.rs` | 子 agent lane `build_agent_runtime` 接线：`runtime.with_cache_mode_for_model(resolved_model)`（strict 阈值段照旧不动——子 lane 本就不读 env） |
+
+### 修复后的行为矩阵
+
+| model（任意大小写/日期后缀变体） | microcompact | auto-compact 阈值 | env 覆盖 |
+|---|---|---|---|
+| `glm-5.1`（唯一例外） | 老机制：常规 snip/清空照跑 | (200K-64K)×75%=102K，或 env 显式值 | ✅ 保留 |
+| `glm-5.2` / glm 系其他 | 高缓存模式：只留 emergency 清 ≥500K | (1M-64K)×75%≈702K（strict） | ❌ 忽略 |
+| deepseek 系（含 `-0731` 快照名） | 同上 | (1M-8K)×75% 或 (128K-8K)×75%（strict） | ❌ 忽略 |
+| claude / 未知 | 同上 | 窗口查表命中则 strict，未命中 55K 兜底 | — |
+
+### 验证状态
+
+- ✅ `cargo check --workspace` 全绿零新增 warning
+- ✅ `cargo test -p api --lib` 163 passed 0 failed（含新增 3 条：归一化查表 / 前缀兜底 / is_glm51_cache_model）
+- ✅ runtime 新增 3 测试全过（high_cache_mode routine 跳过 / emergency 保留 / with_cache_mode_for_model 矩阵）；`microcompact_clears_old_large_results_only` FAILED 是 MEMORY 第 24 条已记预存债（git stash 已核实），非本次引入
+- ✅ `scripts/fmt.sh --check` 干净（fmt 报的 diff 已格式化修掉）
+- ✅ clippy 9 条 warning 全预存（file_ops ×7 + micro_compact 旧代码 `map_or`/`iter().any()` ×2），零新增
+- ⏳ **真机验证未做**——用户需 `cargo build --release` 替换 `claw.exe` 后真机跑一轮。判读 grep 清单：
+
+```bash
+LOG="E:/NW工程/资料库/html/claw_glm_diag.log"
+# ① auto_compact 频率应骤降 + threshold 不再是 55000（GLM-5.2 应 ~702K）
+grep -E "^==== claw_auto_compact" "$LOG" | grep -oE "threshold=[0-9]+" | sort | uniq -c
+# ② microcompact 事件应大幅减少（高缓存模式只留 emergency）
+grep -c "^==== claw_microcompact" "$LOG"
+# ③ cache_read 峰值应突破 50K 天花板爬向几十万
+grep -oE "cache_read=[0-9]+" "$LOG" | sort -t= -k2 -n | tail -5
+```
+
+### 已知未做（本次不动，留债）
+
+1. **`x-atomcode-session-id` 式会话亲和 header 未做**——atomcode 有而 claw 无；子 agent 冷启动首轮必 miss（本次日志实测仅 23K tokens 影响小，暂不值当动 HTTP 层）。
+2. **请求体 744 处 `cache_control` 死字节未删**——对 scnet/DeepSeek 网关是 Ignored，对真 Anthropic 后端正确生效（claw 多后端 CLI），保留无害；下次接手若确认所有目标网关都自动前缀缓存可考虑按 provider 分支。
+3. **auto_compact 摘要折叠仍是非单调全量重写**——高缓存模式下阈值 ~702K，触发频率大降但触发瞬间仍击穿整段前缀。atomcode 的"单调 stub + 冻结 + net-loss guard"机制（`compaction.rs` 头注释）值得下次对照移植。
+
+### 下次接手清单（更新）
+
+33. ★ 2026-09-03 新增（缓存命中率长效修复）：**`is_glm51_cache_model` 有两份同名实现**——`api/src/providers/mod.rs`（导出 pub）与 `runtime/src/micro_compact.rs`（runtime 不依赖 api 的循环依赖副本），**语义必须保持一致，改任一份务必同步另一份**（对齐 `command_exists`/`should_use_compact_receipt` 的"跨 crate 同名函数先 diff"教训）。判定语义：仅 `glm-5.1`（大小写不敏感、容忍 `/` 路径前缀、`[1m]` 方括号、`-0731` 日期后缀）→ true；其他一切 → false。**model_token_limit 的前缀兜底分支里 `glm-5.2*` 判断必须排在 `glm-5.*` 通用前缀之前**，否则 1M 窗口被误压成 200K。归一化只剥尾部**纯数字≥3 位**段——`glm-5` 的个位段和 `4.1`/`5.2` 含点版本段不剥，别把版本号剥没了。
+34. ★ 2026-09-03 新增（扒日志教训）：判"动态阈值是否生效"别只看代码——**先扒日志里 `claw_auto_compact` 的 threshold 值**。threshold=55000（默认兜底值）+ compact 频繁 = `model_token_limit` 查表失败的指纹；threshold=模型窗口 75% = 动态阈值生效。cache_read 峰值贴着阈值走也是同一指纹（缓存刚爬到阈值就被砍）。
+
+### ★★ 2026-09-03 追加（用户两条补充决策，同会话落地）
+
+1. **glm-5.1 子 agent auto-compact 阈值 102K→160K**：`tools/src/lib.rs` 新增 `subagent_auto_compact_threshold(model)`——glm-5.1（含大小写/日期后缀变体）返回 `Some(160_000)`，其他模型返回 `None` 走 strict 动态公式；`build_agent_runtime` 改成 `if let Some(threshold)` 优先分支（`with_auto_compaction_input_tokens_threshold`），else-if 才走 `with_model_context_window_strict`。**用户理由**：160K 阈值下压缩后保留内容以 **<40K 为宜**（200K − 160K = 40K 余量）；102K 触发过早频繁 compact 击穿前缀缓存。**溢出风险已记**：160K input + 64K max_output > 200K 窗口，over-size 400 由 `conversation.rs` 降级重试路径兜底（≤3 次）。2 个测试在 `subagent_threshold_tests` mod。
+2. **高缓存模式去掉 cache_control 标记**：`api/src/cache_control.rs` 新增 `CacheConfig::disabled()` 构造器（enabled=false，`control()` 返回 None → `add_cache_breakpoints`/`add_tools_cache_marker` 全变 no-op）；两个 client 构造点按 `is_glm51_cache_model` 分支——仅 glm-5.1 走 `CacheConfig::from_env()`（真 Anthropic 协议后端需要标记），其他模型（glm-5.2/deepseek 系等自动前缀缓存网关）走 `disabled()` 省掉每请求 2 处标记的死字节。**主 lane `main.rs:8950` 有个 E0382 坑**：struct 字面量里 `model,` 字段先 move 掉 model，`cache_config: if ...(&model)` 再借用就编译错——**修法是把 cache_config 计算提到 `Ok(Self{...})` 之前存局部变量**（tools 侧 `resolved.model` 是引用无此坑）。子 agent lane 判定用 `resolved.model`（子 agent 实际调度的 model 名），不是主 LLM env。1 个测试 `cache_config_disabled_is_noop_for_both_marker_kinds`（断言序列化后请求体不含 cache_control 字节）。
+
+**验证状态（追加）**：`cargo check --workspace` 全绿（修掉 E0382 后）；`cargo test -p api --lib` 164 passed（cache_control mod 14 条全过含新增 1 条）；`cargo test -p tools --lib subagent_threshold_tests` 2 passed；`scripts/fmt.sh --check` 干净；clippy 零新增（tools 2 条在 `resolve_auth_source`/over_size kind 既有代码段，runtime 9 条全预存）。⏳ **真机验证未做**——除上一节的 grep 清单外，追加两条：① glm-5.1 子 agent 的 `claw_auto_compact` threshold 应为 160000；② glm-5.2/deepseek 请求体里 `"cache_control"` 命中数应降为 0（glm-5.1 请求仍保留）。
+
+---
+
+## ★★★ 2026-09-03 auto-compact 机制对齐 claude-code 重做（本次会话，落地 docs/compact_rework_plan.md Step 1-5 + Step 6 占位）
+
+### 背景
+
+按同日写好的 `docs/compact_rework_plan.md` 落地三个问题：**P1** `maybe_auto_compact` 读 `cumulative_usage().input_tokens` 判断触发——cumulative 是跨 turn 累加的计费值只增不减，一旦破阈值每轮都满足，2-3 轮压一次停不下来（3 小时 31 次 auto_compact 的根因）；**P2** pre-flight（char 粗估）+ turn 后（回执）双触发点口径不一致，turn 后触发多一次前缀击穿；**P3** 阈值 75% 常数公式 + env 可任意拖后 + 无熔断。**§6 不许动清单全部未触碰**（is_glm51_cache_model 双副本 / 高缓存模式 / cache_control 禁用 / over_size_400 reactive / strict 不读 env），api 164 条锁定测试全绿。锚点可用性依据同日上午会话的日志判读（8-28 日志 main/sub 双 lane `input=`/`cache_read=` 都有值）；找不到锚点自动走兜底粗估，行为不差于现状。
+
+### 落地改动（4 文件）
+
+| 文件 | 改动 |
+|---|---|
+| `runtime/src/compact.rs` | ① 新增 `estimate_context_tokens(&Session)`（P1，对齐 claude-code `tokenCountWithEstimation`）：消息末尾向前找最近一条带**真实 usage** 的 assistant 消息当锚点（`is_real_usage` 过滤全零——GLM 不回 input_tokens 的兼容形态），锚点 = input+output+cache_creation+cache_read（服务端报的"当时上下文总量"，天然含 system+tools，不再双算），加锚点之后尾部消息 `estimate_message_tokens` 粗估；找不到锚点 → `estimate_session_tokens + SYSTEM_OVERHEAD_TOKENS(15_000)` 兜底（常量 pub，只加在兜底路径）。② `estimate_message_tokens` 改 `pub(crate)`。③ 3 条新测试（锚点取最近忽略更早大 usage / 全无 usage 兜底 / 全零跳过） |
+| `runtime/src/conversation.rs` | ① `maybe_auto_compact` → `auto_compact_if_needed(snip_tokens_freed: usize)`——**Step 6（G6）占位参数，当前调用方传 0**，真机验证稳定后再接 `microcompact_session` 的 `chars_freed` 折算（÷CJK 比率 ~3）从触发估算扣除（对齐 `snipTokensFreed`）；估算段整体换 `estimate_context_tokens`，**compact 判断路径的 cumulative 读取删除**（验收 #5 已 grep 验证：只剩 TurnSummary.usage 计费字段与 /cost /stats 展示）。② **P2 触发点收敛**：eprintln + `write_auto_compact_diag` 吸收进触发函数；**turn 后触发点删除**；`session_needs_pre_flight_compact` 整个删除（char/4 粗估路径退役——**2026-07-17 第 16 条"pre-flight char/4 误触发嫌疑"随之消解**）；孤儿 `estimate_tokens_mixed` 删除；`TurnSummary.auto_compaction` 字段保留（CLI 渲染/jsonl 兼容），来源改为本轮**请求前**那次 event（`pre_turn_auto_compaction` 局部变量）。③ **P3 阈值公式化**：新增 pub `autocompact_threshold_formula(窗口, max_output)` = `窗口 − min(max_output, 20K 摘要预留) − 13K 缓冲`，下限 55K（对齐 autoCompact.ts:72-91；200K/64K→167K，1M/64K→967K，200K/8K→179K）；`with_model_context_window` **签名加第二参 `max_output_tokens`**（唯一外部调用方 main.rs 同步补 `api::max_tokens_for_model(&model)`），动态值从 `窗口×75%` 换公式（主 lane glm-5.1 动态值 150K→167K）；`with_model_context_window_strict` 签名不变、内部换公式（glm-5.2 1M → 967K；deepseek-v4-flash 1M/8K → 978,808，窗口值按下方"窗口矩阵用户裁定"从 128K 修正）。④ **G4 env min 封顶**：`CLAUDE_CODE_AUTO_COMPACT_WINDOW` 从"替代窗口"改为"**封顶有效窗口**"（`min(模型窗口, env值)` 再进公式）；`INPUT_TOKENS` / `PCT+WINDOW` 算出的阈值与公式默认取 min——**env 只能提前、不能拖后**；逃生口 `CLAUDE_AUTOCOMPACT_THRESHOLD_UNCAPPED=1` 恢复旧替代语义（调试用，默认不设）。⑤ **G5 熔断器**：字段 `auto_compact_consecutive_failures` + 常量 `MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES=3`（对齐 autoCompact.ts:67-70，250K 次/天浪费教训）——压不动（removed=0）计无效返回 None；**压了但压后仍超阈值计无效但事件照发**（TurnSummary/diag 如实记录 compact 确实发生）；生效（removed>0 且压后低于阈值）清零；≥3 熔断停手打 `[auto-compact: ineffective ×N/3 — 熔断停手，交给 over_size_400 reactive 兜底]`；**reactive 降级路径一行未动**（§6）。⑥ **env 测试串行化根治**：`static ENV_TEST_LOCK: Mutex<()>` + `lock_env()` helper，5 条 env 测试上锁——第 25 条坑（并行 set_var 互踩、须 `--test-threads=1`）的 runtime 侧根治，对齐 api crate cache_control 测试的 OnceLock<Mutex> 范式。⑦ 测试：**新增 10 条**（锚点 3 + 公式矩阵 1 + 封顶 4 + 熔断 2……实为 compact 3 + conversation 7）、**修订 6 条**（`auto_compacts_when_cumulative_input_threshold_is_crossed` 重命名 `auto_compacts_when_receipt_anchor_exceeds_threshold` 并改双轮断言——本轮跨阈值 summary=None、下一轮请求前才压；`skips_auto_compaction_below_threshold` 的 usage 99_999→50_000（锚点语义下回执含 output）；strict 3 条 + floor 1 条换公式数值） |
+| `rusty-claude-cli/src/main.rs` | glm-5.1 主 lane 分支调用补第二参：`with_model_context_window(limit.context_window_tokens, api::max_tokens_for_model(&model))` |
+| `runtime/src/lib.rs` | 导出 `estimate_context_tokens` / `SYSTEM_OVERHEAD_TOKENS` / `autocompact_threshold_formula` |
+
+### 语义变化要点（真机判读用）
+
+- **threshold 指纹**：glm-5.1 子 agent 仍 **160000**（用户决策 2026-09-03 不动，`subagent_auto_compact_threshold` 2 测试原样过）；glm-5.2 strict **967000**；deepseek-v4-flash **978808**（1M 窗口，见下方窗口矩阵修正）；主 lane glm-5.1 动态值 150K→**167K**；**55000 只在未知模型兜底出现**。
+- **触发时机**：本轮请求回执跨阈值 → 本轮 `summary.auto_compaction=None`，**下一轮请求前**才压并记到下一轮的 TurnSummary（原"turn 后立刻压"已死；CLI 渲染位置不变）。
+- **熔断开路状态**：连续 3 次无效后 proactive 完全停手（会话原样），日志有 `ineffective ×3/3 — 熔断停手` 指纹。
+
+### ★ 用户配置建议（需要用户动手）
+
+`.claw.json` env 段的 `CLAUDE_CODE_AUTO_COMPACT_WINDOW=131000` 是 GLM-5.1 200K 时代旧值。**封顶语义下它会把 glm-5.1 有效窗口压到 131K → 阈值 98K，反而频繁 compact 反伤缓存**——**建议删掉这条 env**（若 `CLAUDE_CODE_AUTO_COMPACT_PCT_OVERRIDE`/`INPUT_TOKENS` 也设了旧值一并清理）。确需临时拖后阈值调试时设 `CLAUDE_AUTOCOMPACT_THRESHOLD_UNCAPPED=1`。
+
+### 验证状态
+
+- ✅ `cargo check --workspace` 全绿零新增 warning；`scripts/fmt.sh --check` 干净
+- ✅ `cargo test -p api --lib` 164 passed 0 failed（§6 锁定测试未被波及）
+- ✅ runtime：562 passed / 42 failed——**`git stash` 基线对照，失败集逐条 diff 完全一致（42 条全预存债，零新增）**；新增 10 条测试全过
+- ✅ `cargo test -p tools --lib subagent_threshold_tests` 2 passed（160K 决策未破坏）；clippy 与基线逐条 diff 一致（零新增）
+- ⏳ **真机验证未做**——重编 `cargo build --release` 替换 claw.exe 后扒日志：
+
+```bash
+LOG="E:/NW工程/资料库/html/claw_glm_diag.log"
+# ① threshold 指纹：glm-5.1 子 agent=160000；glm-5.2≈967000；主 lane glm-5.1=167000；不应再出现 55000（除非未知模型兜底）
+grep -E "^==== claw_auto_compact" "$LOG" | grep -oE "threshold=[0-9]+" | sort | uniq -c
+# ② compact 频率：同会话内不应再出现 2-3 轮一次的连环 compact（P1 已死）
+grep -E "^==== claw_auto_compact" "$LOG" | wc -l     # 对比修复前 3 小时 31 次
+# ③ 熔断器：出现 "ineffective" 且 ≤3 次后停手
+grep -c "auto-compact: ineffective" "$LOG"
+# ④ 缓存天花板：cache_read 峰值应显著突破旧 42-50K
+grep -oE "cache_read=[0-9]+" "$LOG" | sort -t= -k2 -n | tail -5
+```
+
+### 下次接手清单（更新）
+
+35. ★ 2026-09-03 新增（compact 重做不变量）：compact 触发判断**只有一个入口** `auto_compact_if_needed(snip_tokens_freed)`（run_turn 请求前唯一调用点），估算只认 `estimate_context_tokens`（回执锚点+尾部粗估，**禁止再读 cumulative_usage**——那是计费语义）；阈值公式唯一来源 `autocompact_threshold_formula`（strict 与主 lane 共用，glm-5.1 子 agent 的 160K 用户决策优先于公式）；env 三件套一律 min 封顶只能提前不能拖后（逃生口 UNCAPPED）；熔断 3 次停手。TurnSummary.auto_compaction 记的是"本轮请求前"那次 event，跨阈值当轮是 None——扒日志别把"当轮没 compact"误判成失效。Step 6（G6）snip 联动留了 `snip_tokens_freed` 参数位（当前恒 0），接的时候把 `run_turn` 里 `mc_result.chars_freed` 折算传进去即可，勿改签名。
+36. ★ 2026-09-03 新增（runtime env 测试串行化根治）：`conversation.rs` tests 模块新增 `static ENV_TEST_LOCK: Mutex<()>` + `lock_env()` helper——凡动 `CLAUDE_CODE_AUTO_COMPACT_*` 组 env 的测试开头 `let _env_guard = lock_env();`，并行跑不再互踩（第 25 条"必须 `--test-threads=1`"的坑已根治，但该条保留——历史会话跑旧代码仍会撞）。以后 runtime 加 env 类测试直接复用此 helper，别再靠串行模式。
+    - **第 16 条（2026-07-17）"pre-flight char/4 误触发嫌疑"已消解**——`session_needs_pre_flight_compact` 整个删除，pre-flight 与 turn 后两套口径统一为锚点估算单触发点。
+    - **★★ 本节一处数值已被下方"窗口矩阵用户裁定"推翻**：deepseek-v4-flash 窗口不是 128K 而是 1M，对应 strict 阈值 978,808——本节早前写的 107000 指纹作废，见下节。
+
+### ★★★ 2026-09-03 窗口矩阵用户裁定（V4 Flash 128K 修正为 1M）
+
+**用户原话语义**："glm5.1 走 200K 模式，其他的模型上下文都是 1M，走前缀缓存模式！"
+
+| model | 上下文窗口 | 模式 | 子 agent 阈值（strict 公式） |
+|---|---|---|---|
+| glm-5.1（唯一） | 200K | 老压缩 + env 可覆盖 + 160K 决策 | 160,000（用户决策固定） |
+| glm-5.2 / glm-5.3 等 glm 系 | **1M** | 高缓存命中（前缀缓存） | 967,000（max_output heuristic 64K） |
+| deepseek-v4-pro / v4-flash 全系 | **1M** | 同上 | **978,808**（max_output 8,192 全额预留） |
+
+**修正内容**（`api/src/providers/mod.rs` + 测试 + 陈旧注释）：
+1. `deepseek-v4-flash` 精确条目 + 前缀兜底：128K → **1M**。原 128K 是从 docs/DeepseekAPI/1.md 的 claude-haiku/sonnet→v4-flash 映射关系**推出来**的，不是网关实测——**教训：查表值必须有实测或官方窗口数佐证，映射推断值要标注来源与置信度，否则会被当事实沿袭**。
+2. `glm-5.*` 前缀兜底（glm-5.3 等新小版本）：200K → **1M**（glm-5.1 走精确条目 200K 不受影响）。
+3. 同步测试：`model_token_limit_normalizes_gateway_names` flash 断言 128K→1M；`model_token_limit_prefix_fallback_covers_family_variants` glm-5.3 断言 200K→1M + 新增 flash snapshot 断言。
+4. 陈旧注释清理：main.rs strict 分支注释、conversation.rs 公式文档示例（128K/8K→107K → 200K/8K→179K）。
+
+**验证**：`cargo test -p api --lib` 164 passed 0 failed；`cargo check --workspace`/fmt/clippy 零新增。
+
+37. ★ 2026-09-03 新增（窗口矩阵用户裁定，第 34 条 threshold 指纹判读法的修订）：**仅 glm-5.1 是 200K + 老压缩模式；其余全系（glm-5.2/5.3、deepseek pro/flash）一律 1M + 前缀缓存（高缓存命中）模式**。查表指纹：deepseek-v4-flash=1M（不是 128K——那是映射推断错值，用户已推翻）；glm-5.* 前缀兜底=1M（glm-5.1 走精确条目不受影响）。**子 agent 阈值判读矩阵**：glm-5.1=160000 / glm-5.2=967000 / deepseek-v4-flash=978808（max_output 8,192 全额预留）。扒日志判 threshold 按此矩阵对号，别再用 107000/90K 旧指纹。
+
+

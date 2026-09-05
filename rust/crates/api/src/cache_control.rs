@@ -60,6 +60,21 @@ impl CacheConfig {
         }
     }
 
+    /// **2026-09-03 高缓存命中模式**：显式禁用 cache_control 标记注入的构造器。
+    ///
+    /// 背景：scnet/DeepSeek 类网关走**自动前缀缓存**（`cache_creation`/`hit`/`miss` 全程 0，
+    /// 请求体里的 `cache_control` 被直接忽略——claw_glm_diag.log 实测 744 处死字节）。
+    /// 对这类网关，每个 message-level + tools 标记都在白耗 token。判定入口
+    /// `is_glm51_cache_model`：仅 glm-5.1 老机制保留标记注入（真 Anthropic 协议后端需要），
+    /// 其他模型（glm-5.2 / deepseek 系等高缓存模式）用本构造器禁用。
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            ttl: "5m".to_string(),
+            enabled: false,
+        }
+    }
+
     /// Whether prompt-cache marker injection is enabled.
     #[must_use]
     pub const fn enabled(&self) -> bool {
@@ -218,6 +233,28 @@ mod tests {
         let mut msgs = vec![user_msg("hello")];
         add_cache_breakpoints(&mut msgs, &cfg);
         assert!(msgs[0].cache_control.is_none());
+    }
+
+    /// ★ 2026-09-03 高缓存命中模式：`disabled()` 构造器必须让两类标记注入全部变成 no-op，
+    /// 请求体里不再出现任何 `cache_control` 字节（scnet/DeepSeek 自动前缀缓存网关忽略标记，
+    /// 每个标记都是白耗的 token）。
+    #[test]
+    fn cache_config_disabled_is_noop_for_both_marker_kinds() {
+        let cfg = CacheConfig::disabled();
+        assert!(!cfg.enabled());
+        assert!(cfg.control().is_none());
+
+        let mut msgs = vec![user_msg("hello"), user_msg("world")];
+        add_cache_breakpoints(&mut msgs, &cfg);
+        assert!(msgs.iter().all(|m| m.cache_control.is_none()));
+
+        let mut tools = vec![tool_def("read_file"), tool_def("write_file")];
+        add_tools_cache_marker(&mut tools, &cfg);
+        assert!(tools.iter().all(|t| t.cache_control.is_none()));
+
+        // 序列化后请求体不含 cache_control 字节
+        let v = serde_json::to_value(&msgs).unwrap();
+        assert!(!v.to_string().contains("cache_control"));
     }
 
     #[test]

@@ -28,10 +28,10 @@ pub use providers::openai_compat::{
     OpenAiCompatConfig,
 };
 pub use providers::{
-    detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,
-    model_family_identity_for, model_family_identity_for_kind, model_token_limit,
-    provider_diagnostics_for_model, resolve_model_alias, ModelTokenLimit, ProviderDiagnostics,
-    ProviderKind,
+    detect_provider_kind, is_glm51_cache_model, max_tokens_for_model,
+    max_tokens_for_model_with_override, model_family_identity_for, model_family_identity_for_kind,
+    model_token_limit, provider_diagnostics_for_model, resolve_model_alias, ModelTokenLimit,
+    ProviderDiagnostics, ProviderKind,
 };
 pub use sse::{parse_frame, SseParser};
 pub use types::{

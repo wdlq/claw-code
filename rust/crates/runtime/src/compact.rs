@@ -1,4 +1,5 @@
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+use crate::usage::TokenUsage;
 
 const COMPACT_CONTINUATION_PREAMBLE: &str =
     "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n";
@@ -34,6 +35,48 @@ pub struct CompactionResult {
 #[must_use]
 pub fn estimate_session_tokens(session: &Session) -> usize {
     session.messages.iter().map(estimate_message_tokens).sum()
+}
+
+/// 系统开销估算（token）：系统提示词 + 工具定义始终随请求发送但不计入 session messages。
+/// 只加在兜底粗估路径——锚点路径服务端回执已含系统开销，再加就双算。
+pub const SYSTEM_OVERHEAD_TOKENS: usize = 15_000;
+
+/// 对齐 claude-code `tokenCountWithEstimation`（src/utils/tokens.ts:226-261）的上下文
+/// token 估算——auto-compact 触发判断的数据源（**2026-09-03 P1 修复**）。
+///
+/// - 锚点 = 会话中**最近**一条带真实 usage 的 assistant 消息的回执全量
+///   （input + cache_creation + cache_read + output——服务端报的"当时上下文总量"，
+///   天然包含 system prompt + tools 定义，不需要客户端拼）。
+/// - 估算 = 锚点 + 锚点之后各消息的 [`estimate_message_tokens`] 粗估和（只粗估新增尾巴）。
+/// - 找不到锚点（首轮 / 网关不回 usage / usage 全零的 GLM 兼容形态）→ 全量粗估兜底：
+///   [`estimate_session_tokens`] + [`SYSTEM_OVERHEAD_TOKENS`]。
+#[must_use]
+pub fn estimate_context_tokens(session: &Session) -> usize {
+    for (index, message) in session.messages.iter().enumerate().rev() {
+        let Some(usage) = message.usage.filter(is_real_usage) else {
+            continue;
+        };
+        // 对齐 getTokenCountFromUsage：input + cache_creation + cache_read + output
+        let anchor = usage.input_tokens as usize
+            + usage.output_tokens as usize
+            + usage.cache_creation_input_tokens as usize
+            + usage.cache_read_input_tokens as usize;
+        let tail: usize = session.messages[index + 1..]
+            .iter()
+            .map(estimate_message_tokens)
+            .sum();
+        return anchor.saturating_add(tail);
+    }
+    estimate_session_tokens(session).saturating_add(SYSTEM_OVERHEAD_TOKENS)
+}
+
+/// 真实回执判定：usage 缺失或全零的消息不算锚点——部分网关（如 GLM）不回
+/// `input_tokens`，回执字段全零时锚点会把上下文估成 0，必须继续向前找或走兜底。
+fn is_real_usage(usage: &TokenUsage) -> bool {
+    usage.input_tokens > 0
+        || usage.output_tokens > 0
+        || usage.cache_creation_input_tokens > 0
+        || usage.cache_read_input_tokens > 0
 }
 
 /// Returns `true` when the session exceeds the configured compaction budget.
@@ -445,7 +488,7 @@ fn truncate_summary(content: &str, max_chars: usize) -> String {
     truncated
 }
 
-fn estimate_message_tokens(message: &ConversationMessage) -> usize {
+pub(crate) fn estimate_message_tokens(message: &ConversationMessage) -> usize {
     message
         .blocks
         .iter()
@@ -563,10 +606,12 @@ fn extract_summary_timeline(summary: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_key_files, compact_session, format_compact_summary,
-        get_compact_continuation_message, infer_pending_work, should_compact, CompactionConfig,
+        collect_key_files, compact_session, estimate_context_tokens, estimate_session_tokens,
+        format_compact_summary, get_compact_continuation_message, infer_pending_work,
+        should_compact, CompactionConfig, SYSTEM_OVERHEAD_TOKENS,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+    use crate::usage::TokenUsage;
 
     #[test]
     fn formats_compact_summary_like_upstream() {
@@ -830,5 +875,103 @@ mod tests {
         ]);
         assert_eq!(pending.len(), 1);
         assert!(pending[0].contains("Next: update tests"));
+    }
+
+    fn message_with_usage(text: &str, usage: Option<TokenUsage>) -> ConversationMessage {
+        ConversationMessage {
+            role: MessageRole::Assistant,
+            blocks: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            usage,
+        }
+    }
+
+    /// 锚点路径：最近一条真实回执 = input+output+cache_creation+cache_read 的全量上下文，
+    /// 尾部消息只做逐消息粗估；更早消息的 usage 不参与（它不是"当前上下文大小"）。
+    #[test]
+    fn estimate_context_tokens_uses_latest_receipt_as_anchor() {
+        let mut session = Session::new();
+        // 更早的大 usage 锚点——必须被忽略（不是最近的）
+        session.messages = vec![
+            message_with_usage(
+                "early",
+                Some(TokenUsage {
+                    input_tokens: 99_999,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                }),
+            ),
+            // 真锚点：1000 + 200 + 0 + 4096 = 5296
+            message_with_usage(
+                "anchor",
+                Some(TokenUsage {
+                    input_tokens: 1000,
+                    output_tokens: 200,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 4096,
+                }),
+            ),
+            // 尾部两条：粗估 = len/4 + 1
+            ConversationMessage::user_text("tail-one"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "tail-two".to_string(),
+            }]),
+        ];
+
+        let tail: usize = session.messages[2..]
+            .iter()
+            .map(|m| {
+                m.blocks
+                    .iter()
+                    .map(|b| match b {
+                        ContentBlock::Text { text } => text.len() / 4 + 1,
+                        _ => 0,
+                    })
+                    .sum::<usize>()
+            })
+            .sum();
+
+        let estimate = estimate_context_tokens(&session);
+        assert_eq!(estimate, 5296 + tail);
+        assert!(
+            estimate < 10_000,
+            "不应把更早那条 99_999 的 usage 算进来（它不是当前上下文）"
+        );
+    }
+
+    /// 兜底路径：全部消息无 usage → estimate_session_tokens + SYSTEM_OVERHEAD_TOKENS。
+    #[test]
+    fn estimate_context_tokens_falls_back_to_char_estimate_without_usage() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("hello"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "world".to_string(),
+            }]),
+        ];
+
+        assert_eq!(
+            estimate_context_tokens(&session),
+            estimate_session_tokens(&session) + SYSTEM_OVERHEAD_TOKENS
+        );
+    }
+
+    /// GLM 网关兼容形态：回执字段全零的消息不算锚点（否则上下文会被估成 0），
+    /// 继续向前找——找不到就走兜底粗估。
+    #[test]
+    fn estimate_context_tokens_skips_zero_usage_messages() {
+        let zero = TokenUsage::default();
+        let mut session = Session::new();
+        session.messages = vec![
+            message_with_usage("zero", Some(zero)),
+            ConversationMessage::user_text("tail"),
+        ];
+
+        assert_eq!(
+            estimate_context_tokens(&session),
+            estimate_session_tokens(&session) + SYSTEM_OVERHEAD_TOKENS
+        );
     }
 }

@@ -2524,6 +2524,23 @@ struct AgentInput {
     subagent_type: Option<String>,
     name: Option<String>,
     model: Option<String>,
+    /// ★ 2026-08-15 atomcode task 思想落地：难度路由（对标 atomcode `is_hard` → capable/fast provider）。
+    ///
+    /// atomcode 的 task 机制按 `difficulty` 字段路由 provider：
+    /// - `"hard"` → capable provider（更强模型，处理复杂任务）
+    /// - `"simple"` / 其他 → fast provider（更快更廉，处理简单任务）
+    ///
+    /// claw-code 落地：`difficulty` 字段可选，默认 `"simple"`。`build_agent_runtime` 按难度
+    /// 选 provider——`"hard"` 走主 LLM endpoint（更贵但更强），`"simple"` 走子 agent routing
+    /// 配置的 endpoint（更廉）。这层路由让主 LLM 派活时能按任务复杂度选模型，避免简单任务
+    /// 也走贵模型浪费 token。
+    ///
+    /// **注意**：claw 当前架构里子 agent 一直走 `resolve_subagent_provider` 路由的 endpoint，
+    /// 主 LLM 走主 env endpoint。`difficulty` 字段落地后，`"hard"` 子 agent 会走主 LLM endpoint
+    /// （更强的模型），`"simple"` 子 agent 走原 routing endpoint（更廉的模型）。这是与 atomcode
+    /// `make_fast_provider` / `make_capable_provider` 对应的双 provider 路由。
+    #[serde(default)]
+    difficulty: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2836,6 +2853,10 @@ struct AgentJob {
     prompt: String,
     system_prompt: Vec<String>,
     allowed_tools: BTreeSet<String>,
+    /// ★ 2026-08-15 atomcode task 思想落地：难度路由（对标 atomcode `is_hard`）。
+    /// `"hard"` → build_agent_runtime 走主 LLM endpoint（更强模型）；
+    /// `"simple"` / 其他 → 走原 resolve_subagent_provider routing endpoint（更廉）。
+    difficulty: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -3841,6 +3862,7 @@ where
         prompt: input.prompt,
         system_prompt,
         allowed_tools,
+        difficulty: input.difficulty,
     };
     if let Err(error) = spawn_fn(job) {
         let error = format!("failed to spawn sub-agent: {error}");
@@ -3861,6 +3883,12 @@ where
 /// **2026-07-20 subagent 同步等结果改造**：从 `manifest_file` 读回终态 `AgentOutput`，
 /// 再从 `output_file` 末尾反向解析 `### Final response` 段拿到 `final_text`，
 /// 回填到 `AgentOutput.result` 字段。失败时返回 `None`，调用方回退到原 manifest。
+///
+/// **2026-08-15 atomcode task 思想落地**：回传的 `result` 用 `<task_result>` 块包装 +
+/// `first_line_capped` 截断首行到 200 字符（对标 atomcode `render_task_block` +
+/// `first_line_capped`）。atomcode task 机制的核心节省点：父会话只收到子代理的精简摘要块，
+/// 子代理中间几十轮的 read/grep/edit 全过程不回传父代理。claw-code 之前 `result` 是子 agent
+/// 的完整 final_text 无截断，长 findings 会原样进父会话上下文。现在加硬性截断兜底 persona 软约束。
 fn read_back_terminal_manifest(manifest_file: &str) -> Option<AgentOutput> {
     let manifest_text = std::fs::read_to_string(manifest_file).ok()?;
     let mut terminal: AgentOutput = serde_json::from_str(&manifest_text).ok()?;
@@ -3877,10 +3905,39 @@ fn read_back_terminal_manifest(manifest_file: &str) -> Option<AgentOutput> {
             .unwrap_or(trimmed.len());
         let final_text = trimmed[..end].trim_end().to_string();
         if !final_text.is_empty() {
-            terminal.result = Some(final_text);
+            // ★ atomcode task 思想：精简摘要块回传。
+            // 用 `<task id="..." model="..." state="completed"><task_result>...</task_result></task>`
+            // 块包装，对标 atomcode `render_task_block`。主 LLM 在 tool_result JSON 里通过
+            // `result` 字段直接拿到这个块，子 agent 的完整 final_text 留在子会话不进父上下文。
+            let summary = first_line_capped(&final_text, 200);
+            let model_tag = terminal.model.as_deref().unwrap_or("unknown");
+            terminal.result = Some(format!(
+                "<task id=\"{id}\" model=\"{model}\" state=\"{state}\">\n<task_result>\n{summary}\n</task_result>\n</task>",
+                id = terminal.agent_id,
+                model = model_tag,
+                state = terminal.status,
+                summary = summary,
+            ));
         }
     }
     Some(terminal)
+}
+
+/// ★ 2026-08-15 atomcode task 思想落地：截断首行到 `max` 字符（对标 atomcode `first_line_capped`）。
+/// 取首行 trim，超 `max` 字符按 UTF-8 字符边界截断 + 追加 `…` 省略号。
+/// atomcode 用 48 字符截断 task 面板显示，这里用 200 字符截断回传摘要块——
+/// 比 atomcode 宽（atomcode 摘要块走 `<task_result>` 标签内嵌完整文本，claw 走截断 + 省略号
+/// 因为 claw 子 agent 的 final_text 可能是长 findings 报告，不截断会原样进父会话上下文）。
+fn first_line_capped(s: &str, max: usize) -> String {
+    let first = s.lines().next().unwrap_or("").trim();
+    let char_count = first.chars().count();
+    if char_count > max {
+        // 按 UTF-8 字符边界截断，避免割半多字节字符。
+        let truncated: String = first.chars().take(max - 1).collect();
+        format!("{truncated}\u{2026}")
+    } else {
+        first.to_string()
+    }
 }
 
 /// **2026-07-30 subagent 自适应判活**：硬上限兜底——防真死循环/网关挂死导致永久阻塞。
@@ -3896,7 +3953,11 @@ const DEFAULT_SUBAGENT_HARD_TIMEOUT_SECS: u64 = 1800;
 /// 静默超此阈值即判"已挂"（网关挂死/auto-compact 卡死/死循环），回填 `status="stale"` 提前结束。
 /// GLM 5.1 单事件间隔可达 4-5 分钟（MEMORY 2026-07-23 已证），所以 5 分钟静默才判挂；
 /// 设太小（如 3 分钟）会误杀 GLM 正常的大段内容生成间隔。
-const DEFAULT_SUBAGENT_STALE_SECS: u64 = 300;
+/// **2026-08-17 调到 600s（10 分钟）**：reader 子 agent 跑 grep 大目录 / read_file 大文件时，
+/// 单工具执行轻易 5+ 分钟，300s 误判 stale（agent-1786942156282712600 实测：14 轮心跳后
+/// 300s 静默被判 stale，但 detached 子线程实际还在跑，stale 后又发 13 个请求把子会话
+/// 上下文撑到 70K+ est_tokens——这才是"主 agent 上下文爆掉"的真凶，不是主 agent 自己）。
+const DEFAULT_SUBAGENT_STALE_SECS: u64 = 600;
 
 /// **2026-07-30 subagent 自适应判活**：读 `CLAW_SUBAGENT_TIMEOUT_SECS` env 算硬上限。
 /// env 没设 / 解析失败 / ≤0 → 用 `DEFAULT_SUBAGENT_HARD_TIMEOUT_SECS`（30 分钟）兜底。
@@ -3938,6 +3999,18 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
     let (outcome_tx, outcome_rx) = std::sync::mpsc::channel::<AgentRunOutcome>();
     let manifest_for_timeout = job.manifest.clone();
     let heartbeat_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // **2026-08-17 stale/timeout 后 kill detached 子线程**：创建共享 `HookAbortSignal`，
+    // 一份注入子 agent runtime（`with_hook_abort_signal`），主线程另一份在 break 前 `.abort()`。
+    // 子 agent `run_turn` loop 每轮迭代开头检查 `hook_abort_signal.is_aborted()`（conversation.rs:487），
+    // 收到 abort 即 `return Err("Turn aborted by user")` 退出，不再继续发 API 请求爆 detached 子会话上下文。
+    // 实测证据：agent-1786942156282712600 在 t=1786942510 判 stale 后，detached 子线程又发了 13 个请求
+    // 把子会话上下文撑到 70K+ est_tokens / 283KB——这是"主 agent 上下文爆掉"的真凶，不是主 agent 自己。
+    // **2026-08-17 stale/timeout 后 kill detached 子线程**：共享 abort signal——
+    // 一份 clone 进 spawn 闭包注入子 agent runtime，主线程持原变量在 break 前 .abort()。
+    // `HookAbortSignal` 内部是 `Arc<AtomicBool>` + `Arc<Notify>`，clone 仅增引用计数，
+    // 主线程 clone 与子线程 clone 共享同一 AtomicBool，abort 信号互相可见。
+    let subagent_abort_signal = runtime::HookAbortSignal::new();
+    let subagent_abort_for_thread = subagent_abort_signal.clone();
 
     // 心跳闭包：注入到 runtime 的 `with_heartbeat`，子 agent loop 每轮完成时调一次自增计数器。
     // `Arc<AtomicU64>` 跨线程共享计数器；闭包本身用 `Arc<dyn Fn() + Send + Sync>` 包装——
@@ -3952,6 +4025,9 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
     let builder_result = std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
+            // **2026-08-17 stale/timeout 后 kill detached 子线程**：clone 一份共享 abort signal
+            // 传给 run_agent_job_with_outcome，后者注入子 agent runtime。主线程持另一份在 break 前 abort()。
+            // `subagent_abort_for_thread` 在 spawn 前 clone 好（避免 move 后主线程再用 E0382）。
             // **2026-07-20 panic 兜底**：catch_unwind 包 run_agent_job_with_outcome，
             // panic 时也 send outcome（status="failed", error="sub-agent thread panicked"）。
             // **2026-07-30 心跳注入**：clone Arc 后用裸闭包包一层转 Box<dyn Fn()> 传给 run_agent_job_with_outcome，
@@ -3962,7 +4038,7 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
             let heartbeat_for_call: Box<dyn Fn() + Send + Sync> =
                 Box::new(move || heartbeat_arc_clone());
             let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_agent_job_with_outcome(&job, heartbeat_for_call)
+                run_agent_job_with_outcome(&job, heartbeat_for_call, subagent_abort_for_thread)
             })) {
                 Ok(outcome) => outcome,
                 Err(_) => AgentRunOutcome {
@@ -3997,6 +4073,8 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // 检查 Ctrl+C abort signal。
                 if process_abort_signal().is_some_and(|s| s.is_aborted()) {
+                    // **2026-08-17**：break 前 abort detached 子线程，避免它继续发 API 请求爆上下文。
+                    subagent_abort_signal.abort();
                     let _ = persist_agent_terminal_state(
                         &manifest_for_timeout,
                         "aborted",
@@ -4021,6 +4099,9 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                 }
                 // 静默超时——判"子 agent 已挂"提前结束。回填 `status="stale"` 与硬上限 `timeout` 区分。
                 if stale_secs >= stale_threshold.as_secs() {
+                    // **2026-08-17**：break 前 abort detached 子线程，避免它继续发 API 请求爆上下文。
+                    // 实测 agent-1786942156282712600 在 stale 后又发 13 个请求把子会话撑到 70K+ est_tokens。
+                    subagent_abort_signal.abort();
                     let detail = format!(
                         "sub-agent went stale (no heartbeat for {}s), presumed hung — \
                          last heartbeat count={current_heartbeat}",
@@ -4040,6 +4121,8 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                 }
                 // 硬上限兜底——防真死循环/网关永久挂死。正常情况不会命中（静默超时先触发）。
                 if std::time::Instant::now() >= hard_deadline {
+                    // **2026-08-17**：break 前 abort detached 子线程，避免它继续发 API 请求爆上下文。
+                    subagent_abort_signal.abort();
                     let _ = persist_agent_terminal_state(
                         &manifest_for_timeout,
                         "timeout",
@@ -4109,6 +4192,7 @@ impl Drop for SubagentDiagEnvGuard {
 fn run_agent_job_with_outcome(
     job: &AgentJob,
     heartbeat: Box<dyn Fn() + Send + Sync>,
+    subagent_abort_signal: runtime::HookAbortSignal,
 ) -> AgentRunOutcome {
     // **2026-07-21 子 LLM 诊断日志改造**：在子 agent 线程入口设 `CLAW_SUBAGENT_*` env，
     // api 层 `subagent_diag_context()` 读这三个 env 区分主子流量 + 关联 `.clawd-agents/{id}.json` manifest。
@@ -4118,7 +4202,7 @@ fn run_agent_job_with_outcome(
         job.manifest.subagent_type.as_deref().unwrap_or(""),
     );
     let runtime_result = (|| -> Result<String, String> {
-        let mut runtime = build_agent_runtime(job, Some(heartbeat))?
+        let mut runtime = build_agent_runtime(job, Some(heartbeat), subagent_abort_signal.clone())?
             .with_max_iterations(subagent_max_iterations());
         // **2026-07-19 multiprovider 落地**：把子 agent 的 resolved model 注入 thread-local，
         // dispatch 层的 `current_dispatch_model()` 优先读 thread-local 算 `compact_receipt`。
@@ -4159,6 +4243,7 @@ fn run_agent_job_with_outcome(
 fn build_agent_runtime(
     job: &AgentJob,
     heartbeat: Option<Box<dyn Fn() + Send + Sync>>,
+    subagent_abort_signal: runtime::HookAbortSignal,
 ) -> Result<ConversationRuntime<ProviderRuntimeClient, SubagentToolExecutor>, String> {
     let model = job
         .manifest
@@ -4178,7 +4263,25 @@ fn build_agent_runtime(
         .subagent_type
         .as_deref()
         .unwrap_or("general-purpose");
-    let resolved = resolve_subagent_provider(subagent_type, Some(&model), &routing);
+    // ★ 2026-08-15 atomcode task 思想落地：难度路由（对标 atomcode `is_hard`）。
+    // `"hard"` → resolved 走主 env（base_url=None, auth=None），build_provider_entry_with_override
+    //   走 from_model / from_env 主 LLM endpoint（更强模型）。这是 atomcode `make_capable_provider`。
+    // `"simple"` / 其他 → resolved 走原 resolve_subagent_provider routing endpoint（更廉）。
+    //   这是 atomcode `make_fast_provider`。
+    // 这层路由让主 LLM 派活时能按任务复杂度选模型，避免简单任务也走贵模型浪费 token。
+    let resolved = if job.difficulty.trim().eq_ignore_ascii_case("hard") {
+        // hard 路径：走主 env endpoint（更强模型）。base_url/auth 都 None 让 new_with_resolved
+        // 走 build_provider_entry_with_override(..., None, None) → from_model / from_env。
+        // model 用 job 的 model（主 LLM 那套），不用 routing 配的更廉 model。
+        ResolvedSubagentProvider {
+            model: model.clone(),
+            base_url: None,
+            auth: None,
+        }
+    } else {
+        // simple / 默认路径：走原 routing endpoint（更廉）。
+        resolve_subagent_provider(subagent_type, Some(&model), &routing)
+    };
     let api_client = ProviderRuntimeClient::new_with_resolved(&resolved, allowed_tools.clone())?;
     // 用 resolved.model（可能是 routing 配的 model）算 context window，
     // 而不是 job 的 model（那是主 LLM 的 model 名）
@@ -4198,6 +4301,12 @@ fn build_agent_runtime(
     if let Some(heartbeat) = heartbeat {
         runtime = runtime.with_heartbeat(heartbeat);
     }
+    // **2026-08-17 stale/timeout 后 kill detached 子线程**：注入共享 abort signal。
+    // 主线程在 stale/timeout/aborted break 前调 `subagent_abort_signal.abort()`，
+    // 子 agent `run_turn` loop 在每轮迭代开头检查 `hook_abort_signal.is_aborted()`
+    //（conversation.rs:487）即 `return Err("Turn aborted by user")` 退出，
+    // 不再继续发 API 请求把 detached 子会话上下文撑爆。
+    runtime = runtime.with_hook_abort_signal(subagent_abort_signal);
     // 二期-C1：按模型上下文窗口动态算auto-compact阈值。
     // DeepSeek V4 Pro 1M窗口→750K才压，几乎不触发，前缀稳定→DeepSeek硬盘缓存命中。
     // **2026-07-19 multiprovider 落地**：子 agent 走 strict 变体——阈值严格按自己 model 算，
@@ -4205,7 +4314,15 @@ fn build_agent_runtime(
     // 主=DeepSeek 1M + 子=GLM 200K，主那套 env 设的 131K 阈值会误压到子 agent 反伤缓存；
     // 反过来主=GLM + 子=DeepSeek 1M，子 agent 拿 131K 阈值撑爆 200K GLM 报 ContextWindowExceeded。
     // 对照 `docs/multiprovider.md` 3.4ter 节。
-    if let Some(limit) = api::model_token_limit(resolved_model) {
+    // ★ 2026-09-03 缓存命中率长效修复：子 agent lane 与主 lane 同一套分支——按 resolved.model 判定。
+    // - 仅 glm-5.1：维持老激进压缩机制（microcompact 常规 snip/清空照跑）+ 固定 160K 阈值。
+    // - 其他模型（glm-5.2 / glm 系其他 / deepseek 系等）：高缓存命中模式——
+    //   microcompact 只保留 emergency 清，历史字节稳定让网关前缀缓存持续累积。
+    runtime = runtime.with_cache_mode_for_model(resolved_model);
+    if let Some(threshold) = subagent_auto_compact_threshold(resolved_model) {
+        // glm-5.1 子 agent：用户决策固定 160K（不走 strict 公式的 102K）。
+        runtime = runtime.with_auto_compaction_input_tokens_threshold(threshold);
+    } else if let Some(limit) = api::model_token_limit(resolved_model) {
         // 用实际请求中的 max_tokens（`max_tokens_for_model` 经 heuristic min 截断后的值）
         // 而非 `limit.max_output_tokens`（模型理论上限）——确保阈值与实际请求体匹配。
         let effective_max_tokens = api::max_tokens_for_model(resolved_model);
@@ -4213,6 +4330,52 @@ fn build_agent_runtime(
             .with_model_context_window_strict(limit.context_window_tokens, effective_max_tokens);
     }
     Ok(runtime)
+}
+
+/// **2026-09-03 用户决策**：glm-5.1 作为**子 agent** 时的 auto-compact 阈值——固定 160K，
+/// 不用 strict 公式的 167K（200K − min(64K, 20K) − 13K）。
+///
+/// 理由（用户原话语义）：160K 阈值下压缩后保留的内容以 **<40K 为宜**（200K 窗口 - 160K = 40K
+/// 余量）。102K 触发过早会频繁 compact 击穿前缀缓存；160K 让 compact 尽量晚触发、少触发。
+///
+/// 溢出风险说明：160K input + 64K max_output > 200K 窗口，理论上有 over-size 400 风险——
+/// 该风险由 `conversation.rs` 的 over_size_400 降级重试路径兜底（强制 compact 后重试，≤3 次）。
+///
+/// 返回 `None` = 非 glm-5.1，调用方走 `with_model_context_window_strict` 动态公式。
+fn subagent_auto_compact_threshold(model: &str) -> Option<u32> {
+    if runtime::is_glm51_cache_model(model) {
+        Some(160_000)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod subagent_threshold_tests {
+    use super::subagent_auto_compact_threshold;
+
+    #[test]
+    fn glm51_subagent_threshold_is_fixed_160k() {
+        assert_eq!(subagent_auto_compact_threshold("glm-5.1"), Some(160_000));
+        assert_eq!(subagent_auto_compact_threshold("GLM-5.1"), Some(160_000));
+        assert_eq!(
+            subagent_auto_compact_threshold("GLM-5.1-0731"),
+            Some(160_000)
+        );
+    }
+
+    #[test]
+    fn non_glm51_subagent_models_fall_through_to_strict_formula() {
+        assert_eq!(subagent_auto_compact_threshold("glm-5.2"), None);
+        assert_eq!(subagent_auto_compact_threshold("GLM-5.2"), None);
+        assert_eq!(subagent_auto_compact_threshold("glm-5"), None);
+        assert_eq!(subagent_auto_compact_threshold("deepseek-v4-pro"), None);
+        assert_eq!(
+            subagent_auto_compact_threshold("DeepSeek-V4-Flash-0731"),
+            None
+        );
+        assert_eq!(subagent_auto_compact_threshold(""), None);
+    }
 }
 
 /// ★ 2026-07-19 路径 E 落地：加第三参数 `subagent_cfg`——配置里的 `systemPrompt` 段追加到默认
@@ -4235,6 +4398,13 @@ fn build_agent_system_prompt(
     prompt.push(format!(
         "You are a background sub-agent of type `{subagent_type}`. Work only on the delegated task, use only the tools available to you, do not ask the user questions, and finish with a concise result."
     ));
+    // ★ 2026-08-15 atomcode task 思想落地：按 subagent_type 分级注入 persona
+    // （对标 atomcode `EXPLORE_PERSONA` / `WORKER_PERSONA`）。
+    // atomcode 用 persona 软约束压缩子代理输出体积：explore="concise findings report"，
+    // worker="one-line summary of what you changed"。claw-code 之前所有 type 共用一句
+    // "finish with a concise result"，无按类型分级。现在按 read-only / write / plan 三类
+    // 注入不同强度的精简约束，配合 `first_line_capped` 截断兜底。
+    prompt.push(subagent_persona(subagent_type));
     // ★ 2026-07-19 路径 E 落地：配置里的 `systemPrompt` 段追加到默认 "You are a background sub-agent..." 后。
     // 没配或空段跳过（保持向后兼容）。对照 `docs/SUBAGENT_GUIDE.md` 第二节 + `docs/multiprovider.md` 3.4septies 节。
     if let Some(cfg) = subagent_cfg {
@@ -4243,6 +4413,45 @@ fn build_agent_system_prompt(
         }
     }
     Ok(prompt)
+}
+
+/// ★ 2026-08-15 atomcode task 思想落地：按 subagent_type 分级 persona
+/// （对标 atomcode `EXPLORE_PERSONA` / `WORKER_PERSONA`）。
+///
+/// atomcode 的 task 机制用 persona 软约束从源头压缩子代理回传体积：
+/// - explore 子代理："stop with a concise findings report the parent agent can act on"
+/// - worker 子代理："stop with a one-line summary of what you changed"
+///
+/// claw-code 落地：按 `allowed_tools_for_subagent` 的 read-only / write / plan 三类分级。
+/// - **Explore / claw-guide / Plan**（只读 + 检索）：要求"concise findings report"，列发现不堆过程
+/// - **Verification**（只读 + bash）：要求"list pass/fail per check, no prose"
+/// - **statusline-setup / general-purpose**（含 write/edit）：要求"one-line summary of what you changed"
+/// - 默认（未识别 type）：通用精简约束
+///
+/// 这层是软约束——`first_line_capped` 截断是硬兜底。两层叠加确保子代理回传不爆父上下文。
+fn subagent_persona(subagent_type: &str) -> String {
+    match subagent_type {
+        "Explore" | "claw-guide" | "Plan" => String::from(
+            "You are a READ-ONLY investigation subagent. Use read/search tools to answer the \
+             assigned task about the codebase. You CANNOT edit files. When done, stop with a \
+             concise findings report the parent agent can act on — list what you found, do not \
+             narrate the search process.",
+        ),
+        "Verification" => String::from(
+            "You are a VERIFICATION subagent. Run the checks the parent asked for, then stop \
+             with a compact pass/fail report — one line per check, no prose explanation.",
+        ),
+        "statusline-setup" | "general-purpose" => String::from(
+            "You are a focused EXECUTION subagent. Do exactly the task described — no more, no \
+             less — honoring the working directory. Make the change, verify it if cheap, then \
+             stop with a one-line summary of what you changed. Do not wander outside the task's \
+             stated scope.",
+        ),
+        _ => String::from(
+            "Finish with a concise result the parent agent can act on. Do not narrate your \
+             tool-use process in the final reply — state the outcome.",
+        ),
+    }
 }
 
 fn resolve_agent_model(model: Option<&str>) -> String {
@@ -5184,7 +5393,14 @@ impl ProviderRuntimeClient {
             runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
             chain: vec![primary],
             allowed_tools,
-            cache_config: api::CacheConfig::from_env(),
+            // ★ 2026-09-03 高缓存命中模式：与主 lane（main.rs AnthropicRuntimeClient）同一套
+            // 判定——仅 glm-5.1 保留 cache_control 标记注入，其他模型（自动前缀缓存网关）
+            // 禁用标记以省 token。用 resolved.model（子 agent 实际调度的 model 名）判定。
+            cache_config: if api::is_glm51_cache_model(&resolved.model) {
+                api::CacheConfig::from_env()
+            } else {
+                api::CacheConfig::disabled()
+            },
         })
     }
 
@@ -5481,29 +5697,43 @@ async fn stream_with_provider(
     let mut pending_thinking: BTreeMap<u32, (String, Option<String>)> = BTreeMap::new();
     let mut saw_stop = false;
 
-    // **2026-07-23 子 agent 防挂死**：SSE 事件间超时。
-    // GLM 网关在生成过程中偶尔“卡住”——TCP 连接存活但不再发 SSE 事件。
-    // 无此超时 `next_event().await` 会无限阻塞，导致主线程 recv_timeout(10min) 才能回收。
-    // 360s 内无新事件→视为流已死，提前 break 走下方 fallback 路径。
-    // （GLM 5.1 生成大段内容时单事件间隔可达 4–5 分钟，3min 太短会误杀。）
-    const SSE_EVENT_TIMEOUT: Duration = Duration::from_secs(360);
+    // **2026-08-17 修订**（对齐用户定义"工具调用期间不算超时；工具结果上传云端后 600s 没返回才算超时"）：
+    // 原设计是"流内事件间 360s 无新事件即 break 走 fallback"——这会把 GLM 5-6 分钟大段生成
+    // 期间的正常间隔误判成超时硬切，反 agentic。
+    // 现改成只在"等首个事件"窗口生效 600s：收到第一个事件后流内不再有任何超时。
+    // GLM 网关卡死时（TCP 活但永久不发）靠下方 `received_any_event` 标志 + 600s 首事件超时兜底，
+    // 不会无限阻塞；正常大段生成期间不被硬切。
+    const SSE_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(600);
+    let mut received_any_event = false;
 
     loop {
-        let event_result = tokio::time::timeout(SSE_EVENT_TIMEOUT, stream.next_event()).await;
+        // 收到首个事件后不再包 timeout——GLM 5-6 分钟大段生成是正常的，不该硬切。
+        let event_result: Result<Option<Result<Option<ApiStreamEvent>, ApiError>>, ApiError> =
+            if received_any_event {
+                Ok(Some(stream.next_event().await))
+            } else {
+                match tokio::time::timeout(SSE_FIRST_EVENT_TIMEOUT, stream.next_event()).await {
+                    Ok(inner) => Ok(Some(inner)),
+                    Err(_elapsed) => Ok(None),
+                }
+            };
         let event = match event_result {
-            Ok(Ok(Some(event))) => event,
-            Ok(Ok(None)) => break, // 流正常结束
-            Ok(Err(error)) => return Err(error),
-            Err(_elapsed) => {
-                // SSE 流卡死——180s 无新事件。记录日志并 break，
-                // 下方 fallback 逻辑会判断已有 events 是否足够返回。
+            Ok(Some(Ok(Some(event)))) => event,
+            Ok(Some(Ok(None))) => break, // 流正常结束
+            Ok(Some(Err(error))) => return Err(error),
+            Ok(None) => {
+                // 首个事件超时——GLM 网关卡死（TCP 活但 600s 不发），走非流式 fallback。
                 eprintln!(
-                    "[stream_with_provider: SSE 流超时 180s 无新事件，model={}]",
+                    "[stream_with_provider: 等首个 SSE 事件超时 {}s，model={}，走非流式 fallback]",
+                    SSE_FIRST_EVENT_TIMEOUT.as_secs(),
                     message_request.model
                 );
                 break;
             }
+            Err(error) => return Err(error),
         };
+        // 收到首个事件后置位——后续 `next_event()` 不再包 timeout，GLM 5-6 分钟大段生成不被硬切。
+        received_any_event = true;
         match event {
             ApiStreamEvent::MessageStart(start) => {
                 for block in start.message.content {
@@ -9108,6 +9338,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("ship-audit".to_string()),
                 model: None,
+                difficulty: String::new(),
             },
             move |job| {
                 *captured_for_spawn
@@ -9189,6 +9420,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("complete-task".to_string()),
                 model: Some("claude-sonnet-4-6".to_string()),
+                difficulty: String::new(),
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9246,6 +9478,7 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("fail-task".to_string()),
                 model: None,
+                difficulty: String::new(),
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9293,6 +9526,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("summary-floor".to_string()),
                 model: None,
+                difficulty: String::new(),
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9338,6 +9572,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("recovery-lane".to_string()),
                 model: None,
+                difficulty: String::new(),
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9386,6 +9621,7 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("review-lane".to_string()),
                 model: None,
+                difficulty: String::new(),
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9426,6 +9662,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("backlog-scan".to_string()),
                 model: None,
+                difficulty: String::new(),
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9472,6 +9709,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("artifact-lane".to_string()),
                 model: None,
+                difficulty: String::new(),
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9542,6 +9780,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("cron-closeout".to_string()),
                 model: None,
+                difficulty: String::new(),
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9583,6 +9822,7 @@ mod tests {
                 subagent_type: None,
                 name: Some("spawn-error".to_string()),
                 model: None,
+                difficulty: String::new(),
             },
             |_| Err(String::from("thread creation failed")),
         )

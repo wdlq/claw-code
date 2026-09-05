@@ -28,6 +28,16 @@ const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
 const DEFAULT_MAX_RETRIES: u32 = 8;
+/// **2026-08-17 send_message fallback 超时保护**：单次 HTTP 请求（连接 + 等响应头）的硬上限。
+/// GLM 网关偶尔 TCP 活着但不响应——`reqwest::Client` 只设了 `connect_timeout(30s)`，
+/// **没有整体请求超时**，`request_builder.send().await` 在网关挂死时无限阻塞。
+/// 非流式 fallback `send_message` → `send_with_retry` → `send_raw_request` 走这条路径，
+/// 流式 `stream_message` 的初始连接也走这条路径。
+/// 给 `send_raw_request` 的 `send().await` 包 `tokio::time::timeout`，单次请求超 600s 即返回 `ApiError::Network`。
+/// 600s 取值依据：GLM 5.1 单事件间隔可达 4-5 分钟（MEMORY 已证），但单次 HTTP 请求（连接 + 响应头）
+/// 不应超过 10 分钟——若超 10 分钟说明网关已挂死，重试也没用。`send_with_retry` 的 `max_retries=8`
+/// 会在每次超时后重试，但每次单请求不会无限阻塞。
+const HTTP_REQUEST_HARD_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthSource {
@@ -529,7 +539,15 @@ impl AnthropicClient {
         let mut request_body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut request_body);
 
-        let request_builder = self.build_request(&request_url).json(&request_body);
+        // **2026-08-17 send_message fallback 超时保护**：per-request `.timeout()` 让 reqwest
+        // 在 GLM 网关 TCP 活着但不响应时自己产生 `is_timeout()` 错误。
+        // `is_retryable()` 已支持 `Http.is_timeout()`（error.rs:137），`send_with_retry` 会自动重试。
+        // 不用全局 client `.timeout()`——那是连接 + 整个响应体读取的总超时，会误杀流式大响应。
+        // 这里只给单次 `send().await`（连接 + 等响应头）设超时，响应体读取不受影响。
+        let request_builder = self
+            .build_request(&request_url)
+            .json(&request_body)
+            .timeout(HTTP_REQUEST_HARD_TIMEOUT);
         request_builder.send().await.map_err(ApiError::from)
     }
 

@@ -603,22 +603,51 @@ pub fn max_tokens_for_model_with_override(model: &str, plugin_override: Option<u
     plugin_override.unwrap_or_else(|| max_tokens_for_model(model))
 }
 
-#[must_use]
-pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
+/// 模型名归一化 key：剖路径前缀与方括号后缀、转小写、剥纯数字日期/版本尾段。
+///
+/// **2026-09-03 缓存命中率长效修复**：网关配置/回显的 model 名（`GLM-5.2`、
+/// `DeepSeek-V4-Flash-0731`）与表内小写精确名不一致，导致 `model_token_limit`
+/// 查表失败 → 动态阈值静默回落 55K → 3 小时 31 次 auto-compact 反复击穿前缀缓存
+/// （cache_read 天花板仅 42–50K，命中率 main 69.6% / sub 79.9%）。归一化后：
+/// - `GLM-5.2` → `glm-5.2`（新条目：1M 窗口）
+/// - `DeepSeek-V4-Flash-0731` → 剥日期后缀 `-0731` → `deepseek-v4-flash`
+/// - `claude-haiku-4-5-20251213` 保持可匹配（日期段剥掉后回退前缀匹配命中同族条目）
+fn model_registry_key(model: &str) -> String {
     let canonical = resolve_model_alias(model);
     // 剖路径前缀和方括号后缀（如 deepseek-v4-pro[1m] → deepseek-v4-pro）。
     // [1m] 是用户配的上下文窗口标记，不参与模型身份匹配。
     let after_slash = canonical.rsplit('/').next().unwrap_or(canonical.as_str());
     let base_model = after_slash.split('[').next().unwrap_or(after_slash);
-    match base_model {
+    let key = base_model.trim().to_ascii_lowercase();
+    // 剥尾部**纯数字**段（≥3 位，如日期快照 `-0731`/`-20251213`）。
+    // 只剥纯数字段——`4.1`/`5.2`/`k1.5` 这类含点的版本段与 `glm-5` 的个位数段不动。
+    let mut segments: Vec<&str> = key.split('-').collect();
+    while segments.len() > 1 {
+        let last = segments[segments.len() - 1];
+        let is_pure_numeric = !last.is_empty() && last.chars().all(|c| c.is_ascii_digit());
+        if is_pure_numeric && last.len() >= 3 {
+            segments.pop();
+        } else {
+            break;
+        }
+    }
+    segments.join("-")
+}
+
+#[must_use]
+pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
+    let key = model_registry_key(model);
+    match key.as_str() {
         "claude-opus-4-6" => Some(ModelTokenLimit {
             max_output_tokens: 32_000,
             context_window_tokens: 200_000,
         }),
-        "claude-sonnet-4-6" | "claude-haiku-4-5-20251213" => Some(ModelTokenLimit {
-            max_output_tokens: 64_000,
-            context_window_tokens: 200_000,
-        }),
+        "claude-sonnet-4-6" | "claude-haiku-4-5" | "claude-haiku-4-5-20251213" => {
+            Some(ModelTokenLimit {
+                max_output_tokens: 64_000,
+                context_window_tokens: 200_000,
+            })
+        }
         "grok-3" | "grok-3-mini" => Some(ModelTokenLimit {
             max_output_tokens: 64_000,
             context_window_tokens: 131_072,
@@ -649,18 +678,79 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 128_000,
             context_window_tokens: 200_000,
         }),
-        // DeepSeek V4 family — V4 Pro 1M context, V4 Flash 128K context
-        // Source: docs/DeepseekAPI/1.md (Anthropic-compat映射 claude-opus→v4-pro, claude-haiku/sonnet→v4-flash)
+        // GLM-5.2 — 1M context（2026-09-03 实测：api.scnet.cn 网关回显名 "GLM-5.2"，
+        // 1M 上下文窗口；max_output 沿用 GLM 家族 128K 上限，实际由 heuristic min 出 64K）
+        "glm-5.2" => Some(ModelTokenLimit {
+            max_output_tokens: 128_000,
+            context_window_tokens: 1_000_000,
+        }),
+        // DeepSeek V4 family — 全系 1M context。
+        // **2026-09-03 用户裁定窗口矩阵**：仅 glm-5.1 是 200K 老窗口（200K 模式唯一成员），
+        // 其余模型（glm-5.2/5.3、deepseek pro/flash）一律 1M + 前缀缓存（高缓存命中）模式。
+        // 原 "V4 Flash 128K" 是从 docs/DeepseekAPI/1.md 的 claude-haiku/sonnet→v4-flash
+        // 映射关系**推出来**的，并非网关实测——scnet 网关的 V4 Flash 实际 1M。
         "deepseek-v4-pro" => Some(ModelTokenLimit {
             max_output_tokens: 8_192,
             context_window_tokens: 1_000_000,
         }),
         "deepseek-v4-flash" => Some(ModelTokenLimit {
             max_output_tokens: 8_192,
-            context_window_tokens: 128_000,
+            context_window_tokens: 1_000_000,
         }),
-        _ => None,
+        _ => {
+            // 前缀匹配兜底：同族新快照/新小版本名（如未来的 glm-5.3、deepseek-v4-pro-xxxx）
+            // 不再静默查表失败。按家族已知上限给值——宁可高估窗口少 compact，也别低估
+            // 频繁 compact 击穿前缀缓存（2026-09-03 根因）。
+            // 注意顺序：glm-5.2* 必须先于通用 glm-5* 前缀判断。
+            if key.starts_with("glm-5.2") || key.starts_with("glm5.2") {
+                return Some(ModelTokenLimit {
+                    max_output_tokens: 128_000,
+                    context_window_tokens: 1_000_000,
+                });
+            }
+            // glm-5.* 新小版本（glm-5.3 等）——用户裁定：除 glm-5.1 外全系 1M。
+            if key.starts_with("glm-5.") || key.starts_with("glm5.") {
+                return Some(ModelTokenLimit {
+                    max_output_tokens: 128_000,
+                    context_window_tokens: 1_000_000,
+                });
+            }
+            if key.starts_with("deepseek-v4-pro") {
+                return Some(ModelTokenLimit {
+                    max_output_tokens: 8_192,
+                    context_window_tokens: 1_000_000,
+                });
+            }
+            if key.starts_with("deepseek-v4-flash") {
+                return Some(ModelTokenLimit {
+                    max_output_tokens: 8_192,
+                    context_window_tokens: 1_000_000,
+                });
+            }
+            None
+        }
     }
+}
+
+/// **2026-09-03 缓存命中率长效修复**：判定某模型是否沿用"GLM-5.1 小窗口 + 激进压缩"老缓存机制。
+///
+/// 只有 `glm-5.1`（大小写不敏感、容忍日期后缀/方括号窗口标记）返回 `true`——维持现机制：
+/// microcompact 常规清空/snip 照跑，阈值 env 可覆盖（对齐 2026-06~07 联通云 GLM-5.1 时代
+/// 数百轮稳定跑通的既定行为）。
+///
+/// 其他一切模型（`glm-5.2` 及 glm 系列其他型号、deepseek 全系、claude 等）返回 `false`——
+/// 走高缓存命中模式：按模型真实窗口动态算大阈值（1M 窗口 → 750K 才压）+ microcompact
+/// 常规路径跳过（仅 emergency 清超大输出），让网关自动前缀缓存能持续累积。
+///
+/// 主 lane（`main.rs`）与子 agent lane（`build_agent_runtime`）共用本判定，保证两条路径
+/// 按**各自调度的 model 名**走同一套分支（对照 multiprovider 的 per-lane model 判定范式）。
+#[must_use]
+pub fn is_glm51_cache_model(model: &str) -> bool {
+    let canonical = resolve_model_alias(model);
+    let after_slash = canonical.rsplit('/').next().unwrap_or(canonical.as_str());
+    let base = after_slash.split('[').next().unwrap_or(after_slash);
+    let key = base.trim().to_ascii_lowercase();
+    key == "glm-5.1" || key.starts_with("glm-5.1-")
 }
 
 pub fn preflight_message_request(request: &MessageRequest) -> Result<(), ApiError> {
@@ -1753,4 +1843,70 @@ NO_EQUALS_LINE
     // (env_lock only protects within a single binary). The detection logic
     // is covered: OPENAI_BASE_URL alone routes to OpenAi as a last-resort
     // fallback in detect_provider_kind().
+
+    // ===== 2026-09-03 缓存命中率长效修复：model_registry_key 归一化 + is_glm51_cache_model =====
+
+    #[test]
+    fn model_token_limit_normalizes_gateway_names() {
+        // 网关回显名大小写 + 日期后缀都要能查表命中
+        //（2026-09-03 根因：查表失败 → 动态阈值静默回落 55K → 频繁 compact 击穿前缀缓存）
+        let glm52 = crate::providers::model_token_limit("GLM-5.2").expect("GLM-5.2 must resolve");
+        assert_eq!(glm52.context_window_tokens, 1_000_000);
+        assert_eq!(glm52.max_output_tokens, 128_000);
+
+        let ds_flash = crate::providers::model_token_limit("DeepSeek-V4-Flash-0731")
+            .expect("flash snapshot must resolve");
+        // 2026-09-03 用户裁定：deepseek 全系 1M（原 128K 是映射推断值，非网关实测）
+        assert_eq!(ds_flash.context_window_tokens, 1_000_000);
+        assert_eq!(ds_flash.max_output_tokens, 8_192);
+
+        // 旧精确名不回归
+        let glm51 = crate::providers::model_token_limit("glm-5.1").expect("glm-5.1 must resolve");
+        assert_eq!(glm51.context_window_tokens, 200_000);
+        let pro = crate::providers::model_token_limit("deepseek-v4-pro").expect("pro must resolve");
+        assert_eq!(pro.context_window_tokens, 1_000_000);
+
+        // 方括号窗口标记仍剥掉
+        let pro_1m = crate::providers::model_token_limit("deepseek-v4-pro[1m]")
+            .expect("pro[1m] must resolve");
+        assert_eq!(pro_1m.context_window_tokens, 1_000_000);
+
+        // 未知模型仍 None
+        assert!(crate::providers::model_token_limit("totally-unknown-model").is_none());
+    }
+
+    #[test]
+    fn model_token_limit_prefix_fallback_covers_family_variants() {
+        // 同族新快照名走前缀兜底，不再静默 None。
+        // 2026-09-03 用户裁定：仅 glm-5.1 是 200K，glm-5.* 其余小版本（5.3 等）一律 1M。
+        let glm53 = crate::providers::model_token_limit("glm-5.3-preview")
+            .expect("glm-5.3* falls back to glm-5 family");
+        assert_eq!(glm53.context_window_tokens, 1_000_000);
+        // glm-5.2 变体先于通用 glm-5 前缀命中（1M）
+        let glm52x =
+            crate::providers::model_token_limit("glm-5.2-turbo").expect("glm-5.2* variant");
+        assert_eq!(glm52x.context_window_tokens, 1_000_000);
+        let pro_snap =
+            crate::providers::model_token_limit("deepseek-v4-pro-0901").expect("pro snapshot");
+        assert_eq!(pro_snap.context_window_tokens, 1_000_000);
+        let flash_snap =
+            crate::providers::model_token_limit("deepseek-v4-flash-0915").expect("flash snapshot");
+        assert_eq!(flash_snap.context_window_tokens, 1_000_000);
+    }
+
+    #[test]
+    fn is_glm51_cache_model_matches_only_glm51() {
+        assert!(crate::providers::is_glm51_cache_model("glm-5.1"));
+        assert!(crate::providers::is_glm51_cache_model("GLM-5.1"));
+        assert!(crate::providers::is_glm51_cache_model("GLM-5.1-0731"));
+        assert!(!crate::providers::is_glm51_cache_model("glm-5"));
+        assert!(!crate::providers::is_glm51_cache_model("glm-5.2"));
+        assert!(!crate::providers::is_glm51_cache_model("GLM-5.2"));
+        assert!(!crate::providers::is_glm51_cache_model("deepseek-v4-pro"));
+        assert!(!crate::providers::is_glm51_cache_model(
+            "DeepSeek-V4-Flash-0731"
+        ));
+        assert!(!crate::providers::is_glm51_cache_model("claude-opus-4-6"));
+        assert!(!crate::providers::is_glm51_cache_model(""));
+    }
 }

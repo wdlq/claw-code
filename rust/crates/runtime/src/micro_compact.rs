@@ -133,6 +133,22 @@ const COMPACTABLE_TOOLS: &[&str] = &[
     "list_directory",
 ];
 
+/// **2026-09-03 缓存命中率长效修复**：判定某模型是否沿用"GLM-5.1 小窗口 + 激进压缩"老缓存机制。
+///
+/// **runtime 本地副本**——与 `api::providers::is_glm51_cache_model`（`api/src/providers/mod.rs`）
+/// 同名同源，语义必须保持一致。runtime crate 不依赖 api crate（循环依赖禁令，见
+/// ATOMCODE_MEMORY "should_use_compact_receipt 在 runtime 内独立判断"先例），故此处复制判定。
+/// **改任一份时务必同步另一份**。
+///
+/// - 仅 `glm-5.1`（大小写不敏感、容忍路径前缀/方括号窗口标记/日期后缀）→ `true`
+/// - 其他一切模型 → `false`（走高缓存命中模式）
+pub fn is_glm51_cache_model(model: &str) -> bool {
+    let canonical = model.trim().to_ascii_lowercase();
+    let after_slash = canonical.rsplit('/').next().unwrap_or(canonical.as_str());
+    let base = after_slash.split('[').next().unwrap_or(after_slash);
+    base == "glm-5.1" || base.starts_with("glm-5.1-")
+}
+
 /// Minimum character length for a tool result to be considered for clearing.
 /// Short results (e.g. "ok", "file written") are not worth compacting.
 ///
@@ -217,9 +233,22 @@ pub struct MicroCompactResult {
 /// `min_output_length_for_clear(threshold)` — are cleared.  This preserves enough working
 /// context for the model to reason across several tool calls, which is
 /// essential when the provider has no server-side cache_edits to fall back on.
+/// **2026-09-03 缓存命中率长效修复**：新增 `high_cache_mode` 参数——高缓存命中模式。
+///
+/// - `false`（默认，GLM-5.1 老机制）：维持原行为——常规 snip/清空照跑，microcompact 是
+///   GLM-5.1 小窗口（200K）下防请求体膨胀的主防线（对齐 2026-06~07 联通云时代既定行为）。
+/// - `true`（glm-5.2 / deepseek 等所有其他模型）：**常规路径整体跳过**——不动任何历史
+///   tool result 字节，让网关自动前缀缓存持续累积（对照 atomcode 的"纯 append-only =
+///   完美缓存"）。**仅保留 emergency 清**：单个 output ≥ `EMERGENCY_CLEAR_THRESHOLD`
+///   （500K 字符）时无条件清成占位符——这是防单条巨型输出撑爆上下文/请求体的安全网，
+///   该场景下牺牲一次前缀缓存换可用性。
+///
+/// 判定入口 `api::is_glm51_cache_model`（只有 glm-5.1 返回 false），由 runtime 字段
+/// `microcompact_high_cache_mode` 承载，`conversation.rs` 调用点透传。
 pub fn microcompact_session(
     session: &mut Session,
     auto_compaction_threshold: u32,
+    high_cache_mode: bool,
 ) -> MicroCompactResult {
     // 二期-C3：CLAW_MICROCOMPACT_DISABLE=1 彻底关掉 microcompact。
     // DeepSeek 1M 窗口下重传前缀的代价被 cache hit 抹消，microcompact 省的 input token
@@ -272,6 +301,12 @@ pub fn microcompact_session(
             }
             // Skip already-snipped results（避免重复截短，对齐 Reasonix shouldMaintainToolResult）。
             if output.starts_with(SNIPPED_MARKER) {
+                continue;
+            }
+
+            // **高缓存命中模式**（2026-09-03）：常规 snip/清空整体跳过，保历史字节完全稳定。
+            // 只放行 emergency——巨型输出撑爆上下文的安全网仍在。
+            if high_cache_mode && output.len() < EMERGENCY_CLEAR_THRESHOLD {
                 continue;
             }
 
@@ -466,7 +501,7 @@ mod tests {
             ConversationMessage::tool_result("new", "read_file", large.clone(), false),
         ];
 
-        let result = microcompact_session(&mut session, auto_threshold);
+        let result = microcompact_session(&mut session, auto_threshold, false);
         // PROTECT_RECENT_TOOL_RESULTS >= 1 → "new" is kept, "old" is cleared.
         assert_eq!(result.cleared_count, 1);
         // The kept one is still verbatim; the cleared one is the placeholder.
@@ -492,7 +527,58 @@ mod tests {
             "tiny",
             false,
         )];
-        let result = microcompact_session(&mut session, 55_000);
+        let result = microcompact_session(&mut session, 55_000, false);
         assert_eq!(result.cleared_count, 0);
+    }
+
+    // ===== 2026-09-03 缓存命中率长效修复：高缓存命中模式 =====
+
+    #[test]
+    fn high_cache_mode_skips_routine_snip_but_keeps_emergency() {
+        // 高缓存模式：旧的较大（超 5K 常规闸门但 < 500K emergency 线）tool result
+        // 不再被 snip/清空——历史字节完全稳定，网关前缀缓存可持续累积。
+        let threshold = min_output_length_for_clear(55_000);
+        let large_but_not_emergency = "x".repeat(threshold + 100); // ~5.1K，远小于 500K
+        let mut session = Session::new();
+        session.messages = vec![ConversationMessage::tool_result(
+            "old",
+            "read_file",
+            large_but_not_emergency.clone(),
+            false,
+        )];
+
+        let result = microcompact_session(&mut session, 55_000, true);
+        assert_eq!(
+            result.cleared_count, 0,
+            "routine snip must be skipped in high cache mode"
+        );
+        assert_eq!(result.chars_freed, 0);
+        let output = match &session.messages[0].blocks[0] {
+            ContentBlock::ToolResult { output, .. } => output.clone(),
+            _ => String::new(),
+        };
+        assert_eq!(output, large_but_not_emergency, "bytes must stay verbatim");
+    }
+
+    #[test]
+    fn high_cache_mode_still_clears_emergency_sized_output() {
+        // 高缓存模式的安全网：≥ EMERGENCY_CLEAR_THRESHOLD（500K 字符）的巨型输出
+        // 仍被清成占位符——防单条输出撑爆上下文/请求体。
+        let emergency = "y".repeat(crate::micro_compact::EMERGENCY_CLEAR_THRESHOLD + 100);
+        let mut session = Session::new();
+        session.messages = vec![ConversationMessage::tool_result(
+            "old",
+            "grep_search",
+            emergency,
+            false,
+        )];
+
+        let result = microcompact_session(&mut session, 55_000, true);
+        assert_eq!(result.cleared_count, 1, "emergency clear must still fire");
+        let output = match &session.messages[0].blocks[0] {
+            ContentBlock::ToolResult { output, .. } => output.clone(),
+            _ => String::new(),
+        };
+        assert_eq!(output, CLEARED_PLACEHOLDER);
     }
 }

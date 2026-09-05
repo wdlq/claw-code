@@ -28,6 +28,7 @@ pub mod mcp_server;
 mod mcp_stdio;
 pub mod mcp_tool_bridge;
 mod micro_compact;
+pub use micro_compact::is_glm51_cache_model;
 mod oauth;
 pub mod permission_enforcer;
 mod permissions;
@@ -62,8 +63,9 @@ pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
 pub use compact::{
-    compact_session, estimate_session_tokens, format_compact_summary,
+    compact_session, estimate_context_tokens, estimate_session_tokens, format_compact_summary,
     get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
+    SYSTEM_OVERHEAD_TOKENS,
 };
 pub use config::{
     ConfigEntry, ConfigError, ConfigLoader, ConfigSource, McpConfigCollection,
@@ -78,9 +80,9 @@ pub use config_validate::{
     DiagnosticKind, ValidationResult,
 };
 pub use conversation::{
-    auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
-    ConversationRuntime, ErrorKind, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolError,
-    ToolExecutor, TurnSummary,
+    auto_compaction_threshold_from_env, autocompact_threshold_formula, ApiClient, ApiRequest,
+    AssistantEvent, AutoCompactionEvent, ConversationRuntime, ErrorKind, PromptCacheEvent,
+    RuntimeError, StaticToolExecutor, ToolError, ToolExecutor, TurnSummary,
 };
 pub use file_ops::{
     edit_file, edit_file_in_workspace, edit_file_in_workspace_with_allowed, glob_search,

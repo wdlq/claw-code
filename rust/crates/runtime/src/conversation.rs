@@ -5,7 +5,8 @@ use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 
 use crate::compact::{
-    compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
+    compact_session, estimate_context_tokens, estimate_session_tokens, CompactionConfig,
+    CompactionResult,
 };
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
@@ -16,11 +17,17 @@ use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 55_000;
+/// **2026-09-03 G5 熔断器**：连续无效 proactive auto-compact 的最大次数——超过即停手
+/// （对齐 claude-code autoCompact.ts:70 `MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES`）。
+const MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES: u32 = 3;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
 /// Percentage of context window to trigger auto-compact (e.g. 75 means 75%).
 const AUTO_COMPACT_PCT_OVERRIDE_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_PCT_OVERRIDE";
 /// Context window size in tokens, used together with PCT_OVERRIDE.
 const AUTO_COMPACT_WINDOW_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
+/// **2026-09-03 G4 逃生口**：设为 "1" 时跳过 env min 封顶，恢复旧"env 显式替代"语义
+/// （调试用，默认不设——正常路径下 env 覆盖只能提前、不能拖后）。
+const AUTO_COMPACT_THRESHOLD_UNCAPPED_ENV_VAR: &str = "CLAUDE_AUTOCOMPACT_THRESHOLD_UNCAPPED";
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +199,15 @@ pub struct ConversationRuntime<C, T> {
     /// 主线程（`spawn_agent_job`）注入 sender——收到心跳即知子 agent 还在干活，重置静默计时器；
     /// 静默超过 `STALE_SECS` 判"已挂"提前结束，不再死切 600s。`None` = 主 LLM 路径，不判活。
     heartbeat: Option<Box<dyn Fn() + Send + Sync>>,
+    /// **2026-09-03 缓存命中率长效修复**：高缓存命中模式——`true` 时 microcompact 跳过
+    /// 常规 snip/清空（只保留 emergency 清超大输出），auto-compact 走模型真实窗口的大阈值，
+    /// 让网关自动前缀缓存持续累积。由 `with_cache_mode_for_model` 按 model 名一次性设定：
+    /// 仅 `glm-5.1` 走 `false`（老压缩机制），其他模型（glm-5.2 / deepseek 系等）走 `true`。
+    microcompact_high_cache_mode: bool,
+    /// **2026-09-03 G5 熔断器**：proactive auto-compact 连续无效计数——连续 3 次
+    /// 压不动/压后仍超阈值即停手（交给 over_size_400 reactive 兜底），
+    /// compact 生效后清零。对齐 claude-code autoCompact.ts:67-70。
+    auto_compact_consecutive_failures: u32,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -242,6 +258,8 @@ where
             hook_progress_reporter: None,
             session_tracer: None,
             heartbeat: None,
+            microcompact_high_cache_mode: false,
+            auto_compact_consecutive_failures: 0,
         }
     }
 
@@ -257,32 +275,117 @@ where
         self
     }
 
+    /// **2026-09-03 缓存命中率长效修复**：按**当前调度的 model 名**一次性设定缓存策略——
+    /// 这是本修复的核心入口，主 lane（`main.rs::build_runtime_with_plugin_state`）与
+    /// 子 agent lane（`tools/src/lib.rs::build_agent_runtime`）都必须调它，保证两条路径
+    /// 按各自 model 名走同一套分支（对照 multiprovider 的 per-lane model 判定范式）。
+    ///
+    /// - `glm-5.1`（唯一例外）→ `microcompact_high_cache_mode = false`：维持"GLM-5.1 小窗口
+    ///   激进压缩"老机制——microcompact 常规 snip/清空照跑，阈值可被 env 覆盖（原行为）。
+    /// - 其他一切模型（glm-5.2 / glm 系其他 / deepseek 系 / claude 等）→ `true`：
+    ///   **高缓存命中模式**——microcompact 只保留 emergency 清（≥500K 字符安全网），
+    ///   历史字节完全稳定，网关自动前缀缓存可持续累积。
+    ///
+    /// 注意：本方法**只设 microcompact 模式位**，不动阈值；动态大阈值由调用方按
+    /// `api::model_token_limit` 的结果走 `with_model_context_window`（主）/`_strict`（子）设定。
+    /// 两者分开是因为主 lane 要保留 env 覆盖能力（GLM-5.1 场景），子 lane 用 strict 忽略 env。
+    #[must_use]
+    pub fn with_cache_mode_for_model(mut self, model: &str) -> Self {
+        self.microcompact_high_cache_mode = !crate::micro_compact::is_glm51_cache_model(model);
+        self
+    }
+
+    /// 高缓存命中模式位读取器（诊断/测试用）。
+    #[must_use]
+    pub fn microcompact_high_cache_mode(&self) -> bool {
+        self.microcompact_high_cache_mode
+    }
+
     /// 按**模型上下文窗口**动态算auto-compact阈值（二期-C1）。
     ///
-    /// DeepSeek V4 Pro 1M窗口→750K才压，几乎不触发，前缀稳定→DeepSeek硬盘缓存命中。
-    /// GLM 5.1 200K窗口→150K才压，不撑爆200K上下文。
+    /// **2026-09-03 P3 修复**：env 未设时动态值从 `窗口×75%` 换成 claude-code
+    /// `autocompact_threshold_formula`（窗口 − min(max_output, 20K 摘要预留) − 13K 缓冲，
+    /// 下限 55K）——对 200K 级 LLM 触发在 167K（83.5%），比 75% 版晚触发，对前缀缓存更友好。
     ///
-    /// **优先级**：env显式阈值（`CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS` /
-    /// `CLAUDE_CODE_AUTO_COMPACT_PCT_OVERRIDE`+`CLAUDE_CODE_AUTO_COMPACT_WINDOW`）
-    /// 优先于本builder。只有env没显式设阈值时，才用`context_window × pct`动态算。
-    /// 默认pct=75（对齐官方claude-code的0.75阈值）。
+    /// **2026-09-03 G4 封顶**：env 覆盖从"替代"改为"min 封顶"——对齐 claude-code 语义，
+    /// **只能提前、不能拖后**：
+    /// - `CLAUDE_CODE_AUTO_COMPACT_WINDOW`：从"替代窗口"改为"封顶有效窗口"
+    ///   （`effective_window = min(模型窗口, env值)`，再进公式）；
+    /// - `CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS` / `CLAUDE_CODE_AUTO_COMPACT_PCT_OVERRIDE`：
+    ///   env 算出的阈值与公式默认阈值取 `min`。
+    ///
+    /// 逃生口：`CLAUDE_AUTOCOMPACT_THRESHOLD_UNCAPPED=1` 跳过封顶恢复旧替代语义（调试用）。
     #[must_use]
-    pub fn with_model_context_window(mut self, context_window_tokens: u32) -> Self {
-        // env没显式设阈值时才动态算，避免覆盖用户显式配置。
-        if std::env::var(AUTO_COMPACTION_THRESHOLD_ENV_VAR).is_err()
-            && std::env::var(AUTO_COMPACT_PCT_OVERRIDE_ENV_VAR).is_err()
-        {
-            let pct = 75u32; // 对齐官方claude-code的0.75阈值
-            let dynamic_threshold = (context_window_tokens as u64 * pct as u64 / 100) as u32;
-            // 下限保护：太小阈值会频繁compact反伤缓存，至少给到默认阈值
-            self.auto_compaction_input_tokens_threshold =
-                dynamic_threshold.max(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD);
+    pub fn with_model_context_window(
+        mut self,
+        context_window_tokens: u32,
+        max_output_tokens: u32,
+    ) -> Self {
+        // env WINDOW 是"封顶"而非"替代"：glm-5.1 时代旧值 131000 不会把 1M 窗口顶成 131K。
+        let env_window = std::env::var(AUTO_COMPACT_WINDOW_ENV_VAR)
+            .ok()
+            .and_then(|value| {
+                value
+                    .trim()
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|window| *window > 0)
+            });
+        let effective_window = env_window.map_or(context_window_tokens, |window| {
+            window.min(context_window_tokens)
+        });
+        let formula_threshold = autocompact_threshold_formula(effective_window, max_output_tokens);
+
+        // env 显式阈值（原始值，解析语义与 auto_compaction_threshold_from_env 一致）
+        let mut env_threshold: Option<u32> = None;
+        if let Ok(value) = std::env::var(AUTO_COMPACTION_THRESHOLD_ENV_VAR) {
+            if let Ok(tokens) = value.trim().parse::<u32>() {
+                if tokens > 0 {
+                    env_threshold = Some(tokens);
+                }
+            }
         }
+        if env_threshold.is_none() {
+            if let (Ok(pct_str), Ok(window_str)) = (
+                std::env::var(AUTO_COMPACT_PCT_OVERRIDE_ENV_VAR),
+                std::env::var(AUTO_COMPACT_WINDOW_ENV_VAR),
+            ) {
+                if let (Ok(pct), Ok(window)) = (
+                    pct_str.trim().parse::<u32>(),
+                    window_str.trim().parse::<u32>(),
+                ) {
+                    if pct > 0 && pct <= 100 && window > 0 {
+                        env_threshold = Some(((window as u64 * pct as u64) / 100) as u32);
+                    }
+                }
+            }
+        }
+
+        // 逃生口：恢复旧"env 显式替代"语义（调试用，默认关）。
+        let uncapped = std::env::var(AUTO_COMPACT_THRESHOLD_UNCAPPED_ENV_VAR)
+            .map(|value| value.trim() == "1")
+            .unwrap_or(false);
+        if uncapped {
+            self.auto_compaction_input_tokens_threshold =
+                env_threshold.unwrap_or(formula_threshold);
+            return self;
+        }
+
+        // **G4 封顶**：env 只能提前（更小），不能拖后（更大）——min(env, 公式默认)。
+        self.auto_compaction_input_tokens_threshold = env_threshold
+            .map_or(formula_threshold, |threshold| {
+                threshold.min(formula_threshold)
+            });
         self
     }
 
     /// **2026-07-19 multiprovider 落地**：子 agent 专用——按 model 上下文窗口动态算
-    /// auto-compact 阈值，**不读任何 env 覆盖**，强制用 `(context_window - max_output) × 75%`。
+    /// auto-compact 阈值，**不读任何 env 覆盖**。
+    ///
+    /// **2026-09-03 P3 修复**：阈值算法从 `(窗口−max_output)×75%` 换成
+    /// `autocompact_threshold_formula`（窗口 − min(max_output, 20K) − 13K 缓冲，
+    /// 下限 55K）——数值普遍比 75% 版晚触发，对前缀缓存更友好；
+    /// 高缓存模式（不读 env）语义不变（§6 不许动清单）。
     ///
     /// 修的破裂点：主 LLM 走 DeepSeek 1M，子 agent 走 GLM 200K 时，若 `.claw.json`
     /// 的 `env` 段显式设了 `CLAUDE_CODE_AUTO_COMPACT_WINDOW=131000`（针对 GLM 200K 算的 75%），
@@ -290,14 +393,9 @@ where
     /// 频繁 compact 反伤 DeepSeek 缓存；主=GLM 子=DeepSeek 时子 agent 阈值 750K 直接撑爆
     /// GLM 200K 窗口报 `ContextWindowExceeded` 400。
     ///
-    /// **2026-07-22 改进**：阈值基于“输入预算”（context_window - max_output_tokens）而非
-    /// 总窗口。之前用 `context_window × 75%` 算出 150K，但 GLM-5.1 的 max_output=64K，
-    /// 实际输入预算只有 136K——阈值 150K > 输入预算 136K，导致 auto-compact 触发前
-    /// 请求已经超出 GLM 的输入上限报 400。改为 `(200K-64K)×75% = 102K` 后安全。
-    ///
     /// 子 agent 走 strict 路径后阈值严格按自己的 model 算，与主 LLM 的 env 配置彻底独立。
-    /// 仍保留下限保护：至少给到 `DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD` 55K，
-    /// 避免子 agent 走 128K DeepSeek-flash 等小窗口模型算出太小阈值频繁 compact 反伤缓存。
+    /// 仍保留下限保护（公式内置 55K 下限），避免子 agent 走小窗口模型算出太小阈值
+    /// 频繁 compact 反伤缓存。
     ///
     /// 对照 `docs/multiprovider.md` 3.4ter 节。主 LLM 路径仍走 `with_model_context_window`
     /// （允许用户用 env 显式覆盖主 LLM 阈值），两条路径彻底独立。
@@ -307,12 +405,8 @@ where
         context_window_tokens: u32,
         max_output_tokens: u32,
     ) -> Self {
-        let pct = 75u32; // 对齐官方claude-code的0.75阈值
-                         // 基于输入预算（总窗口 - 输出预留）算阈值，确保触发 compact 时 input 仍在窗口内。
-        let input_budget = context_window_tokens.saturating_sub(max_output_tokens);
-        let dynamic_threshold = (input_budget as u64 * pct as u64 / 100) as u32;
         self.auto_compaction_input_tokens_threshold =
-            dynamic_threshold.max(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD);
+            autocompact_threshold_formula(context_window_tokens, max_output_tokens);
         self
     }
 
@@ -467,6 +561,9 @@ where
         // 每次降级 auto-compact 后重试本轮，但最多 3 次避免无限循环（compact 后仍撝 400 说明压不动）。
         let mut over_size_400_retries: u32 = 0;
         const OVER_SIZE_400_MAX_RETRIES: u32 = 3;
+        // **2026-09-03 P2 修复**：turn 内请求前那次 compact 的 event——TurnSummary
+        // 沿用原字段（CLI 渲染 / jsonl 兼容），但来源从"turn 后独立触发点"改为请求前。
+        let mut pre_turn_auto_compaction: Option<AutoCompactionEvent> = None;
 
         loop {
             iterations += 1;
@@ -498,6 +595,7 @@ where
             let mc_result = crate::micro_compact::microcompact_session(
                 &mut self.session,
                 self.auto_compaction_input_tokens_threshold,
+                self.microcompact_high_cache_mode,
             );
             if mc_result.cleared_count > 0 {
                 eprintln!(
@@ -506,20 +604,13 @@ where
                 );
             }
 
-            // Pre-flight auto-compact: if the session is still large after
-            // micro-compact, do a full auto-compact. This prevents 400 errors
-            // from providers (e.g. GLM) that reject oversized requests.
-            if self.session_needs_pre_flight_compact() {
-                if let Some(event) = self.maybe_auto_compact() {
-                    eprintln!(
-                        "[auto-compacted: removed {} messages]",
-                        event.removed_message_count
-                    );
-                    write_auto_compact_diag(
-                        event.removed_message_count,
-                        self.auto_compaction_input_tokens_threshold,
-                    );
-                }
+            // Pre-flight auto-compact（**唯一的 proactive 触发点**——2026-09-03 P2）：
+            // if the session is still large after micro-compact, do a full
+            // auto-compact. This prevents 400 errors from providers (e.g. GLM)
+            // that reject oversized requests.
+            // Step 6（G6）占位：snip 联动稳定后把 mc_result.chars_freed 折算传进来。
+            if let Some(event) = self.auto_compact_if_needed(0) {
+                pre_turn_auto_compaction = Some(event);
             }
 
             let request = ApiRequest {
@@ -550,7 +641,7 @@ where
                             OVER_SIZE_400_MAX_RETRIES
                         );
                         // 强制 auto-compact：用 `compact_session` 压到尽量小（max_estimated_tokens=0）
-                        // 再 `continue` 重试本轮。`maybe_auto_compact` 轻量路径阈值不够低时撝不住，
+                        // 再 `continue` 重试本轮。`auto_compact_if_needed` 轻量路径阈值不够低时撝不住，
                         // 这里直接调 `compact_session` 强压。
                         let compact_result = compact_session(
                             &self.session,
@@ -734,21 +825,16 @@ where
             }
         }
 
-        let auto_compaction = self.maybe_auto_compact();
-        if let Some(event) = &auto_compaction {
-            write_auto_compact_diag(
-                event.removed_message_count,
-                self.auto_compaction_input_tokens_threshold,
-            );
-        }
-
+        // **2026-09-03 P2 修复**：turn 后的独立 auto-compact 触发点已删——触发收敛到
+        // 请求前单点（auto_compact_if_needed）。TurnSummary.auto_compaction 字段保留，
+        // 记录本轮请求前那次 compact 的 event（CLI 渲染与 jsonl 兼容不变）。
         let summary = TurnSummary {
             assistant_messages,
             tool_results,
             prompt_cache_events,
             iterations,
             usage: self.usage_tracker.cumulative_usage(),
-            auto_compaction,
+            auto_compaction: pre_turn_auto_compaction,
         };
         self.record_turn_completed(&summary);
 
@@ -793,35 +879,38 @@ where
         self.session
     }
 
-    fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
-        // Some providers (e.g. GLM) don't return input_tokens in usage.
-        // Fall back to a rough estimate from the session messages so
-        // auto-compact still triggers when the context grows large.
-        let input_tokens = self.usage_tracker.cumulative_usage().input_tokens;
-        let estimated_tokens = if input_tokens == 0 {
-            // **2026-07-23 CJK 感知估算**：bytes/4 对中文严重偏低（UTF-8 中文 3 bytes ≈ 1 token，
-            // 但 bytes/4 只算 0.75 token）。用 `estimate_tokens_mixed` 按 ASCII/非 ASCII 分开算。
-            let byte_count: usize = self
-                .session
-                .messages
-                .iter()
-                .map(|m| {
-                    m.blocks
-                        .iter()
-                        .map(|b| match b {
-                            ContentBlock::Text { text } => text.len(),
-                            ContentBlock::ToolUse { input, .. } => input.to_string().len(),
-                            ContentBlock::ToolResult { output, .. } => output.len(),
-                            _ => 0,
-                        })
-                        .sum::<usize>()
-                })
-                .sum::<usize>();
-            estimate_tokens_mixed(byte_count)
-        } else {
-            input_tokens
-        };
-        if estimated_tokens < self.auto_compaction_input_tokens_threshold {
+    /// **2026-09-03 P2 修复**：全 runtime 唯一的 proactive auto-compact 触发点——
+    /// 只在"发请求前"（run_turn loop 的 pre-flight 位置）调用。turn 结束后的独立
+    /// 触发点已删：两套触发点估算口径不一致，turn 后触发多一次前缀击穿风险
+    /// （对齐 claude-code query.ts:453 单触发点）。
+    ///
+    /// `snip_tokens_freed`：**Step 6（G6）占位参数**——microcompact/snip 本轮释放的量
+    /// 折算 tokens 后从触发估算中扣除（对齐 claude-code `snipTokensFreed`）。
+    /// 当前调用方传 0；等 Step 1-5 真机验证稳定后再接 `microcompact_session`
+    /// 的 `chars_freed` 折算（除以 CJK 估算比率 ~3）。
+    fn auto_compact_if_needed(&mut self, snip_tokens_freed: usize) -> Option<AutoCompactionEvent> {
+        // **2026-09-03 G5 熔断器**（对齐 claude-code autoCompact.ts:67-70
+        // `MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES=3`——Anthropic 实测"失败后连续重试
+        // 每天 250K 次 API 调用"的教训）：连续 3 次 proactive compact 无效
+        // （压不动 / 压后仍超阈值）即停手，交给 over_size_400 reactive 降级路径兜底；
+        // compact 生效（removed>0 且压后低于阈值）后计数清零恢复尝试。
+        if self.auto_compact_consecutive_failures >= MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES {
+            eprintln!(
+                "[auto-compact: ineffective ×{}/{} — 熔断停手，交给 over_size_400 reactive 兜底]",
+                self.auto_compact_consecutive_failures, MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES
+            );
+            return None;
+        }
+
+        // **2026-09-03 P1 修复**：触发判断改用回执锚点估算（对齐 claude-code
+        // tokenCountWithEstimation）。此前读 `cumulative_usage().input_tokens`——
+        // cumulative 是跨 turn 累加的计费/统计值，只增不减、不是当前上下文大小：
+        // 一旦累计破阈值，之后每轮都满足条件，会 2-3 轮压一次停不下来（3 小时 31 次
+        // auto_compact 的日志铁证）。锚点 = 最近一条带真实 usage 的 assistant 消息回执
+        // 全量 + 尾部粗估；找不到锚点走全量粗估兜底（含系统开销 15K）。
+        let estimated_tokens =
+            estimate_context_tokens(&self.session).saturating_sub(snip_tokens_freed);
+        if estimated_tokens < self.auto_compaction_input_tokens_threshold as usize {
             return None;
         }
 
@@ -834,45 +923,45 @@ where
         );
 
         if result.removed_message_count == 0 {
+            // 压不动（可压缩消息不足 preserve_recent 等）——计一次无效。
+            self.auto_compact_consecutive_failures += 1;
+            eprintln!(
+                "[auto-compact: ineffective ×{}/{} — compact 压不动]",
+                self.auto_compact_consecutive_failures, MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES
+            );
             return None;
         }
 
         self.session = result.compacted_session;
-        Some(AutoCompactionEvent {
+        let event = AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
-        })
-    }
+        };
 
-    /// Returns true if the current session is large enough to risk a
-    /// provider-side rejection (e.g. GLM's 400 Bad Request) and should
-    /// be compacted BEFORE the next API call.
-    fn session_needs_pre_flight_compact(&self) -> bool {
-        // **2026-07-23 CJK 感知 + 系统开销估算**：
-        // 之前用 bytes/4 对中文内容严重偏低（实际≈ bytes/3），导致 pre-flight
-        // 放行了实际已超 GLM 输入预算的请求。现改用 `estimate_tokens_mixed`，
-        // 并加上系统提示词+工具定义的开销估算（~15K tokens）。
-        let byte_count: usize = self
-            .session
-            .messages
-            .iter()
-            .map(|m| {
-                m.blocks
-                    .iter()
-                    .map(|b| match b {
-                        ContentBlock::Text { text } => text.len(),
-                        ContentBlock::ToolUse { input, .. } => input.to_string().len(),
-                        ContentBlock::ToolResult { output, .. } => output.len(),
-                        _ => 0,
-                    })
-                    .sum::<usize>()
-            })
-            .sum::<usize>();
-        let estimated_tokens = estimate_tokens_mixed(byte_count);
-        // 加上系统提示词 + 工具定义的开销（子 agent 约 10-15K tokens）。
-        // 主 LLM 路径也适用——系统提示词始终随请求发送但不计入 session messages。
-        const SYSTEM_OVERHEAD_TOKENS: u32 = 15_000;
-        let total_estimate = estimated_tokens.saturating_add(SYSTEM_OVERHEAD_TOKENS);
-        total_estimate >= self.auto_compaction_input_tokens_threshold
+        if estimate_context_tokens(&self.session)
+            >= self.auto_compaction_input_tokens_threshold as usize
+        {
+            // 压了但没压到阈值下——计无效但不吞事件：compact 确实发生，
+            // TurnSummary/diag 如实记录；连续 3 次后熔断。
+            self.auto_compact_consecutive_failures += 1;
+            eprintln!(
+                "[auto-compact: ineffective ×{}/{} — 压后仍超阈值]",
+                self.auto_compact_consecutive_failures, MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES
+            );
+        } else {
+            // compact 生效（removed>0 且压后低于阈值）——清零恢复尝试。
+            self.auto_compact_consecutive_failures = 0;
+        }
+
+        // diag 事件发射随触发点收敛——只有真正 compact 时才发（原 turn 后触发点已删）。
+        eprintln!(
+            "[auto-compacted: removed {} messages]",
+            event.removed_message_count
+        );
+        write_auto_compact_diag(
+            event.removed_message_count,
+            self.auto_compaction_input_tokens_threshold,
+        );
+        Some(event)
     }
 
     fn record_turn_started(&self, user_input: &str) {
@@ -983,20 +1072,26 @@ where
     }
 }
 
-/// **2026-07-23 CJK 感知 token 估算**：替代原来的 `bytes / 4` 硬编码。
+/// 对齐 claude-code `getAutoCompactThreshold`（autoCompact.ts:72-91）的阈值公式
+/// （**2026-09-03 P3 修复**）：
 ///
-/// 原理：
-/// - 纯英文/代码：UTF-8 1 byte/char，tokenizer ~4 chars/token → bytes/4
-/// - 纯中文：UTF-8 3 bytes/char，tokenizer ~1 token/char → bytes/3
-/// - 混合内容：取两者中间值 bytes/3 作为保守估算（宁可早 compact 也不撑爆 400）
+/// ```text
+/// 有效窗口预留 = min(max_output, 20K 摘要预留)   // MAX_OUTPUT_TOKENS_FOR_SUMMARY
+/// 触发阈值     = 窗口 − 预留 − 13K 缓冲          // AUTOCOMPACT_BUFFER_TOKENS
+/// 下限保护     = 55K                              // 防小窗口频繁 compact 反伤缓存
+/// ```
 ///
-/// 用 bytes/3 而非精确统计非 ASCII 字节数，因为：
-/// 1. 子 agent 读的文件多为中文注释+英文代码混合，bytes/3 是安全上界
-/// 2. 早触发 compact 的代价（丢失部分上下文）远小于 400 错误的代价（整个任务失败）
-/// 3. 避免遍历内容统计字节分布的性能开销
+/// 200K/64K → 167K（83.5%）；1M/64K → 967K；200K/8K → 179K（max_output 低于 20K 按实际预留）。
+/// `max_output` 高于 20K 时只预留 20K——摘要调用本身用不了那么多输出。
 #[must_use]
-fn estimate_tokens_mixed(byte_count: usize) -> u32 {
-    (byte_count as u64 / 3) as u32
+pub fn autocompact_threshold_formula(context_window_tokens: u32, max_output_tokens: u32) -> u32 {
+    const MAX_OUTPUT_TOKENS_FOR_SUMMARY: u32 = 20_000;
+    const AUTOCOMPACT_BUFFER_TOKENS: u32 = 13_000;
+    let reserve = max_output_tokens.min(MAX_OUTPUT_TOKENS_FOR_SUMMARY);
+    let threshold = context_window_tokens
+        .saturating_sub(reserve)
+        .saturating_sub(AUTOCOMPACT_BUFFER_TOKENS);
+    threshold.max(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
 }
 
 /// Reads the automatic compaction threshold from the environment.
@@ -1004,6 +1099,11 @@ fn estimate_tokens_mixed(byte_count: usize) -> u32 {
 /// 1. CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS (direct token count)
 /// 2. CLAUDE_CODE_AUTO_COMPACT_PCT_OVERRIDE + CLAUDE_CODE_AUTO_COMPACT_WINDOW (percentage of context window)
 /// 3. Default: 55,000 tokens
+///
+/// **2026-09-03 G4**：本函数只提供 `new()` 时的**兜底初值**（无窗口信息时的语义）。
+/// 主 lane 随后调 `with_model_context_window(窗口, max_output)`，按"env 只能提前
+/// 不能拖后"的 min 封顶语义重算（WINDOW 是封顶有效窗口、显式阈值取 min）。
+/// 逃生口 `CLAUDE_AUTOCOMPACT_THRESHOLD_UNCAPPED=1` 只在该 builder 生效。
 #[must_use]
 pub fn auto_compaction_threshold_from_env() -> u32 {
     // First check for direct token threshold
@@ -1163,9 +1263,9 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_assistant_message, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
-        ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolExecutor,
-        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        autocompact_threshold_formula, build_assistant_message, ApiClient, ApiRequest,
+        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
+        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -1844,7 +1944,11 @@ mod tests {
     }
 
     #[test]
-    fn auto_compacts_when_cumulative_input_threshold_is_crossed() {
+    fn auto_compacts_when_receipt_anchor_exceeds_threshold() {
+        // **2026-09-03 P1+P2 修订**：触发判断 = 最近一条真实回执锚点（input+output+cache，
+        // 不再读 cumulative 跨 turn 累加值）；触发点 = 请求前 pre-flight（turn 后独立
+        // 触发点已删）。本轮跨阈值 → 本轮 summary.auto_compaction = None，下一轮
+        // 请求前才 compact 并记录到那一轮的 TurnSummary。
         struct SimpleApi;
         impl ApiClient for SimpleApi {
             fn stream(
@@ -1885,16 +1989,21 @@ mod tests {
         )
         .with_auto_compaction_input_tokens_threshold(100_000);
 
-        let summary = runtime
+        let first = runtime
             .run_turn("trigger", None)
             .expect("turn should succeed");
-
         assert_eq!(
-            summary.auto_compaction,
-            Some(AutoCompactionEvent {
-                removed_message_count: 2,
-            })
+            first.auto_compaction, None,
+            "turn 后触发点已删——跨阈值留到下一轮请求前处理"
         );
+
+        let second = runtime
+            .run_turn("continue", None)
+            .expect("follow-up turn should succeed");
+        let event = second
+            .auto_compaction
+            .expect("next turn pre-flight should compact once the anchor exceeds threshold");
+        assert!(event.removed_message_count > 0);
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);
     }
 
@@ -1909,7 +2018,9 @@ mod tests {
                 Ok(vec![
                     AssistantEvent::TextDelta("done".to_string()),
                     AssistantEvent::Usage(TokenUsage {
-                        input_tokens: 99_999,
+                        // **2026-09-03 修订**：锚点语义下回执即"当前上下文总量"
+                        // （input+output），50_004 < 100_000 阈值 → 不触发 compact。
+                        input_tokens: 50_000,
                         output_tokens: 4,
                         cache_creation_input_tokens: 0,
                         cache_read_input_tokens: 0,
@@ -1964,6 +2075,16 @@ mod tests {
         );
     }
 
+    /// env 是进程级全局——`set_var`/`remove_var` 同一组 `CLAUDE_CODE_AUTO_COMPACT_*`
+    /// 的测试必须互斥，否则并行跑时互相污染（MEMORY 第 25 条坑；
+    /// 对齐 api crate cache_control 测试的 `static Mutex` 串行化范式）。
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// 构造一个最小可用的 ConversationRuntime 实例供 builder 测试用——
     /// 不跑 turn，只验 builder 设的字段值。对照 `auto_compacts_when_cumulative_input_threshold_is_crossed` 风格。
     /// ApiClient 用最简的 `SimpleApiForBuilder`（返回空流即可——builder 测试不会真调 stream）。
@@ -1983,27 +2104,177 @@ mod tests {
         )
     }
 
-    /// ★ 2026-07-19 multiprovider：strict 变体不读任何 env，强制用 `(context_window - max_output) × 75%`。
-    /// 验 DeepSeek V4 Pro 1M 窗口 + max_output=0 → 750K 阈值。
+    /// ★ 2026-07-19 multiprovider：strict 变体不读任何 env，强制用
+    /// `autocompact_threshold_formula`。验 DeepSeek V4 Pro 1M 窗口 + max_output=0 → 987K 阈值。
     #[test]
     fn with_model_context_window_strict_uses_dynamic_threshold_without_env() {
         let runtime = minimal_runtime().with_model_context_window_strict(1_000_000, 0);
         assert_eq!(
-            runtime.auto_compaction_input_tokens_threshold, 750_000,
-            "1M 窗口 × 75% = 750K，不读 env"
+            runtime.auto_compaction_input_tokens_threshold, 987_000,
+            "1M 窗口 − min(0, 20K) − 13K = 987K，不读 env"
         );
     }
 
-    /// ★ 2026-07-22：strict 变体验 GLM-5.1 场景——200K 窗口 - 64K max_output = 136K 输入预算，
-    /// 136K × 75% = 102K 阈值。确保 auto-compact 在输入超出实际上限前触发。
+    /// **2026-09-03 P3**：`autocompact_threshold_formula` 公式数值矩阵（对齐 claude-code
+    /// getAutoCompactThreshold）——20K 摘要预留封顶 + 13K 缓冲 + 55K 下限。
+    #[test]
+    fn autocompact_threshold_formula_matches_claude_code_matrix() {
+        // 200K/64K → 167K（min(64K, 20K)=20K 预留封顶）
+        assert_eq!(autocompact_threshold_formula(200_000, 64_000), 167_000);
+        // 200K/128K → 167K（max_output 高于 20K 时仍只预留 20K）
+        assert_eq!(autocompact_threshold_formula(200_000, 128_000), 167_000);
+        // 1M/64K → 967K
+        assert_eq!(autocompact_threshold_formula(1_000_000, 64_000), 967_000);
+        // 128K/8K → 107K（max_output=8K 低于 20K，按实际预留）
+        assert_eq!(autocompact_threshold_formula(128_000, 8_000), 107_000);
+        // 下限保护：60K 窗口算出 47K < 55K → 兜底 55K
+        assert_eq!(
+            autocompact_threshold_formula(60_000, 0),
+            DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
+        );
+    }
+
+    /// **2026-09-03 G5 熔断器**：连续 3 次压不动后第 4 次不再尝试（计数停在 3、
+    /// 会话未被压缩），交给 over_size_400 reactive 路径兜底。
+    #[test]
+    fn auto_compact_circuit_breaker_stops_after_3_failures() {
+        // 4 条大 user 消息：fallback 估算（50_004 + 15K 系统开销）≥ 60K 阈值 → 触发条件满足；
+        // 但 compactable.len() = 4 ≤ preserve_recent(4) → compact_session 压不动（removed=0）。
+        let mut session = Session::new();
+        let big = "x".repeat(50_000);
+        for _ in 0..4 {
+            session
+                .push_user_text(big.clone())
+                .expect("message should append");
+        }
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SimpleApiForBuilder,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(60_000);
+
+        for _ in 0..3 {
+            assert!(
+                runtime.auto_compact_if_needed(0).is_none(),
+                "压不动 → None 且计一次无效"
+            );
+        }
+        assert_eq!(runtime.auto_compact_consecutive_failures, 3);
+
+        // 第 4 次：熔断开路——不再尝试。若仍尝试会再计一次无效（计数到 4），
+        // 计数停在 3 即熔断生效的证据。
+        assert!(runtime.auto_compact_if_needed(0).is_none());
+        assert_eq!(
+            runtime.auto_compact_consecutive_failures, 3,
+            "熔断后不再尝试 compact，计数不再增长"
+        );
+        assert_eq!(runtime.session().messages.len(), 4, "会话未被压缩");
+    }
+
+    /// **2026-09-03 G5 熔断器**：连续无效（压不动）计数到 2 后，成功 compact 一次
+    /// （removed>0 且压后低于阈值）→ 计数清零，恢复后续尝试。
+    /// （熔断开路状态本身由上一条测试覆盖——3 次失败后停手，成功路径只能在
+    /// 计数 <3 时发生，这也是"连续失败"语义的本意。）
+    #[test]
+    fn auto_compact_circuit_breaker_resets_on_success() {
+        // 先制造 2 次压不动（4 条大消息：触发条件满足但 preserve_recent(4) 挡住压缩）
+        let mut session = Session::new();
+        let big = "x".repeat(50_000);
+        for _ in 0..4 {
+            session
+                .push_user_text(big.clone())
+                .expect("message should append");
+        }
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SimpleApiForBuilder,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(60_000);
+        for _ in 0..2 {
+            runtime.auto_compact_if_needed(0);
+        }
+        assert_eq!(runtime.auto_compact_consecutive_failures, 2);
+
+        // 换成"可压且压后低于阈值"的会话：50 条 6000 字符消息
+        // （fallback 估算 ≈ 50×1501 + 15K 开销 ≈ 90K ≥ 60K 阈值触发），
+        // compact 保留最近 4 条 → removed>0；压后（摘要 + 4 条 + 开销）远低于 60K → 成功。
+        let mut compactable_session = Session::new();
+        let padded = format!("m{} ", "y".repeat(5990));
+        for i in 0..50 {
+            compactable_session
+                .push_user_text(format!("{padded}{i}"))
+                .expect("message should append");
+        }
+        *runtime.session_mut() = compactable_session;
+
+        let event = runtime
+            .auto_compact_if_needed(0)
+            .expect("可压会话应触发 compact");
+        assert!(event.removed_message_count > 0);
+        assert_eq!(
+            runtime.auto_compact_consecutive_failures, 0,
+            "compact 生效后计数清零恢复尝试"
+        );
+
+        // 清零后熔断器不再开路——空会话估算 < 阈值 → 不触发也不计数。
+        *runtime.session_mut() = Session::new();
+        assert!(runtime.auto_compact_if_needed(0).is_none());
+        assert_eq!(runtime.auto_compact_consecutive_failures, 0);
+    }
+
+    /// ★ 2026-07-22：strict 变体验 GLM-5.1 场景——200K 窗口。
+    /// **2026-09-03 P3 换公式**：(200K − min(64K, 20K 摘要预留) − 13K 缓冲) = 167K（83.5%），
+    /// 对齐 claude-code getAutoCompactThreshold。200K 级 LLM 触发在 167K，
+    /// 比 75% 版（102K）晚 65K，减少 compact 次数保护前缀缓存；
+    /// 输入余量 33K（200K − 167K）> 0，不会撑爆窗口（over_size 400 由 reactive 路径兜底）。
     #[test]
     fn with_model_context_window_strict_glm51_scenario() {
         // GLM-5.1: context=200K, effective max_tokens=64K
         let runtime = minimal_runtime().with_model_context_window_strict(200_000, 64_000);
         assert_eq!(
-            runtime.auto_compaction_input_tokens_threshold, 102_000,
-            "(200K - 64K) × 75% = 102K，安全低于 136K 输入上限"
+            runtime.auto_compaction_input_tokens_threshold, 167_000,
+            "200K − min(64K, 20K) − 13K = 167K，对齐 claude-code 公式"
         );
+    }
+
+    /// ★ 2026-09-03 缓存命中率长效修复：`with_cache_mode_for_model` 按**当前调度的 model 名**
+    /// 分缓存模式——仅 glm-5.1（含大小写/日期后缀变体）维持老压缩机制
+    /// （`microcompact_high_cache_mode = false`），其他一切模型走高缓存命中模式（`true`）。
+    #[test]
+    fn with_cache_mode_for_model_only_glm51_keeps_legacy_compaction() {
+        assert!(
+            !minimal_runtime()
+                .with_cache_mode_for_model("glm-5.1")
+                .microcompact_high_cache_mode(),
+            "glm-5.1 必须维持老激进压缩机制"
+        );
+        assert!(
+            !minimal_runtime()
+                .with_cache_mode_for_model("GLM-5.1-0731")
+                .microcompact_high_cache_mode(),
+            "glm-5.1 日期后缀变体仍走老机制"
+        );
+        for model in [
+            "glm-5.2",
+            "GLM-5.2",
+            "glm-5",
+            "deepseek-v4-pro",
+            "DeepSeek-V4-Flash-0731",
+            "claude-opus-4-6",
+        ] {
+            assert!(
+                minimal_runtime()
+                    .with_cache_mode_for_model(model)
+                    .microcompact_high_cache_mode(),
+                "{model} 必须走高缓存命中模式"
+            );
+        }
     }
 
     /// ★ 2026-07-19 multiprovider：strict 变体**不读 env 覆盖**——
@@ -2011,6 +2282,7 @@ mod tests {
     /// 这是 strict 变体与原 `with_model_context_window` 的核心差异点。
     #[test]
     fn with_model_context_window_strict_ignores_env_override() {
+        let _env_guard = lock_env();
         // 模拟主 LLM 在 .claw.json env 段设的全局阈值——这套是针对主 LLM 算的，
         // 不该施加到子 agent 上（主=DeepSeek 1M 时这套 env 设 131K 是给 GLM 200K 用的，
         // 强加到子 agent=DeepSeek 1M 会被压到 131K 频繁 compact 反伤缓存）。
@@ -2020,8 +2292,8 @@ mod tests {
 
         let runtime = minimal_runtime().with_model_context_window_strict(1_000_000, 0);
         assert_eq!(
-            runtime.auto_compaction_input_tokens_threshold, 750_000,
-            "strict 路径必须忽略 env 覆盖，按 (1M - 0) × 75% = 750K 算"
+            runtime.auto_compaction_input_tokens_threshold, 987_000,
+            "strict 路径必须忽略 env 覆盖，按 1M − 0 − 13K = 987K 算"
         );
 
         // 清理 env 防止污染后续测试
@@ -2031,49 +2303,110 @@ mod tests {
     }
 
     /// ★ 2026-07-19 multiprovider：strict 变体保留下限保护——
-    /// 子 agent 走小窗口模型（如 DeepSeek-v4-flash 128K）算出 96K 阈值，
+    /// 子 agent 走小窗口模型（假设 128K 窗口）算出 115K 阈值，
     /// 仍被 `DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD` 55K 下限保护兜底。
     /// 太小阈值频繁 compact 反伤缓存，对子 agent 仍是不良。
     #[test]
     fn with_model_context_window_strict_keeps_floor_protection() {
-        // (128K - 0) × 75% = 96K > 55K 下限，直接用 96K
+        // (128K − 0 − 13K) = 115K > 55K 下限，直接用 115K
         let runtime = minimal_runtime().with_model_context_window_strict(128_000, 0);
         assert_eq!(
-            runtime.auto_compaction_input_tokens_threshold, 96_000,
-            "(128K - 0) × 75% = 96K > 55K 下限，用 96K"
+            runtime.auto_compaction_input_tokens_threshold, 115_000,
+            "128K − 0 − 13K = 115K > 55K 下限，用 115K"
         );
 
-        // (50K - 0) × 75% = 37.5K < 55K 下限，兖底到 55K
+        // (50K − 0 − 13K) = 37K < 55K 下限，兜底到 55K
         let runtime = minimal_runtime().with_model_context_window_strict(50_000, 0);
         assert_eq!(
             runtime.auto_compaction_input_tokens_threshold,
             DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
-            "(50K - 0) × 75% = 37.5K < 55K 下限，兖底到 55K"
+            "50K − 0 − 13K = 37K < 55K 下限，兜底到 55K"
         );
     }
 
-    /// ★ 2026-07-19 multiprovider：对照测试——原 `with_model_context_window` **会被 env 覆盖**。
-    /// 同样的 env 设定下，原路径不动态算（保留 `new()` 里 `auto_compaction_threshold_from_env()` 读的 env 值），
-    /// strict 路径强制动态算（用 750K）。这条测试佐证两条路径彻底独立。
+    /// ★ 2026-07-19 multiprovider + **2026-09-03 G4 封顶修订**：原路径 env 覆盖从
+    /// "替代"改为"min 封顶"——INPUT_TOKENS 比公式默认小 → 提前（用户意图保留）；
+    /// 比公式默认大 → 被公式值封顶（旧语义会让 1M 窗口被 131K 旧值顶回去，频繁 compact）。
     ///
-    /// **注意**：cargo test 默认并行跑，env 是进程级全局——本测试和 `with_model_context_window_strict_ignores_env_override`
-    /// 都用 `set_var`/`remove_var` 操作同一组 env，交错时会污染。改用**串行模式**跑这条对照测试
-    /// （`cargo test -- --test-threads=1` 或单独 `cargo test with_model_context_window_original`）才能稳定。
+    /// **注意**：cargo test 默认并行跑，env 是进程级全局——本测试和
+    /// `with_model_context_window_strict_ignores_env_override` 用同一组 env，
+    /// 交错时会污染。改用**串行模式**跑（`cargo test -- --test-threads=1`）才稳定。
     #[test]
-    fn with_model_context_window_original_path_still_reads_env_override() {
-        // 自设 env——不依赖其他测试的时序
+    fn with_model_context_window_input_tokens_env_is_capped_not_replacement() {
+        let _env_guard = lock_env();
+        // 提前方向：env 131K < 公式默认 967K → 用 env 值（用户"更早触发"的意图保留）
         std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS", "131000");
-        // 关键：`with_model_context_window` 的逻辑是"两个 env 都没设才动态算"，
-        // 我们设了 INPUT_TOKENS，那它就**不进入**动态算分支，
-        // 字段保持 `ConversationRuntime::new()` 构造时调 `auto_compaction_threshold_from_env()`
-        // 读 INPUT_TOKENS=131000 算出的 131K。
-        let runtime = minimal_runtime().with_model_context_window(1_000_000);
+        let runtime = minimal_runtime().with_model_context_window(1_000_000, 64_000);
         assert_eq!(
             runtime.auto_compaction_input_tokens_threshold, 131_000,
-            "原路径 env 设了 INPUT_TOKENS=131000 就用 131000，不动态算 750K"
+            "env INPUT_TOKENS=131000 比公式 967K 小 → min 取 env（提前方向生效）"
         );
-
         std::env::remove_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS");
+
+        // 拖后方向：env 2M > 公式默认 967K → 被公式封顶（**封顶语义核心断言**）
+        std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS", "2000000");
+        let runtime = minimal_runtime().with_model_context_window(1_000_000, 64_000);
+        assert_eq!(
+            runtime.auto_compaction_input_tokens_threshold, 967_000,
+            "env INPUT_TOKENS=2M 比公式 967K 大 → 被公式封顶，env 不能拖后"
+        );
+        std::env::remove_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS");
+    }
+
+    /// **2026-09-03 G4**：`CLAUDE_CODE_AUTO_COMPACT_WINDOW` 从"替代窗口"改为
+    /// "封顶有效窗口"——env 131K + 模型 1M → 有效窗口 = min(1M, 131K) = 131K，
+    /// 阈值按 131K 进公式（131K − 20K − 13K = 98K），**不是**直接拿 env 当阈值，
+    /// 也**不是**拿 131K 当替代窗口×75%。
+    ///
+    /// **注意**：env 全局污染——须 `--test-threads=1` 串行跑。
+    #[test]
+    fn with_model_context_window_env_is_capped_not_replacement() {
+        let _env_guard = lock_env();
+        std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "131000");
+        let runtime = minimal_runtime().with_model_context_window(1_000_000, 64_000);
+        assert_eq!(
+            runtime.auto_compaction_input_tokens_threshold, 98_000,
+            "env WINDOW=131000 封顶有效窗口 → 公式(131K − 20K − 13K) = 98K"
+        );
+        std::env::remove_var("CLAUDE_CODE_AUTO_COMPACT_WINDOW");
+    }
+
+    /// **2026-09-03 G4**：PCT+WINDOW 组合路径同样受封顶。WINDOW 同时有两重作用：
+    /// ①封顶公式侧有效窗口（1M → 131K，公式 = 131K−20K−13K = 98K）；
+    /// ②PCT 组合算出原始 env 阈值（131K × 75% = 98250）。
+    /// 最终 min(98250, 98000) = 98000——env 侧任何来源都不能拖后于公式值。
+    ///
+    /// **注意**：env 全局污染——须 `--test-threads=1` 串行跑。
+    #[test]
+    fn with_model_context_window_pct_override_is_capped_by_formula() {
+        let _env_guard = lock_env();
+        std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_PCT_OVERRIDE", "75");
+        std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "131000");
+        let runtime = minimal_runtime().with_model_context_window(1_000_000, 64_000);
+        assert_eq!(
+            runtime.auto_compaction_input_tokens_threshold, 98_000,
+            "WINDOW 封顶有效窗口 → 公式 98K；PCT 值 98250 > 98K → min 取公式 98000"
+        );
+        std::env::remove_var("CLAUDE_CODE_AUTO_COMPACT_PCT_OVERRIDE");
+        std::env::remove_var("CLAUDE_CODE_AUTO_COMPACT_WINDOW");
+    }
+
+    /// **2026-09-03 G4 逃生口**：`CLAUDE_AUTOCOMPACT_THRESHOLD_UNCAPPED=1` 时跳过封顶，
+    /// 恢复旧"env 显式替代"语义（调试用）。
+    ///
+    /// **注意**：env 全局污染——须 `--test-threads=1` 串行跑。
+    #[test]
+    fn with_model_context_window_uncapped_escape_hatch_restores_replacement_semantics() {
+        let _env_guard = lock_env();
+        std::env::set_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS", "2000000");
+        std::env::set_var("CLAUDE_AUTOCOMPACT_THRESHOLD_UNCAPPED", "1");
+        let runtime = minimal_runtime().with_model_context_window(1_000_000, 64_000);
+        assert_eq!(
+            runtime.auto_compaction_input_tokens_threshold, 2_000_000,
+            "逃生口开启 → env 原始值直接采用（旧替代语义），不被公式封顶"
+        );
+        std::env::remove_var("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS");
+        std::env::remove_var("CLAUDE_AUTOCOMPACT_THRESHOLD_UNCAPPED");
     }
 
     #[test]

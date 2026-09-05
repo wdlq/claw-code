@@ -167,7 +167,12 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
-const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// **2026-08-17 修订**（对齐用户定义"工具调用期间不算超时；工具结果上传云端后 600s 没返回才算超时"）：
+/// 原值 10s 太短——GLM 5.1 "想"很久才发第一个 SSE 事件是正常的，10s 会误切非流式 fallback。
+/// 改成 600s：只在"等第一个事件"窗口生效（`apply_stall_timeout && !received_any_event`），
+/// 收到第一个事件后流内不再有任何超时——GLM 5-6 分钟大段生成是正常的，不该硬切。
+/// 工具执行期间本地跑，不发云端请求，自然不触此超时。
+const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(600);
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
 const OFFICIAL_REPO_URL: &str = "https://github.com/ultraworkers/claw-code";
@@ -8751,10 +8756,34 @@ fn build_runtime_with_plugin_state(
         system_prompt,
         &feature_config,
     );
-    // 二期-C1：按模型上下文窗口动态算auto-compact阈值。
-    // DeepSeek V4 Pro 1M窗口→750K才压，几乎不触发，前缀稳定→DeepSeek硬盘缓存命中。
+    // ★ 2026-09-03 缓存命中率长效修复：按**当前调度的 model 名**分两条缓存策略——
+    // - 仅 glm-5.1：维持"GLM-5.1 小窗口激进压缩"老机制——窗口动态阈值走
+    //   `with_model_context_window`（保留 env 覆盖能力，.claw.json 里针对 GLM 的配置继续生效），
+    //   microcompact 常规 snip/清空照跑（`with_cache_mode_for_model` 置 false）。
+    // - 其他一切模型（glm-5.2 / glm 系其他 / deepseek 系等）：高缓存命中模式——
+    //   strict 动态阈值**不读 env**（用户为 GLM-5.1 时代配的 `CLAUDE_CODE_AUTO_COMPACT_*`
+    //   旧值不顶回 1M 窗口；2026-09-03 实测根因就是阈值被压到 55K 后 3 小时 31 次
+    //   auto-compact 反复击穿前缀缓存），microcompact 只保留 emergency 清。
+    // 修复前此处还有个静默坑：model_token_limit 对 "GLM-5.2"/"DeepSeek-V4-Flash-0731"
+    // 查表失败 → if-let 整段跳过 → 阈值回落 55K 默认值。api 层归一化 + glm-5.2 条目 +
+    // 前缀兜底后，网关回显名也能命中，动态阈值真正生效。
+    runtime = runtime.with_cache_mode_for_model(&model);
     if let Some(limit) = api::model_token_limit(&model) {
-        runtime = runtime.with_model_context_window(limit.context_window_tokens);
+        if api::is_glm51_cache_model(&model) {
+            // GLM-5.1 老机制：env 显式阈值优先，否则按公式动态算（窗口 − min(max_output, 20K) − 13K）。
+            runtime = runtime.with_model_context_window(
+                limit.context_window_tokens,
+                api::max_tokens_for_model(&model),
+            );
+        } else {
+            // 高缓存命中模式：strict 变体不读任何 env，按公式（窗口 − min(max_output, 20K) − 13K）算。
+            // GLM-5.2 1M → 967K；deepseek-v4-flash 1M（max_output 8,192 全额预留）→ 978K。
+            let effective_max_tokens = api::max_tokens_for_model(&model);
+            runtime = runtime.with_model_context_window_strict(
+                limit.context_window_tokens,
+                effective_max_tokens,
+            );
+        }
     }
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
@@ -8924,6 +8953,15 @@ impl AnthropicRuntimeClient {
                 ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
             }
         };
+        // ★ 2026-09-03 高缓存命中模式：仅 glm-5.1 保留 cache_control 标记注入
+        //（真 Anthropic 协议后端需要）；其他模型（glm-5.2 / deepseek 系等）走自动前缀
+        // 缓存网关，标记是 Ignored 死字节，禁用以省 token。
+        // 提前算好——struct 字面量里 `model,` 字段会 move 掉 model，不能再 `&model`。
+        let cache_config = if api::is_glm51_cache_model(&model) {
+            api::CacheConfig::from_env()
+        } else {
+            api::CacheConfig::disabled()
+        };
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
@@ -8937,7 +8975,7 @@ impl AnthropicRuntimeClient {
             reasoning_effort: None,
             abort_signal: None,
             plugin_max_output_tokens: None,
-            cache_config: api::CacheConfig::from_env(),
+            cache_config,
         })
     }
 
@@ -8997,16 +9035,16 @@ impl ApiClient for AnthropicRuntimeClient {
         };
 
         self.runtime.block_on(async {
-            // When resuming after tool execution, apply a stall timeout on the
-            // first stream event.  If the model does not respond within the
-            // deadline we drop the stalled connection and re-send the request as
-            // a continuation nudge (one retry only).
+            // **2026-08-17 修订**：按用户定义"工具结果上传云端后 600s 没返回才算超时"——
+            // **所有请求**都是把上下文上传云端等返回，都该有 POST_TOOL_STALL_TIMEOUT=600s 保护，
+            // 不只 post-tool 请求。原 `is_post_tool && attempt == 1` 让非 post-tool 请求完全不生效，
+            // GLM 网关卡死时主 agent 无限阻塞。
+            // `max_attempts` 那段"post-tool stall 时 nudge 重发"逻辑保持原样——
+            // 非 post-tool 请求 stall 后走 consume_stream 内部的非流式 fallback（`send_message`）。
             let max_attempts: usize = if is_post_tool { 2 } else { 1 };
 
             for attempt in 1..=max_attempts {
-                let result = self
-                    .consume_stream(&message_request, is_post_tool && attempt == 1)
-                    .await;
+                let result = self.consume_stream(&message_request, attempt == 1).await;
                 match result {
                     Ok(events) => return Ok(events),
                     Err(error)
