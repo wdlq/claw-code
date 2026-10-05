@@ -3406,7 +3406,7 @@ fn load_agents_from_roots(
         let mut root_agents = Vec::new();
         for entry in fs::read_dir(root)? {
             let entry = entry?;
-            if entry.path().extension().is_none_or(|ext| ext != "toml") {
+            if entry.path().extension().map_or(true, |ext| ext != "toml") {
                 continue;
             }
             let contents = fs::read_to_string(entry.path())?;

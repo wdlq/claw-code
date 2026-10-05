@@ -4,4 +4,8 @@ target/
 # Claw Code local artifacts
 .claw/settings.local.json
 .claw/sessions/
+.claw/persisted/
 .clawhip/
+# Test sandbox scratch (created by cargo test under crates/*)
+.sandbox-tmp/
+.sandbox-home/

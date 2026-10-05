@@ -126,7 +126,7 @@ pub fn validate_packet(packet: TaskPacket) -> Result<ValidatedPacket, TaskPacket
         && packet
             .recovery_policy
             .as_ref()
-            .is_none_or(|policy| policy.trim().is_empty())
+            .map_or(true, |policy| policy.trim().is_empty())
     {
         errors.push("escalation_policy or recovery_policy must not be empty".to_string());
     }
@@ -201,7 +201,7 @@ fn validate_scope_requirements(packet: &TaskPacket, errors: &mut Vec<String>) {
         && packet
             .scope_path
             .as_ref()
-            .is_none_or(|p| p.trim().is_empty())
+            .map_or(true, |p| p.trim().is_empty())
     {
         errors.push(format!(
             "scope_path is required for scope '{}'",

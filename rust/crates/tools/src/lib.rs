@@ -258,7 +258,7 @@ impl GlobalToolRegistry {
     pub fn definitions(&self, allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolDefinition> {
         let builtin = mvp_tool_specs()
             .into_iter()
-            .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
+            .filter(|spec| allowed_tools.map_or(true, |allowed| allowed.contains(spec.name)))
             .map(|spec| ToolDefinition {
                 name: spec.name.to_string(),
                 description: Some(spec.description.to_string()),
@@ -268,7 +268,9 @@ impl GlobalToolRegistry {
         let runtime = self
             .runtime_tools
             .iter()
-            .filter(|tool| allowed_tools.is_none_or(|allowed| allowed.contains(tool.name.as_str())))
+            .filter(|tool| {
+                allowed_tools.map_or(true, |allowed| allowed.contains(tool.name.as_str()))
+            })
             .map(|tool| ToolDefinition {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
@@ -279,8 +281,9 @@ impl GlobalToolRegistry {
             .plugin_tools
             .iter()
             .filter(|tool| {
-                allowed_tools
-                    .is_none_or(|allowed| allowed.contains(tool.definition().name.as_str()))
+                allowed_tools.map_or(true, |allowed| {
+                    allowed.contains(tool.definition().name.as_str())
+                })
             })
             .map(|tool| ToolDefinition {
                 name: tool.definition().name.clone(),
@@ -297,19 +300,22 @@ impl GlobalToolRegistry {
     ) -> Result<Vec<(String, PermissionMode)>, String> {
         let builtin = mvp_tool_specs()
             .into_iter()
-            .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
+            .filter(|spec| allowed_tools.map_or(true, |allowed| allowed.contains(spec.name)))
             .map(|spec| (spec.name.to_string(), spec.required_permission));
         let runtime = self
             .runtime_tools
             .iter()
-            .filter(|tool| allowed_tools.is_none_or(|allowed| allowed.contains(tool.name.as_str())))
+            .filter(|tool| {
+                allowed_tools.map_or(true, |allowed| allowed.contains(tool.name.as_str()))
+            })
             .map(|tool| (tool.name.clone(), tool.required_permission));
         let plugin = self
             .plugin_tools
             .iter()
             .filter(|tool| {
-                allowed_tools
-                    .is_none_or(|allowed| allowed.contains(tool.definition().name.as_str()))
+                allowed_tools.map_or(true, |allowed| {
+                    allowed.contains(tool.definition().name.as_str())
+                })
             })
             .map(|tool| {
                 permission_mode_from_plugin(tool.required_permission())
@@ -2294,7 +2300,7 @@ fn classify_glob_permission(input: &GlobSearchInputValue) -> PermissionMode {
     let base_allowed = input
         .path
         .as_deref()
-        .is_none_or(|path| path_within_current_workspace(path, false));
+        .map_or(true, |path| path_within_current_workspace(path, false));
     let pattern_allowed = path_within_current_workspace(&input.pattern, true);
     if base_allowed && pattern_allowed {
         PermissionMode::ReadOnly
@@ -2307,7 +2313,7 @@ fn classify_grep_permission(input: &GrepSearchInput) -> PermissionMode {
     if input
         .path
         .as_deref()
-        .is_none_or(|path| path_within_current_workspace(path, false))
+        .map_or(true, |path| path_within_current_workspace(path, false))
     {
         PermissionMode::ReadOnly
     } else {
@@ -5942,7 +5948,7 @@ impl ToolExecutor for SubagentToolExecutor {
 fn tool_specs_for_allowed_tools(allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolSpec> {
     mvp_tool_specs()
         .into_iter()
-        .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
+        .filter(|spec| allowed_tools.map_or(true, |allowed| allowed.contains(spec.name)))
         .collect()
 }
 

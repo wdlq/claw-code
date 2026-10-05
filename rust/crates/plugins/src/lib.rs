@@ -1390,7 +1390,7 @@ impl PluginManager {
             let existing_record = registry.plugins.get(&plugin_id);
             let installed_copy_is_valid =
                 install_path.exists() && load_plugin_from_directory(&install_path).is_ok();
-            let needs_sync = existing_record.is_none_or(|record| {
+            let needs_sync = existing_record.map_or(true, |record| {
                 record.kind != PluginKind::Bundled
                     || record.version != manifest.version
                     || record.name != manifest.name

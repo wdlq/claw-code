@@ -5,7 +5,7 @@ use std::io::{self, IsTerminal, Write};
 
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
-use rustyline::highlight::{CmdKind, Highlighter};
+use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
@@ -140,7 +140,7 @@ impl Highlighter for SlashCommandHelper {
         Cow::Borrowed(line)
     }
 
-    fn highlight_char(&self, line: &str, _pos: usize, _kind: CmdKind) -> bool {
+    fn highlight_char(&self, line: &str, _pos: usize, _forced: bool) -> bool {
         self.set_current_line(line);
         false
     }
