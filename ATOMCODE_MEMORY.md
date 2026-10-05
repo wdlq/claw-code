@@ -1773,7 +1773,106 @@ grep -oE "cache_read=[0-9]+" "$LOG" | sort -t= -k2 -n | tail -5
 
 **验证**：`cargo test -p api --lib` 164 passed 0 failed；`cargo check --workspace`/fmt/clippy 零新增。
 
-37. ★ 2026-09-03 新增（窗口矩阵用户裁定，第 34 条 threshold 指纹判读法的修订）：**仅 glm-5.1 是 200K + 老压缩模式；其余全系（glm-5.2/5.3、deepseek pro/flash）一律 1M + 前缀缓存（高缓存命中）模式**。查表指纹：deepseek-v4-flash=1M（不是 128K——那是映射推断错值，用户已推翻）；glm-5.* 前缀兜底=1M（glm-5.1 走精确条目不受影响）。**子 agent 阈值判读矩阵**：glm-5.1=160000 / glm-5.2=967000 / deepseek-v4-flash=978808（max_output 8,192 全额预留）。扒日志判 threshold 按此矩阵对号，别再用 107000/90K 旧指纹。
+37. ★ 2026-09-03 新增（窗口矩阵用户裁定，第 34 条 threshold 指纹判读法的修订）：**仅 glm-5.1 是 200K + 老压缩模式；其余全系（glm-5.2/5.3、deepseek pro/flash）一律 1M + 前缀缓存（高缓存命中）模式**。查表指纹：deepseek-v4-flash=1M（不是 128K——那是映射推断错值，用户已推翻）；glm-5.* 前缀兜底=1M（glm-5.1 走精确条目不受影响）。**子 agent 阈值判读矩阵**：glm-5.1=160000 / glm-5.2=967000 / deepseek-flash=967000（2026-09-28 改名后 max_output 384K 被 min 截到 20K）。扒日志判 threshold 按此矩阵对号，别再用 107000/90K 旧指纹。
+
+---
+
+## ★ 2026-09-28 模型改名：deepseek-v4-flash → deepseek-flash（本次会话）
+
+### 用户裁定
+1. `deepseek-v4-flash` 老名**完全弃用**，官方新名 `deepseek-flash`
+2. max_output **8,192 → 384K**（原 8,192 是沿用 v4-pro 的错误推断，非官方值）
+3. 窗口仍是 1M、前缀缓存模式不变（`is_glm51_cache_model` 本就不认 deepseek 系）
+
+### 改动清单（全部已验证：cargo check ✅ / api 3 组测试 ✅ / runtime+tools 测试 ✅ / fmt ✅）
+| 文件 | 改动 |
+|------|------|
+| `api/src/providers/mod.rs` | 精确条目换 `"deepseek-flash"`（384_000 / 1_000_000）；前缀兜底加老名→新名别名归并（`deepseek-v4-flash*` replacen 成 `deepseek-flash*` 再匹配，历史网关回显名不回归）；`model_registry_key` 文档加改名记录；两个 model_token_limit 测试更新（新名 + 老名快照都断言 384K） |
+| `api/src/providers/openai_compat.rs` | `model_requires_reasoning_content_in_history` 加 `starts_with("deepseek-flash")`；测试 positives 加新名 |
+| `runtime/src/conversation.rs` | `with_cache_mode_for_model` 测试列表 `DeepSeek-V4-Flash-0731` → `deepseek-flash` |
+| `tools/src/lib.rs` | subagent threshold 测试同步换新名 |
+| `rusty-claude-cli/src/main.rs` | strict 公式注释更新：deepseek-flash 1M（max_output 384K，min 截到 20K）→ **967K**（原 978K 指纹作废） |
+
+### 关键判断依据
+- 新名 `deepseek-flash` 若不做兼容，`model_token_limit` 查表+前缀兜底全 miss → 阈值静默回落 55K → 复现 2026-09-03 的 auto-compact 击穿缓存事故。**这次是"网关改名"再次验证了那条教训：模型名匹配必须容忍官方改名。**
+- 老名保留兜底归并而非直接删除：日志里历史回显名 `DeepSeek-V4-Flash-0731` 仍可能出现在 resume/旧配置中，归并零成本防回归。
+- strict 阈值新指纹：**deepseek-flash = 967000**（1M − min(384K→20K) − 13K），与 glm-5.2 相同；旧 978808 指纹作废。
+
+---
+
+## ★ 2026-09-28 子 agent"失联"根因修复：file_ops 中文截断 panic + panic 终态兜底（本次会话）
+
+### 症状
+用户报：派子 agent 后时不时"失联"，主 LLM 轮询 manifest 一直 `running`（Sleep 60s/120s 反复），最后放弃接管自己干。项目 `E:\NW工程\mail`（中文路径）。
+
+### 根因（两级）
+1. **panic 源头**（`runtime/src/file_ops.rs:422`）：read_file 50K 字符截断 `&selected[..50_000]`，中文内容（3 bytes/字）让 byte 50000 落在多字节字符中间直接 panic——**原实现的 char-boundary 回退循环写在切片之后，panic 时执行不到**（防护代码顺序写反）。真机铁证：`thread 'clawd-agent-agent-...' panicked ... inside '库' (bytes 49998..50001)`。
+2. **状态机缺口**（`tools/src/lib.rs` spawn 闭包 panic 分支）：2026-07-20 的 catch_unwind 兜底只 send failed outcome，**没调 `persist_agent_terminal_state`** → manifest 永久停留 `running` → 主 LLM 判"stuck"接管。TaskGet 期间报 `task not found` 也是同族症状。
+
+### 修复
+| 文件 | 改动 |
+|------|------|
+| `runtime/src/file_ops.rs` | 截断改为先回退 `end` 到 `is_char_boundary` 再切片（防护移到切片前）；加回归测试 `read_file_truncates_long_multibyte_content_without_panicking`（20000 个'库'） |
+| `tools/src/lib.rs` | catch_unwind Err 分支补 `persist_agent_terminal_state(manifest, "failed", ..., "sub-agent thread panicked")`——panic 后 TaskGet 立刻看到 failed 终态，不再无限 running |
+
+### 验证
+回归测试 ok、`cargo check -p tools` ✅、fmt ✅。
+
+### 教训
+- **防护性回退必须写在会 panic 的操作之前**——"先切片再修边界"等于没防护。Rust 字节切片 `&s[..n]` 对多字节字符是硬 panic。
+- **线程 panic 兜底要覆盖全部出口**：catch_unwind 捕获后不仅要通知主线程（outcome channel），还要把**持久化状态**（manifest）落终态，否则外部观察者（TaskGet/轮询）看到的还是中间态。
+
+---
+
+## ★ 2026-09-28 /webui markdown 不渲染修复：marked.js 离线内嵌（本次会话）
+
+### 症状
+`/webui` 历史查看器里 ASSISTANT 消息以源码字符展现（markdown 未渲染）。
+
+### 根因
+`webui_index.html` 用 CDN（cdn.jsdelivr.net）加载 marked.js；内网/断网时加载失败，渲染调用点 `try{marked.parse(...)}catch(_){}` 静默吞异常 → 保持 escapeHtml 纯文本。
+
+### 修复（彻底离线化，marked 随二进制分发）
+| 文件 | 改动 |
+|------|------|
+| `runtime/assets/marked.min.js` | **新增**。从用户本地 `E:\pythonProject\llama_cpp_miniPage\web_static\marked.min.js` 拷入（marked v15.0.12，MIT） |
+| `runtime/src/webui.rs` | 新增路由 `GET /marked.min.js`（content-type `application/javascript`）+ `marked_js()`（`include_str!` 内嵌）；文档注释同步 |
+| `runtime/assets/webui_index.html` | `<script src>` 从 CDN 改为 `/marked.min.js`（同源自服务，无跨域）；中途加过的自写 fallback 渲染器已移除（有真 marked 不需要） |
+
+### 验证
+`cargo check --workspace` ✅；HTML 中 marked 引用仅剩 script 引入 + parse 调用两处 ✅。中间方案（自写 100 行 fallback markdown 渲染器 + node 实测）已用真 marked 替代。
+
+### 注意
+`include_str!` 内嵌资产 → 需重编 `cargo build --release` 替换 claw.exe 后生效。
+
+---
+
+## ★ 2026-09-30 子 agent "provider 解析失败 / 上下文窗口超限"双根因修复（本次会话）
+
+### 症状（用户编译 09-28 修复版后）
+主 LLM 反复输出"子 agent 因基础设施错误（provider 返回解析失败）挂了，我重试一次"、"又是基础设施问题（这次是上下文窗口超限），我把任务大幅收窄再试一次"——子 agent 高频夭折，主 LLM 反复接管重派。项目 `E:\NW工程\mail`。
+
+### 日志铁证（claw_glm_diag.log）
+- **77635 行**：`failed to parse Anthropic response for model glm-5.1: EOF while parsing a value at line 1 column 0; first 200 chars of body: `（body 全空）
+- **77669 行**：`context_window_blocked for glm-5.1: estimated input 84862 + requested output 128000 = 212862 tokens exceeds the 200000-token context window`
+
+### 双根因
+1. **SSE 空 data 帧**：网关偶发 `data:` 行后无内容的帧。`sse.rs parse_frame` 的 `data_lines.push(data.trim_start())` 不滤空 → `payload=""` 直达 `parse_stream_event("")` → serde "EOF at line 1 column 0" → 解析硬错误，子 agent 当场挂。原代码对空**帧**（trimmed.is_empty → Ok(None)）有防护，唯独漏了空 **data 行**。
+2. **ContextWindowExceeded 无降级路径**：glm-5.1 子 agent 默认 max_tokens=128000（`max_tokens_for_model` 家族值，除非配 `subAgentMaxOutputTokens`），input 涨到 84.8K 后本地 preflight（anthropic.rs:586）拦截。该错误 `is_retryable=false` 且非 `over_size_400`，`ProviderRuntimeClient::stream` 只对 over_size_400 映射 OverSize400 → conversation.rs 的 compact 兜底永远接不住 → 子 agent 直接 failed。**设计缺口：本地 preflight 拦截本可无损自救（只是 max_tokens 定大了），却走了硬死路径。**
+
+### 修复
+| 文件 | 改动 |
+|------|------|
+| `api/src/sse.rs` | `parse_frame_with_provider` 在 `[DONE]` 检查后加 `payload.trim().is_empty() → Ok(None)`（空 data 帧按无事件跳过）；回归测试 `skips_empty_data_frame_instead_of_parse_error` |
+| `api/src/error.rs` | 新增 `is_context_window_exceeded()` 访问器（对齐 `is_over_size_400` 模式） |
+| `tools/src/lib.rs` `stream()` | 收到 `ContextWindowExceeded{estimated_input_tokens, context_window_tokens}` 时，把 max_tokens 收窄为 `窗口 − input − 4K 余量` **原地重试一次**（条件：safe_max ≥ 1K 且 < 原 max_tokens；不 compact、不破坏前缀缓存）；stderr 打 `[claw] max_tokens ... retrying once with ...` 可 diag |
+
+### 验证
+`cargo test -p api --lib sse` 12 passed ✅、`error::tests` 10 passed ✅、`cargo check --workspace` ✅、fmt ✅。
+
+### 教训
+- **"EOF while parsing at line 1 column 0" = 空 body/空帧喂了 serde**——先查上游是不是发了空帧，再怀疑解析器。
+- **本地 preflight 拦截 ≠ 必须硬死**：ContextWindowExceeded 是客户端自己算出来的（input + max_tokens），输入不可缩时 max_tokens 总可以缩——这类错误应该走"收窄参数重试"而不是抛给上层当基础设施故障。
 
 ---
 

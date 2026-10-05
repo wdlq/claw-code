@@ -143,6 +143,7 @@ fn handle_request(mut stream: TcpStream, sessions_dir: &Path) -> std::io::Result
 
     let body: Vec<u8> = match (method, path) {
         ("GET", "/") => index_html().as_bytes().to_vec(),
+        ("GET", "/marked.min.js") => marked_js().as_bytes().to_vec(),
         ("GET", "/api/sessions") => {
             let sessions = list_sessions(sessions_dir);
             serde_json::to_vec(&sessions).unwrap_or_default()
@@ -164,6 +165,8 @@ fn handle_request(mut stream: TcpStream, sessions_dir: &Path) -> std::io::Result
     };
     let content_type = if path == "/" {
         "text/html; charset=utf-8"
+    } else if path == "/marked.min.js" {
+        "application/javascript; charset=utf-8"
     } else if path.starts_with("/api/") {
         "application/json; charset=utf-8"
     } else {
@@ -457,8 +460,15 @@ fn parse_message(v: &serde_json::Value) -> Option<SessionMessage> {
     Some(SessionMessage { role, parts })
 }
 
-/// 内嵌的单页 HTML。通过 CDN 引入 marked.js 做 markdown 渲染，
-/// 样式与 atomcode webui 保持一致（深色背景、对话气泡、工具调用折叠块）。
+/// 内嵌的单页 HTML。marked.js 走本 server 的 `/marked.min.js`（内嵌资产，2026-09-28
+/// 离线化——原 CDN 引入在内网/断网时 markdown 渲染静默失败），样式与 atomcode webui
+/// 保持一致（深色背景、对话气泡、工具调用折叠块）。
 fn index_html() -> &'static str {
     include_str!("../assets/webui_index.html")
+}
+
+/// 内嵌的 marked v15.0.12（MIT, markedjs）。来源：用户本地
+/// `E:\pythonProject\llama_cpp_miniPage\web_static\marked.min.js`，拷入 assets 随二进制分发。
+fn marked_js() -> &'static str {
+    include_str!("../assets/marked.min.js")
 }

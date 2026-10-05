@@ -612,6 +612,10 @@ pub fn max_tokens_for_model_with_override(model: &str, plugin_override: Option<u
 /// - `GLM-5.2` → `glm-5.2`（新条目：1M 窗口）
 /// - `DeepSeek-V4-Flash-0731` → 剥日期后缀 `-0731` → `deepseek-v4-flash`
 /// - `claude-haiku-4-5-20251213` 保持可匹配（日期段剥掉后回退前缀匹配命中同族条目）
+///
+/// **2026-09-28 模型改名**：`deepseek-v4-flash` → `deepseek-flash`（max_output 8,192 → 384K
+/// 官方值）。表内精确条目已换新名；老名 `deepseek-v4-flash*` 经前缀兜底别名归并仍命中，
+/// 网关历史回显名不回归。
 fn model_registry_key(model: &str) -> String {
     let canonical = resolve_model_alias(model);
     // 剖路径前缀和方括号后缀（如 deepseek-v4-pro[1m] → deepseek-v4-pro）。
@@ -693,8 +697,10 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 8_192,
             context_window_tokens: 1_000_000,
         }),
-        "deepseek-v4-flash" => Some(ModelTokenLimit {
-            max_output_tokens: 8_192,
+        // 2026-09-28 改名：deepseek-v4-flash → deepseek-flash（老名弃用）。
+        // max_output 384K 为用户提供的官方值（原 8,192 是沿用 v4-pro 的错误推断）。
+        "deepseek-flash" => Some(ModelTokenLimit {
+            max_output_tokens: 384_000,
             context_window_tokens: 1_000_000,
         }),
         _ => {
@@ -721,9 +727,16 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
                     context_window_tokens: 1_000_000,
                 });
             }
-            if key.starts_with("deepseek-v4-flash") {
+            // deepseek-flash 兜底前先做别名归并：老名 deepseek-v4-flash* 并入新名，
+            // 新官方名 deepseek-flash* 直接命中。
+            let flash_key = if key.starts_with("deepseek-v4-flash") {
+                key.replacen("deepseek-v4-flash", "deepseek-flash", 1)
+            } else {
+                key.clone()
+            };
+            if flash_key.starts_with("deepseek-flash") {
                 return Some(ModelTokenLimit {
-                    max_output_tokens: 8_192,
+                    max_output_tokens: 384_000,
                     context_window_tokens: 1_000_000,
                 });
             }
@@ -1854,11 +1867,16 @@ NO_EQUALS_LINE
         assert_eq!(glm52.context_window_tokens, 1_000_000);
         assert_eq!(glm52.max_output_tokens, 128_000);
 
-        let ds_flash = crate::providers::model_token_limit("DeepSeek-V4-Flash-0731")
-            .expect("flash snapshot must resolve");
-        // 2026-09-03 用户裁定：deepseek 全系 1M（原 128K 是映射推断值，非网关实测）
+        // 2026-09-28 改名：新官方名 deepseek-flash；老名 deepseek-v4-flash* 兜底别名归并仍命中。
+        // max_output 384K 为用户提供的官方值（原 8,192 是沿用 v4-pro 的错误推断）。
+        let ds_flash = crate::providers::model_token_limit("deepseek-flash")
+            .expect("deepseek-flash must resolve");
         assert_eq!(ds_flash.context_window_tokens, 1_000_000);
-        assert_eq!(ds_flash.max_output_tokens, 8_192);
+        assert_eq!(ds_flash.max_output_tokens, 384_000);
+        let ds_flash_old = crate::providers::model_token_limit("DeepSeek-V4-Flash-0731")
+            .expect("legacy flash snapshot must resolve");
+        assert_eq!(ds_flash_old.context_window_tokens, 1_000_000);
+        assert_eq!(ds_flash_old.max_output_tokens, 384_000);
 
         // 旧精确名不回归
         let glm51 = crate::providers::model_token_limit("glm-5.1").expect("glm-5.1 must resolve");
@@ -1889,9 +1907,15 @@ NO_EQUALS_LINE
         let pro_snap =
             crate::providers::model_token_limit("deepseek-v4-pro-0901").expect("pro snapshot");
         assert_eq!(pro_snap.context_window_tokens, 1_000_000);
+        // 2026-09-28 改名：新官方名 deepseek-flash 与老名快照都走前缀兜底命中
+        let flash_new =
+            crate::providers::model_token_limit("deepseek-flash-preview").expect("flash new name");
+        assert_eq!(flash_new.context_window_tokens, 1_000_000);
+        assert_eq!(flash_new.max_output_tokens, 384_000);
         let flash_snap =
             crate::providers::model_token_limit("deepseek-v4-flash-0915").expect("flash snapshot");
         assert_eq!(flash_snap.context_window_tokens, 1_000_000);
+        assert_eq!(flash_snap.max_output_tokens, 384_000);
     }
 
     #[test]

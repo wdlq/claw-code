@@ -418,12 +418,16 @@ pub fn read_file(
 
     // **2026-07-23 字符级硬上限**：超过 READ_FILE_MAX_CHARS 时截断并提示。
     // 防止单行长文件（PDF/minified JS）一次注入 MB 级内容擑爆上下文。
+    // **2026-09-28 panic 修复**：`&selected[..READ_FILE_MAX_CHARS]` 若 50000 落在多字节
+    // 字符（中文 3 bytes）中间会直接 panic（真机案例：子 agent 线程崩溃 → manifest 永久
+    // 停留 running → 主 LLM 轮询判"失联"后接管）。必须先回退到字符边界再切片——
+    // 原实现的回退循环写在切片之后，panic 时根本执行不到。
     let selected = if selected.len() > READ_FILE_MAX_CHARS {
-        let mut truncated = selected[..READ_FILE_MAX_CHARS].to_string();
-        // 避免截半多字节字符（UTF-8 中文 3 bytes）——向前回退到字符边界。
-        while !selected.is_char_boundary(truncated.len()) && !truncated.is_empty() {
-            truncated.pop();
+        let mut end = READ_FILE_MAX_CHARS;
+        while end > 0 && !selected.is_char_boundary(end) {
+            end -= 1;
         }
+        let truncated = &selected[..end];
         let next_offset = start_index.saturating_add(collected.len());
         format!(
             "{truncated}\n\n[content truncated at {READ_FILE_MAX_CHARS} chars (file has very long lines); pass offset={next_offset} to continue reading]",
@@ -1434,6 +1438,31 @@ mod tests {
         let read_output = read_file(path.to_string_lossy().as_ref(), Some(1), Some(1))
             .expect("read should succeed");
         assert_eq!(read_output.file.content, "two");
+    }
+
+    /// **2026-09-28 回归测试**：read_file 50K 字符截断必须落在 UTF-8 字符边界上。
+    /// 真机案例：中文内容（3 bytes/字）让 byte 50000 落在多字节字符中间，
+    /// `&selected[..50000]` panic → 子 agent 线程崩溃 → manifest 永久停留 running。
+    #[test]
+    fn read_file_truncates_long_multibyte_content_without_panicking() {
+        let path = temp_path("truncate-cjk.txt");
+        // 单行长中文内容：> 50K bytes，且让 byte 50000 大概率落在字符中间。
+        // '库' = 3 bytes；16667 个 '库' ≈ 50001 bytes，恰好跨过 50000 边界。
+        let content = "库".repeat(20_000);
+        std::fs::write(&path, &content).expect("write should succeed");
+
+        let output = read_file(path.to_string_lossy().as_ref(), None, None)
+            .expect("read must not panic on multibyte char boundary");
+        let out = output.file.content;
+        assert!(out.len() < content.len(), "content should be truncated");
+        assert!(
+            out.contains("[content truncated"),
+            "truncation trailer should be present, got len={}",
+            out.len()
+        );
+        // 截断主体必须是合法 UTF-8（is_char_boundary 已保证，这里端到端复核）
+        let body = out.split("\n\n[content truncated").next().unwrap_or("");
+        assert!(body.is_char_boundary(body.len()));
     }
 
     #[test]

@@ -4041,11 +4041,23 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                 run_agent_job_with_outcome(&job, heartbeat_for_call, subagent_abort_for_thread)
             })) {
                 Ok(outcome) => outcome,
-                Err(_) => AgentRunOutcome {
-                    status: String::from("failed"),
-                    final_text: None,
-                    error: Some(String::from("sub-agent thread panicked")),
-                },
+                Err(_) => {
+                    // **2026-09-28 panic 终态兜底**：panic 分支原先只 send failed outcome，
+                    // 不落 manifest 终态——manifest 永久停留 "running"，主 LLM 轮询判
+                    // "stuck/失联"后接管（真机案例：file_ops char boundary panic）。
+                    // 这里补 persist，让 TaskGet 能立刻看到 failed 终态。
+                    let _ = persist_agent_terminal_state(
+                        &job.manifest,
+                        "failed",
+                        None,
+                        Some(String::from("sub-agent thread panicked")),
+                    );
+                    AgentRunOutcome {
+                        status: String::from("failed"),
+                        final_text: None,
+                        error: Some(String::from("sub-agent thread panicked")),
+                    }
+                }
             };
             // send 失败仅记日志——主线程可能已超时 break 走了，send 报错是正常竞态。
             let _ = outcome_tx.send(outcome);
@@ -4371,10 +4383,7 @@ mod subagent_threshold_tests {
         assert_eq!(subagent_auto_compact_threshold("GLM-5.2"), None);
         assert_eq!(subagent_auto_compact_threshold("glm-5"), None);
         assert_eq!(subagent_auto_compact_threshold("deepseek-v4-pro"), None);
-        assert_eq!(
-            subagent_auto_compact_threshold("DeepSeek-V4-Flash-0731"),
-            None
-        );
+        assert_eq!(subagent_auto_compact_threshold("deepseek-flash"), None);
         assert_eq!(subagent_auto_compact_threshold(""), None);
     }
 }
@@ -5652,7 +5661,7 @@ impl ApiClient for ProviderRuntimeClient {
         let chain = &self.chain;
         let mut last_error: Option<ApiError> = None;
         for (index, entry) in chain.iter().enumerate() {
-            let message_request = MessageRequest {
+            let mut message_request = MessageRequest {
                 model: entry.model.clone(),
                 max_tokens: max_tokens_for_model_with_override(
                     &entry.model,
@@ -5666,7 +5675,37 @@ impl ApiClient for ProviderRuntimeClient {
                 ..Default::default()
             };
 
-            let attempt = runtime.block_on(stream_with_provider(&entry.client, &message_request));
+            let mut attempt =
+                runtime.block_on(stream_with_provider(&entry.client, &message_request));
+            // **2026-09-28 子 agent 上下文超限降级修复**：本地 preflight 拦截
+            //（input + max_tokens > 窗口，真机案例：glm-5.1 默认 128K output + 84.8K input
+            // > 200K）原先直接硬死——主 LLM 只看到"又是基础设施问题"。现在把 max_tokens
+            // 收窄到 窗口 − 实际输入 − 4K 余量 后原地重试一次（不 compact、不破坏前缀缓存）。
+            let exceeded = if let Err(ApiError::ContextWindowExceeded {
+                estimated_input_tokens,
+                context_window_tokens,
+                ..
+            }) = &attempt
+            {
+                Some((*estimated_input_tokens, *context_window_tokens))
+            } else {
+                None
+            };
+            if let Some((input_tokens, window_tokens)) = exceeded {
+                let safe_max = window_tokens
+                    .saturating_sub(input_tokens)
+                    .saturating_sub(4_096);
+                // 至少留 1K 可用输出才值得重试；请求 max_tokens 已低于 safe_max 则无需收窄
+                if safe_max >= 1_024 && safe_max < message_request.max_tokens {
+                    eprintln!(
+                        "[claw] max_tokens {} exceeds window with input {} tokens, retrying once with {}",
+                        message_request.max_tokens, input_tokens, safe_max
+                    );
+                    message_request.max_tokens = safe_max;
+                    attempt =
+                        runtime.block_on(stream_with_provider(&entry.client, &message_request));
+                }
+            }
             match attempt {
                 Ok(events) => return Ok(events),
                 Err(error) if error.is_retryable() && index + 1 < chain.len() => {

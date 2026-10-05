@@ -127,6 +127,13 @@ pub(crate) fn parse_frame_with_provider(
     if payload == "[DONE]" {
         return Ok(None);
     }
+    // **2026-09-28 修复**：网关偶发空 data 帧（`data:` 行后无内容）。空 payload 直接喂
+    // serde 会报 "EOF while parsing a value at line 1 column 0"，被上层当
+    // "provider 返回解析失败"硬错误，子 agent 当场挂掉（真机案例：
+    // claw_glm_diag.log:77635，glm-5.1）。按无事件跳过，与空帧/注释帧同语义。
+    if payload.trim().is_empty() {
+        return Ok(None);
+    }
 
     parse_stream_event(provider, model, &payload)
 }
@@ -202,6 +209,20 @@ mod tests {
                 },
             ))
         );
+    }
+
+    /// **2026-09-28 回归测试**：网关偶发空 data 帧（`data:` 后无内容）必须按无事件
+    /// 跳过，不能喂给 serde 报 "EOF while parsing a value at line 1 column 0"
+    /// （真机案例：子 agent 被 "provider 返回解析失败" 硬死，claw_glm_diag.log:77635）。
+    #[test]
+    fn skips_empty_data_frame_instead_of_parse_error() {
+        let frame = "data: \n\n";
+        let event = parse_frame(frame).expect("empty data frame must not be a parse error");
+        assert_eq!(event, None);
+
+        let frame = "data:\n\n";
+        let event = parse_frame(frame).expect("bare empty data frame must not error either");
+        assert_eq!(event, None);
     }
 
     #[test]

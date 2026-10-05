@@ -8777,7 +8777,7 @@ fn build_runtime_with_plugin_state(
             );
         } else {
             // 高缓存命中模式：strict 变体不读任何 env，按公式（窗口 − min(max_output, 20K) − 13K）算。
-            // GLM-5.2 1M → 967K；deepseek-v4-flash 1M（max_output 8,192 全额预留）→ 978K。
+            // GLM-5.2 1M → 967K；deepseek-flash 1M（max_output 384K，min 截到 20K）→ 967K。
             let effective_max_tokens = api::max_tokens_for_model(&model);
             runtime = runtime.with_model_context_window_strict(
                 limit.context_window_tokens,

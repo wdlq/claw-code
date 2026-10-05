@@ -2265,7 +2265,7 @@ mod tests {
             "GLM-5.2",
             "glm-5",
             "deepseek-v4-pro",
-            "DeepSeek-V4-Flash-0731",
+            "deepseek-flash",
             "claude-opus-4-6",
         ] {
             assert!(

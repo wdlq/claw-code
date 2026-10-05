@@ -162,6 +162,14 @@ impl ApiError {
         }
     }
 
+    /// **2026-09-28 子 agent 上下文超限降级修复**：本地 preflight 拦截
+    ///（`input + max_tokens > 窗口`）时子 agent 不应硬死——调用方
+    ///（`ProviderRuntimeClient::stream`）据此收窄 max_tokens 原地重试。
+    #[must_use]
+    pub fn is_context_window_exceeded(&self) -> bool {
+        matches!(self, Self::ContextWindowExceeded { .. })
+    }
+
     #[must_use]
     pub fn request_id(&self) -> Option<&str> {
         match self {

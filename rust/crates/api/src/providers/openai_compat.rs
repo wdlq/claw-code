@@ -902,11 +902,14 @@ pub fn is_reasoning_model(model: &str) -> bool {
 
 /// Returns true for OpenAI-compatible `DeepSeek` V4 models that require prior
 /// assistant reasoning to be echoed back as `reasoning_content` in history.
+///
+/// 2026-09-28 改名兼容：`deepseek-flash`（新官方名，替代 deepseek-v4-flash）与
+/// 老名 `deepseek-v4-*` 都要求回显；`deepseek-chat`/`deepseek-reasoner` 仍排除。
 #[must_use]
 pub fn model_requires_reasoning_content_in_history(model: &str) -> bool {
     let lowered = model.to_ascii_lowercase();
     let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
-    canonical.starts_with("deepseek-v4")
+    canonical.starts_with("deepseek-v4") || canonical.starts_with("deepseek-flash")
 }
 
 /// Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
@@ -1757,6 +1760,7 @@ mod tests {
     fn model_requires_reasoning_content_in_history_detects_deepseek_v4_models() {
         // Given DeepSeek V4 and non-V4 model names.
         let positive = [
+            "deepseek-flash",
             "deepseek-v4-flash",
             "deepseek-v4-pro",
             "openai/deepseek-v4-pro",
@@ -1770,7 +1774,7 @@ mod tests {
         ];
 
         // When checking whether history reasoning_content is required.
-        // Then only DeepSeek V4 variants require it.
+        // Then DeepSeek V4 variants and the new deepseek-flash name require it.
         for model in positive {
             assert!(model_requires_reasoning_content_in_history(model));
         }
