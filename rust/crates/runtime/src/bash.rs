@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command as TokioCommand;
 use tokio::runtime::Builder;
 use tokio::time::timeout;
@@ -174,16 +175,36 @@ async fn execute_bash_async(
     // Detect and emit ship provenance for git push operations
     detect_and_emit_ship_prepared(&input.command);
 
-    let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
+    eprintln!(
+        "[bash-diag] stage=enter cwd={} timeout_ms={:?} command={}",
+        cwd.display(),
+        input.timeout,
+        input.command
+    );
+
+    let command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
 
     let output_result = if let Some(timeout_ms) = input.timeout {
-        if let Ok(result) = timeout(Duration::from_millis(timeout_ms), command.output()).await {
+        if let Ok(result) = timeout(
+            Duration::from_millis(timeout_ms),
+            run_with_stage_logs(command, "bash"),
+        )
+        .await
+        {
             (result?, false)
         } else {
+            eprintln!(
+                "[bash-diag] stage=timeout command={}",
+                input.command
+            );
             return Ok(timeout_output(&input, timeout_ms, sandbox_status));
         }
     } else {
-        (command.output().await?, false)
+        eprintln!(
+            "[bash-diag] stage=no_timeout command={} <- will wait indefinitely if pipes never EOF",
+            input.command
+        );
+        (run_with_stage_logs(command, "bash").await?, false)
     };
 
     let (output, interrupted) = output_result;
@@ -214,6 +235,84 @@ async fn execute_bash_async(
         persisted_output_path: None,
         persisted_output_size: None,
         sandbox_status: Some(sandbox_status),
+    })
+}
+
+/// #win7-diag: instrumented replacement for `TokioCommand::output()` —
+/// distinguishes "cmd.exe exited" from "stdout/stderr pipes reached EOF".
+/// On Windows a grandchild spawned by cmd.exe inherits the pipe write
+/// handles; if it outlives cmd.exe the pipes never EOF and `output().await`
+/// hangs forever even though the command itself finished.  The stage logs
+/// make that gap visible: a large gap between `child_exited` and
+/// `pipes_closed` (or repeated `pipes_still_open`) identifies that case.
+async fn run_with_stage_logs(
+    mut command: TokioCommand,
+    label: &str,
+) -> io::Result<std::process::Output> {
+    let started = std::time::Instant::now();
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let pid = child.id();
+    eprintln!(
+        "[bash-diag] stage=spawned label={label} pid={pid:?} elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
+
+    let mut stdout_pipe = child.stdout.take().expect("stdout piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf).await;
+        buf
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf).await;
+        buf
+    });
+
+    let status = loop {
+        match timeout(Duration::from_secs(1), child.wait()).await {
+            Err(_) => continue, // still running; stay quiet
+            Ok(r) => {
+                eprintln!(
+                    "[bash-diag] stage=child_exited label={label} pid={pid:?} elapsed_ms={}",
+                    started.elapsed().as_millis()
+                );
+                break r?;
+            }
+        }
+    };
+
+    let mut pipes_fut = std::pin::pin!(async {
+        (
+            stdout_task.await.unwrap_or_default(),
+            stderr_task.await.unwrap_or_default(),
+        )
+    });
+    let (stdout, stderr) = loop {
+        match timeout(Duration::from_secs(5), &mut pipes_fut).await {
+            Err(_) => eprintln!(
+                "[bash-diag] stage=pipes_still_open label={label} pid={pid:?} elapsed_ms={} <- grandchild likely holding pipe write handles",
+                started.elapsed().as_millis()
+            ),
+            Ok((so, se)) => break (so, se),
+        }
+    };
+    eprintln!(
+        "[bash-diag] stage=pipes_closed label={label} pid={pid:?} elapsed_ms={} stdout_bytes={} stderr_bytes={}",
+        started.elapsed().as_millis(),
+        stdout.len(),
+        stderr.len()
+    );
+
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
     })
 }
 
