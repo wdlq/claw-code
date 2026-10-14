@@ -266,8 +266,11 @@ impl LineEditor {
                     if self.paste_manager.is_large_paste {
                         let mut stdout = io::stdout();
                         // Move cursor up 1 line and clear it
-                        write!(stdout, "\x1b[1A\x1b[2K")?;
-                        stdout.flush()?;
+                        // (老 conhost 无 VT 支持，转义会打出来成乱码，直接跳过)
+                        if crate::console::ansi_rendering_ok() {
+                            write!(stdout, "\x1b[1A\x1b[2K")?;
+                            stdout.flush()?;
+                        }
                     }
 
                     // If this was the last line to skip, let user type more
