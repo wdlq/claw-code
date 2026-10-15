@@ -17,8 +17,15 @@ pub fn ansi_rendering_ok() -> bool {
 }
 
 #[cfg(windows)]
-#[allow(unsafe_code)] // Win32 Console API 本身就是 unsafe 接口
+#[allow(unsafe_code)] // Win32/ntdll 接口本身是 unsafe
 pub fn init() {
+    // 关键：ENABLE_VIRTUAL_TERMINAL_PROCESSING(0x0004) 在 Win7 老 conhost 里
+    // 是 ENABLE_PROCESSED_OUTPUT（默认已开），SetConsoleMode 会"成功"但什么
+    // 都没启用——必须按 OS 版本门禁，Win10 1511 (build 10586) 以下一律判
+    // 不支持，走剥离模式。
+    if !windows_vt_capable() {
+        return;
+    }
     use windows_sys::Win32::System::Console::{
         GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
         STD_OUTPUT_HANDLE,
@@ -31,6 +38,37 @@ pub fn init() {
         {
             ANSI_RENDERING_OK.store(true, Ordering::Relaxed);
         }
+    }
+}
+
+/// 经 ntdll!RtlGetVersion 取真实 OS 版本（不受 manifest 兼容性谎言影响）。
+/// VT 解析自 Win10 1511 (build 10586) 起才完整支持 256 色 SGR。
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn windows_vt_capable() -> bool {
+    use std::mem::zeroed;
+    #[repr(C)]
+    struct OsVersionInfoW {
+        dw_os_version_info_size: u32,
+        dw_major_version: u32,
+        dw_minor_version: u32,
+        dw_build_number: u32,
+        dw_platform_id: u32,
+        sz_csd_version: [u16; 128],
+    }
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn RtlGetVersion(lp_version_information: *mut OsVersionInfoW) -> i32;
+    }
+    unsafe {
+        let mut info: OsVersionInfoW = unsafe { zeroed() };
+        info.dw_os_version_info_size =
+            std::mem::size_of::<OsVersionInfoW>() as u32;
+        if unsafe { RtlGetVersion(&mut info) } != 0 {
+            return false;
+        }
+        info.dw_major_version > 10
+            || (info.dw_major_version == 10 && info.dw_build_number >= 10586)
     }
 }
 

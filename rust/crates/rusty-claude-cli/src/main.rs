@@ -416,6 +416,33 @@ fn apply_config_env() {
     }
 }
 
+/// 带兜底的单轮执行：控制台 stdout 写失败会让标准库 print!/println! 直接
+/// panic（stdio.rs print_to），几小时的长会话不该被一次瞬时 IO 抖动杀死。
+/// panic 在这里被拦下、降级为可继续的错误；"Turn aborted" 仍按用户取消处理。
+fn run_turn_safely(cli: &mut LiveCli, prompt: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cli.run_turn(prompt)));
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            let msg = error.to_string();
+            if msg.contains("Turn aborted") {
+                eprintln!("Cancelled.");
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+        Err(_) => {
+            eprintln!(
+                "[warn] 本轮输出时控制台写入失败（stdout 写入异常），本轮已终止但会话保持存活；\n\
+                 若持续出现，请检查显示器的控制台/终端状态或将输出重定向到文件。"
+            );
+            Ok(())
+        }
+    }
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     console::init();
     apply_config_env();
@@ -4381,28 +4408,12 @@ fn run_repl(
                 if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &resolved) {
                     editor.push_history(input);
                     cli.record_prompt_history(&resolved);
-                    if let Err(error) = cli.run_turn(&prompt) {
-                        let msg = error.to_string();
-                        if msg.contains("Turn aborted") {
-                            eprintln!("Cancelled.");
-                        } else {
-                            return Err(error);
-                        }
-                    }
+                    run_turn_safely(&mut cli, &prompt)?;
                     continue;
                 }
                 editor.push_history(input);
                 cli.record_prompt_history(&resolved);
-                if let Err(error) = cli.run_turn(&resolved) {
-                    let msg = error.to_string();
-                    if msg.contains("Turn aborted") {
-                        // User cancelled (e.g. CTRL+C) — return to the REPL
-                        // prompt instead of crashing.
-                        eprintln!("Cancelled.");
-                    } else {
-                        return Err(error);
-                    }
-                }
+                run_turn_safely(&mut cli, &resolved)?;
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -5150,7 +5161,9 @@ impl LiveCli {
                 )?;
                 let final_text = final_assistant_text(&summary);
                 if !final_text.is_empty() {
-                    let rendered = TerminalRenderer::new().markdown_to_ansi(&final_text);
+                    let renderer = TerminalRenderer::new();
+                    let ansi = renderer.markdown_to_ansi(&final_text);
+                    let rendered = console::sanitize(&ansi);
                     println!("{rendered}");
                 }
                 println!();

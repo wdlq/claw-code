@@ -66,6 +66,11 @@ impl Spinner {
     ) -> io::Result<()> {
         let frame = Self::FRAMES[self.frame_index % Self::FRAMES.len()];
         self.frame_index += 1;
+        if !crate::console::ansi_rendering_ok() {
+            // 老 conhost/管道无 VT：crossterm 的 SavePosition/SetForeground-
+            // Color 都会变成裸转义乱码，降级为纯文本
+            return write!(out, "{frame} {label}").and_then(|()| out.flush());
+        }
         queue!(
             out,
             SavePosition,
@@ -86,6 +91,9 @@ impl Spinner {
         out: &mut impl Write,
     ) -> io::Result<()> {
         self.frame_index = 0;
+        if !crate::console::ansi_rendering_ok() {
+            return writeln!(out, "✔ {label}").and_then(|()| out.flush());
+        }
         execute!(
             out,
             MoveToColumn(0),
@@ -104,6 +112,9 @@ impl Spinner {
         out: &mut impl Write,
     ) -> io::Result<()> {
         self.frame_index = 0;
+        if !crate::console::ansi_rendering_ok() {
+            return writeln!(out, "✘ {label}").and_then(|()| out.flush());
+        }
         execute!(
             out,
             MoveToColumn(0),
