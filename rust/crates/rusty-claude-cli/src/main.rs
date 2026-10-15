@@ -6,7 +6,6 @@
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
-mod console;
 mod init;
 mod input;
 mod render;
@@ -444,7 +443,6 @@ fn run_turn_safely(cli: &mut LiveCli, prompt: &str) -> Result<(), Box<dyn std::e
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    console::init();
     apply_config_env();
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args)? {
@@ -4369,7 +4367,7 @@ fn run_repl(
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
-    println!("{}", console::sanitize(&cli.startup_banner()));
+    println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
 
     loop {
@@ -5162,8 +5160,7 @@ impl LiveCli {
                 let final_text = final_assistant_text(&summary);
                 if !final_text.is_empty() {
                     let renderer = TerminalRenderer::new();
-                    let ansi = renderer.markdown_to_ansi(&final_text);
-                    let rendered = console::sanitize(&ansi);
+                    let rendered = renderer.markdown_to_ansi(&final_text);
                     println!("{rendered}");
                 }
                 println!();
@@ -9271,7 +9268,7 @@ impl AnthropicRuntimeClient {
                             progress_reporter.mark_tool_phase(&name, &input);
                         }
                         // Display tool call now that input is fully accumulated
-                        writeln!(out, "\n{}", console::sanitize(&format_tool_call_start(&name, &input)))
+                        writeln!(out, "\n{}", format_tool_call_start(&name, &input))
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
                         events.push(AssistantEvent::ToolUse { id, name, input });
@@ -10358,8 +10355,7 @@ impl ToolExecutor for CliToolExecutor {
         match result {
             Ok(output) => {
                 if self.emit_output {
-                    let rendered = format_tool_result(tool_name, &output, false);
-                    let markdown = console::sanitize(&rendered);
+                    let markdown = format_tool_result(tool_name, &output, false);
                     self.renderer
                         .stream_markdown(&markdown, &mut io::stdout())
                         .map_err(|error| ToolError::new(error.to_string()))?;
@@ -10368,8 +10364,7 @@ impl ToolExecutor for CliToolExecutor {
             }
             Err(error) => {
                 if self.emit_output {
-                    let rendered = format_tool_result(tool_name, &error.to_string(), true);
-                    let markdown = console::sanitize(&rendered);
+                    let markdown = format_tool_result(tool_name, &error.to_string(), true);
                     self.renderer
                         .stream_markdown(&markdown, &mut io::stdout())
                         .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;

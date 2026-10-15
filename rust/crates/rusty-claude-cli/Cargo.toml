@@ -25,7 +25,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 syntect = "5"
 unicode-width = "0.2"
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Console"] }
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "time"] }
 tools = { path = "../tools" }
 
