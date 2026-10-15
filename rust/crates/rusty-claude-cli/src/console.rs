@@ -19,6 +19,12 @@ pub fn ansi_rendering_ok() -> bool {
 #[cfg(windows)]
 #[allow(unsafe_code)] // Win32/ntdll 接口本身是 unsafe
 pub fn init() {
+    // VS Code 集成终端（winpty/ConPTY 桥接）会设 TERM_PROGRAM=vscode，其
+    // 前端 xterm.js 自己解析 ANSI——即使在 Win7 上彩色也是好的，必须放行。
+    if std::env::var("TERM_PROGRAM").map(|v| v == "vscode").unwrap_or(false) {
+        ANSI_RENDERING_OK.store(true, Ordering::Relaxed);
+        return;
+    }
     // 关键：ENABLE_VIRTUAL_TERMINAL_PROCESSING(0x0004) 在 Win7 老 conhost 里
     // 是 ENABLE_PROCESSED_OUTPUT（默认已开），SetConsoleMode 会"成功"但什么
     // 都没启用——必须按 OS 版本门禁，Win10 1511 (build 10586) 以下一律判
