@@ -208,6 +208,26 @@ type RuntimePluginStateBuildOutput = (
 );
 
 fn main() {
+    // #win7 取证钩子：生产环境的 stdout 写失败 panic 在 unwind 链上被某处
+    // 转成 Err 后仍导致退出，靠 stderr 输出无法定位真实 panic 点。这里把
+    // 每次 panic 的完整信息（线程/位置/消息）落盘到 cwd 的 claw_panic.log，
+    // 同时保留默认 stderr 输出不受影响。
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("claw_panic.log")
+        {
+            use std::io::Write as _;
+            let _ = writeln!(file, "==== panic t={timestamp} ====\n{info}\n");
+        }
+        default_hook(info);
+    }));
     if let Err(error) = run() {
         let message = error.to_string();
         // When --output-format json is active, emit errors as JSON so downstream
