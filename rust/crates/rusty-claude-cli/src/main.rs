@@ -429,6 +429,16 @@ fn run_turn_safely(cli: &mut LiveCli, prompt: &str) -> Result<(), Box<dyn std::e
             if msg.contains("Turn aborted") {
                 eprintln!("Cancelled.");
                 Ok(())
+            } else if msg.contains("panicked") || msg.contains("failed printing to stdout") {
+                // 下层 catch_unwind 把 stdout 写失败的 panic 转成了 Err
+                // （生产实测：Ctrl+C 后 Windows 控制台句柄短暂不可写，
+                // os error 995/31，println! 在 stdio.rs:1088 panic）。
+                // 这类瞬时 IO 抖动不杀会话，降级为警告继续。
+                eprintln!(
+                    "[warn] 本轮输出时控制台写入失败（stdout 写入异常），本轮已终止但会话保持存活；\n\
+                     若持续出现，请检查终端状态或将输出重定向到文件。"
+                );
+                Ok(())
             } else {
                 Err(error)
             }
