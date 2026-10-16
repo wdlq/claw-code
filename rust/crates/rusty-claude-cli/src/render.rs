@@ -116,6 +116,19 @@ impl Spinner {
     }
 }
 
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        // 兜底：轮次 panic / 提前退出时 finish()/fail() 不会执行，Win7(winpty)
+        // 下已设置的前景色会粘在控制台属性上，导致后续所有输出变色（实测
+        // spinner_done 的绿色粘满整屏）。Drop 里尽力恢复默认前景色。
+        let _ = execute!(
+            std::io::stdout(),
+            MoveToColumn(0),
+            ResetColor
+        );
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ListKind {
     Unordered,
