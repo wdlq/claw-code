@@ -22,3 +22,8 @@ pedantic = { level = "allow", priority = -1 }
 module_name_repetitions = "allow"
 missing_panics_doc = "allow"
 missing_errors_doc = "allow"
+
+# Win7 生产诊断：release 保留行号表，claw_panic.log 的 backtrace 能看到
+# 文件:行；诊断结束后可移除以缩小体积。
+[profile.release]
+debug = "line-tables-only"

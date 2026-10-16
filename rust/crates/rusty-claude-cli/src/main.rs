@@ -224,7 +224,11 @@ fn main() {
             .open("claw_panic.log")
         {
             use std::io::Write as _;
-            let _ = writeln!(file, "==== panic t={timestamp} ====\n{info}\n");
+            let backtrace = std::backtrace::Backtrace::force_capture();
+            let _ = writeln!(
+                file,
+                "==== panic t={timestamp} ====\n{info}\n--- backtrace ---\n{backtrace}\n"
+            );
         }
         default_hook(info);
     }));
