@@ -442,39 +442,58 @@ fn apply_config_env() {
     }
 }
 
+/// 瞬时流错误：网关偶发空响应/流中断，重试即可恢复。
+fn is_transient_stream_error(msg: &str) -> bool {
+    msg.contains("assistant stream produced no content")
+        || msg.contains("assistant stream ended without a message stop event")
+}
+
 /// 带兜底的单轮执行：控制台 stdout 写失败会让标准库 print!/println! 直接
 /// panic（stdio.rs print_to），几小时的长会话不该被一次瞬时 IO 抖动杀死。
 /// panic 在这里被拦下、降级为可继续的错误；"Turn aborted" 仍按用户取消处理。
+/// 瞬时流错误（网关空响应/流中断）自动重试最多 2 次——无人值守的长批量
+/// 任务不该因一次网络抖动中断。
 fn run_turn_safely(cli: &mut LiveCli, prompt: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cli.run_turn(prompt)));
-    match result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => {
-            let msg = error.to_string();
-            if msg.contains("Turn aborted") {
-                eprintln!("Cancelled.");
-                Ok(())
-            } else if msg.contains("panicked") || msg.contains("failed printing to stdout") {
-                // 下层 catch_unwind 把 stdout 写失败的 panic 转成了 Err
-                // （生产实测：Ctrl+C 后 Windows 控制台句柄短暂不可写，
-                // os error 995/31，println! 在 stdio.rs:1088 panic）。
-                // 这类瞬时 IO 抖动不杀会话，降级为警告继续。
+    let mut stream_retries = 0u32;
+    loop {
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cli.run_turn(prompt)));
+        match result {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) => {
+                let msg = error.to_string();
+                if msg.contains("Turn aborted") {
+                    eprintln!("Cancelled.");
+                    return Ok(());
+                }
+                if is_transient_stream_error(&msg) && stream_retries < 2 {
+                    stream_retries += 1;
+                    eprintln!(
+                        "[warn] 模型流式响应中断（{msg}），3 秒后自动重试（第 {stream_retries}/2 次）..."
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    continue;
+                }
+                if msg.contains("panicked") || msg.contains("failed printing to stdout") {
+                    // 下层 catch_unwind 把 stdout 写失败的 panic 转成了 Err
+                    // （生产实测：Ctrl+C 后 Windows 控制台句柄短暂不可写，
+                    // os error 995/31，println! 在 stdio.rs:1088 panic）。
+                    // 这类瞬时 IO 抖动不杀会话，降级为警告继续。
+                    eprintln!(
+                        "[warn] 本轮输出时控制台写入失败（stdout 写入异常），本轮已终止但会话保持存活；\n\
+                         若持续出现，请检查终端状态或将输出重定向到文件。"
+                    );
+                    return Ok(());
+                }
+                return Err(error);
+            }
+            Err(_) => {
                 eprintln!(
                     "[warn] 本轮输出时控制台写入失败（stdout 写入异常），本轮已终止但会话保持存活；\n\
-                     若持续出现，请检查终端状态或将输出重定向到文件。"
+                     若持续出现，请检查显示器的控制台/终端状态或将输出重定向到文件。"
                 );
-                Ok(())
-            } else {
-                Err(error)
+                return Ok(());
             }
-        }
-        Err(_) => {
-            eprintln!(
-                "[warn] 本轮输出时控制台写入失败（stdout 写入异常），本轮已终止但会话保持存活；\n\
-                 若持续出现，请检查显示器的控制台/终端状态或将输出重定向到文件。"
-            );
-            Ok(())
         }
     }
 }
