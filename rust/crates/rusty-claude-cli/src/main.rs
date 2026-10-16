@@ -230,7 +230,13 @@ fn main() {
                 "==== panic t={timestamp} ====\n{info}\n--- backtrace ---\n{backtrace}\n"
             );
         }
-        default_hook(info);
+        // 关键：stderr 可能正是引发 panic 的坏句柄（生产实测 os error 31，
+        // eprintln! 写 stderr 失败 → panic → default_hook 又往 stderr 写 →
+        // 二次 panic → 直接 abort，catch_unwind 永远没机会执行）。这里吞掉
+        // default_hook 自身的 panic，把 abort 变回可捕获的 unwind。
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            default_hook(info);
+        }));
     }));
     if let Err(error) = run() {
         let message = error.to_string();
