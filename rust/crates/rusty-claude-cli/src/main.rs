@@ -224,19 +224,15 @@ fn main() {
             .open("claw_panic.log")
         {
             use std::io::Write as _;
-            let backtrace = std::backtrace::Backtrace::force_capture();
-            let _ = writeln!(
-                file,
-                "==== panic t={timestamp} ====\n{info}\n--- backtrace ---\n{backtrace}\n"
-            );
+            let _ = writeln!(file, "==== panic t={timestamp} ====\n{info}\n");
         }
-        // 关键：stderr 可能正是引发 panic 的坏句柄（生产实测 os error 31，
-        // eprintln! 写 stderr 失败 → panic → default_hook 又往 stderr 写 →
-        // 二次 panic → 直接 abort，catch_unwind 永远没机会执行）。这里吞掉
-        // default_hook 自身的 panic，把 abort 变回可捕获的 unwind。
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            default_hook(info);
-        }));
+        // 注意：钩子里绝不能再做这两件事（生产 c0000005 崩溃实证）：
+        // 1. Backtrace::force_capture() —— Win7 的 dbghelp 路径会段错误，
+        //    且钩子内段错误 = 双重 panic 路径，直接 abort + APPCRASH；
+        // 2. 调用 default_hook —— 它往 stderr 写，而 stderr/stdout 可能正是
+        //    引发 panic 的坏句柄（os error 31）。钩子内的 panic 属于双重
+        //    panic，Rust 设计上不可被 catch_unwind 捕获，必然 abort。
+        // 因此只写日志文件，所有写失败一律忽略。
     }));
     if let Err(error) = run() {
         let message = error.to_string();
